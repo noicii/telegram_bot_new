@@ -22,10 +22,6 @@ from config import (
 
 
 def is_authorized(user_id, admin_ids=None):
-    """
-    Only explicitly configured administrators are allowed.
-    Empty ADMIN_IDS means nobody is authorized.
-    """
     if admin_ids is None:
         admin_ids = ADMIN_IDS
 
@@ -44,18 +40,11 @@ def format_size(size):
     except (TypeError, ValueError):
         return "0 B"
 
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    ]
+    units = ["B", "KB", "MB", "GB", "TB"]
 
     for unit in units:
         if size < 1024 or unit == units[-1]:
             return f"{size:.1f} {unit}"
-
         size /= 1024
 
     return "0 B"
@@ -88,11 +77,7 @@ def sanitize_filename(name, default="video"):
         name,
     )
 
-    name = re.sub(
-        r"\s+",
-        " ",
-        name,
-    ).strip(" .")
+    name = re.sub(r"\s+", " ", name).strip(" .")
 
     if not name:
         name = default
@@ -100,9 +85,9 @@ def sanitize_filename(name, default="video"):
     return name[:180]
 
 
-def clean_title(title):
+def clean_title(title, idx=None):
     if not title:
-        return "video"
+        title = "video"
 
     title = str(title)
 
@@ -118,7 +103,21 @@ def clean_title(title):
         title,
     )
 
-    return sanitize_filename(title)
+    title = sanitize_filename(title)
+
+    if idx is not None:
+        try:
+            idx = int(idx)
+            if idx > 0:
+                title = f"{title}_{idx}"
+        except (TypeError, ValueError):
+            pass
+
+    return title
+
+
+def clean_media_title(title):
+    return clean_title(title)
 
 
 def run_command(command):
@@ -163,8 +162,6 @@ async def run_command_async(command):
 
 
 def get_video_metadata(path):
-    path = str(path)
-
     command = [
         "ffprobe",
         "-v",
@@ -173,7 +170,7 @@ def get_video_metadata(path):
         "json",
         "-show_format",
         "-show_streams",
-        path,
+        str(path),
     ]
 
     try:
@@ -187,9 +184,7 @@ def get_video_duration(path):
     metadata = get_video_metadata(path)
 
     try:
-        return float(
-            metadata["format"]["duration"]
-        )
+        return float(metadata["format"]["duration"])
     except (KeyError, TypeError, ValueError):
         return 0.0
 
@@ -197,10 +192,7 @@ def get_video_duration(path):
 def get_video_dimensions(path):
     metadata = get_video_metadata(path)
 
-    for stream in metadata.get(
-        "streams",
-        [],
-    ):
+    for stream in metadata.get("streams", []):
         if stream.get("codec_type") == "video":
             try:
                 return (
@@ -214,13 +206,9 @@ def get_video_dimensions(path):
 
 
 def check_disk_space_guard(required_gb=MIN_DISK_FREE_GB):
-    usage = shutil.disk_usage(
-        str(DOWNLOAD_DIR)
-    )
+    usage = shutil.disk_usage(str(DOWNLOAD_DIR))
 
-    free_gb = usage.free / (
-        1024 ** 3
-    )
+    free_gb = usage.free / (1024 ** 3)
 
     if free_gb < required_gb:
         raise RuntimeError(
@@ -293,19 +281,238 @@ def get_main_keyboard():
         ],
     ]
 
-    return InlineKeyboardMarkup(
-        keyboard
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def trim_video_file(input_path, trim_info):
+    if not trim_info:
+        return input_path
+
+    try:
+        start, end = trim_info
+        start = float(start)
+        end = float(end)
+    except (TypeError, ValueError):
+        return input_path
+
+    if end <= start:
+        return input_path
+
+    input_path = Path(input_path)
+
+    output_path = input_path.with_name(
+        f"{input_path.stem}.trim{input_path.suffix}"
     )
 
+    duration = end - start
 
-async def extract_subtitles_from_video(
-    video_path,
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(start),
+        "-i",
+        str(input_path),
+        "-t",
+        str(duration),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+
+    await run_command_async(command)
+
+    if output_path.exists():
+        cleanup_task_artifacts(input_path)
+        return output_path
+
+    return input_path
+
+
+async def compress_video(input_path, output_path=None):
+    input_path = Path(input_path)
+
+    if output_path is None:
+        output_path = input_path.with_name(
+            f"{input_path.stem}.compressed{input_path.suffix}"
+        )
+    else:
+        output_path = Path(output_path)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(output_path),
+    ]
+
+    await run_command_async(command)
+
+    if output_path.exists():
+        if output_path != input_path:
+            cleanup_task_artifacts(input_path)
+        return output_path
+
+    return input_path
+
+
+async def apply_watermark(input_path, output_path=None):
+    input_path = Path(input_path)
+
+    if output_path is None:
+        output_path = input_path.with_name(
+            f"{input_path.stem}.watermark{input_path.suffix}"
+        )
+    else:
+        output_path = Path(output_path)
+
+    if not WATERMARK_PATH.exists():
+        return input_path
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-i",
+        str(WATERMARK_PATH),
+        "-filter_complex",
+        "overlay=W-w-20:H-h-20",
+        "-c:a",
+        "copy",
+        str(output_path),
+    ]
+
+    await run_command_async(command)
+
+    if output_path.exists():
+        if output_path != input_path:
+            cleanup_task_artifacts(input_path)
+        return output_path
+
+    return input_path
+
+
+async def filter_audio_tracks(input_path, mode=None):
+    input_path = Path(input_path)
+
+    if mode is None:
+        mode = SETTINGS.get(
+            "audio_track_mode",
+            "all",
+        )
+
+    if mode == "all":
+        return input_path
+
+    if mode not in {"first", "second"}:
+        return input_path
+
+    output_path = input_path.with_name(
+        f"{input_path.stem}.audio{input_path.suffix}"
+    )
+
+    audio_index = "0" if mode == "first" else "1"
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        f"0:a:{audio_index}",
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+
+    try:
+        await run_command_async(command)
+    except Exception:
+        return input_path
+
+    if output_path.exists():
+        cleanup_task_artifacts(input_path)
+        return output_path
+
+    return input_path
+
+
+async def apply_resolution_downscale(
+    input_path,
+    resolution="original",
 ):
+    input_path = Path(input_path)
+
+    resolution = str(resolution).lower()
+
+    height_map = {
+        "360p": 360,
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+    }
+
+    height = height_map.get(resolution)
+
+    if not height:
+        return input_path
+
+    width, current_height = get_video_dimensions(
+        input_path
+    )
+
+    if current_height and current_height <= height:
+        return input_path
+
+    output_path = input_path.with_name(
+        f"{input_path.stem}.{resolution}{input_path.suffix}"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"scale=-2:{height}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "copy",
+        str(output_path),
+    ]
+
+    await run_command_async(command)
+
+    if output_path.exists():
+        cleanup_task_artifacts(input_path)
+        return output_path
+
+    return input_path
+
+
+async def extract_subtitles_from_video(video_path):
     video_path = Path(video_path)
 
-    output_path = video_path.with_suffix(
-        ".srt"
-    )
+    output_path = video_path.with_suffix(".srt")
 
     command = [
         "ffmpeg",
@@ -329,267 +536,6 @@ async def extract_subtitles_from_video(
     return None
 
 
-async def apply_audio_track_filter(
-    input_path,
-    output_path,
-    mode="all",
-):
-    if mode == "all":
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    if mode not in {
-        "first",
-        "second",
-    }:
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    index = "0" if mode == "first" else "1"
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        f"0:a:{index}",
-        "-c",
-        "copy",
-        str(output_path),
-    ]
-
-    await run_command_async(command)
-
-    return output_path
-
-
-async def downscale_video(
-    input_path,
-    output_path,
-    resolution="original",
-):
-    if resolution == "original":
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    height_map = {
-        "360p": 360,
-        "480p": 480,
-        "720p": 720,
-        "1080p": 1080,
-    }
-
-    height = height_map.get(
-        str(resolution).lower()
-    )
-
-    if not height:
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vf",
-        f"scale=-2:{height}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "copy",
-        str(output_path),
-    ]
-
-    await run_command_async(command)
-
-    return output_path
-
-
-async def compress_video(
-    input_path,
-    output_path,
-):
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        str(output_path),
-    ]
-
-    await run_command_async(command)
-
-    return output_path
-
-
-async def add_watermark(
-    input_path,
-    output_path,
-):
-    if not Path(WATERMARK_PATH).exists():
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-i",
-        str(WATERMARK_PATH),
-        "-filter_complex",
-        "overlay=W-w-20:H-h-20",
-        "-c:a",
-        "copy",
-        str(output_path),
-    ]
-
-    await run_command_async(command)
-
-    return output_path
-
-
-async def trim_video(
-    input_path,
-    output_path,
-    start,
-    end,
-):
-    duration = max(
-        0,
-        float(end) - float(start),
-    )
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        str(start),
-        "-i",
-        str(input_path),
-        "-t",
-        str(duration),
-        "-c",
-        "copy",
-        str(output_path),
-    ]
-
-    await run_command_async(command)
-
-    return output_path
-
-
-async def generate_sample_clip(
-    input_path,
-    output_path,
-    seconds=30,
-):
-    duration = get_video_duration(
-        input_path
-    )
-
-    clip_length = min(
-        float(seconds),
-        duration,
-    )
-
-    if clip_length <= 0:
-        return None
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-t",
-        str(clip_length),
-        "-c",
-        "copy",
-        str(output_path),
-    ]
-
-    try:
-        await run_command_async(command)
-        return output_path
-    except Exception:
-        return None
-
-
-async def generate_screenshots_collage(
-    input_path,
-    output_path,
-    count=4,
-):
-    duration = get_video_duration(
-        input_path
-    )
-
-    if duration <= 0:
-        return None
-
-    count = max(
-        1,
-        int(count),
-    )
-
-    fps = count / duration
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vf",
-        (
-            f"fps={fps},"
-            "scale=320:-1,"
-            "tile=2x2"
-        ),
-        "-frames:v",
-        "1",
-        str(output_path),
-    ]
-
-    try:
-        await run_command_async(command)
-        return output_path
-    except Exception:
-        return None
-
-
 def split_large_file(
     file_path,
     max_size=MAX_SPLIT_SIZE,
@@ -604,15 +550,11 @@ def split_large_file(
 
     parts = []
 
-    with file_path.open(
-        "rb"
-    ) as source:
+    with file_path.open("rb") as source:
         index = 1
 
         while True:
-            chunk = source.read(
-                max_size
-            )
+            chunk = source.read(max_size)
 
             if not chunk:
                 break
@@ -621,9 +563,7 @@ def split_large_file(
                 f"{file_path.stem}.part{index:02d}{file_path.suffix}"
             )
 
-            with part_path.open(
-                "wb"
-            ) as destination:
+            with part_path.open("wb") as destination:
                 destination.write(chunk)
 
             parts.append(part_path)
@@ -632,9 +572,7 @@ def split_large_file(
     return parts
 
 
-def cleanup_task_artifacts(
-    *paths,
-):
+def cleanup_task_artifacts(*paths):
     for path in paths:
         if not path:
             continue
@@ -643,9 +581,7 @@ def cleanup_task_artifacts(
             path = Path(path)
 
             if path.is_file() or path.is_symlink():
-                path.unlink(
-                    missing_ok=True
-                )
+                path.unlink(missing_ok=True)
 
             elif path.is_dir():
                 shutil.rmtree(
@@ -663,14 +599,10 @@ def update_stats(
     downloaded_bytes=None,
 ):
     if successful is not None:
-        STATS["successful"] += int(
-            successful
-        )
+        STATS["successful"] += int(successful)
 
     if failed is not None:
-        STATS["failed"] += int(
-            failed
-        )
+        STATS["failed"] += int(failed)
 
     if downloaded_bytes is not None:
         STATS["total_downloaded"] += int(
