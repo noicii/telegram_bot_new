@@ -1,0 +1,12 @@
+pyrogram
+tgcrypto
+aiohttp
+aiofiles
+beautifulsoup4
+lxml
+yt-dlp
+requests
+python-dotenv
+curl_cffi
+psutil
+playwright
