@@ -1,3 +1,7 @@
+cd ~/telegram_bot_new
+source venv/bin/activate
+
+cat > bot.py <<'PY'
 import logging
 
 from pyrogram import Client, idle
@@ -28,6 +32,22 @@ logging.basicConfig(
 logger = logging.getLogger("telegram_bot")
 
 
+if not API_ID:
+    raise RuntimeError("API_ID is missing")
+
+if not API_HASH:
+    raise RuntimeError("API_HASH is missing")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+
+init_db()
+
+logger.info("Bot configuration loaded")
+logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
+
+
 app = Client(
     "telegram_bot_session",
     api_id=API_ID,
@@ -36,52 +56,18 @@ app = Client(
     workers=8,
 )
 
-
 register_handlers(app)
 
 
-async def startup():
-    init_db()
-
-    if not API_ID:
-        raise RuntimeError("API_ID is missing")
-
-    if not API_HASH:
-        raise RuntimeError("API_HASH is missing")
-
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
-
-    logger.info("Bot configuration loaded")
-    logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
-
-
 if __name__ == "__main__":
-    import asyncio
-
-    async def main():
-        await startup()
-
-        await app.start()
-
-        me = await app.get_me()
-
-        logger.info(
-            "Bot started: @%s (%s)",
-            me.username,
-            me.id,
-        )
-
-        await idle()
-
-        await app.stop()
-
     try:
-        asyncio.run(main())
-
+        app.run()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-
     except Exception:
         logger.exception("Bot crashed")
         raise
+PY
+
+python -m py_compile bot.py
+echo "BOT.PY FIXED AND COMPILES OK"
