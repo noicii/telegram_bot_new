@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -16,7 +15,6 @@ from config import (
     SETTINGS,
     STATS,
     WATERMARK_PATH,
-    save_settings,
     save_stats,
 )
 
@@ -108,8 +106,10 @@ def clean_title(title, idx=None):
     if idx is not None:
         try:
             idx = int(idx)
+
             if idx > 0:
                 title = f"{title}_{idx}"
+
         except (TypeError, ValueError):
             pass
 
@@ -180,11 +180,51 @@ def get_video_metadata(path):
         return {}
 
 
+async def async_get_video_metadata(path):
+    metadata = get_video_metadata(path)
+
+    duration = 0.0
+    width = 0
+    height = 0
+
+    try:
+        duration = float(
+            metadata.get("format", {}).get(
+                "duration",
+                0,
+            )
+        )
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    for stream in metadata.get("streams", []):
+        if stream.get("codec_type") == "video":
+            try:
+                width = int(
+                    stream.get("width", 0)
+                )
+            except (TypeError, ValueError):
+                width = 0
+
+            try:
+                height = int(
+                    stream.get("height", 0)
+                )
+            except (TypeError, ValueError):
+                height = 0
+
+            break
+
+    return duration, width, height
+
+
 def get_video_duration(path):
     metadata = get_video_metadata(path)
 
     try:
-        return float(metadata["format"]["duration"])
+        return float(
+            metadata["format"]["duration"]
+        )
     except (KeyError, TypeError, ValueError):
         return 0.0
 
@@ -205,10 +245,16 @@ def get_video_dimensions(path):
     return 0, 0
 
 
-def check_disk_space_guard(required_gb=MIN_DISK_FREE_GB):
-    usage = shutil.disk_usage(str(DOWNLOAD_DIR))
+def check_disk_space_guard(
+    required_gb=MIN_DISK_FREE_GB,
+):
+    usage = shutil.disk_usage(
+        str(DOWNLOAD_DIR)
+    )
 
-    free_gb = usage.free / (1024 ** 3)
+    free_gb = usage.free / (
+        1024 ** 3
+    )
 
     if free_gb < required_gb:
         raise RuntimeError(
@@ -284,7 +330,10 @@ def get_main_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def trim_video_file(input_path, trim_info):
+async def trim_video_file(
+    input_path,
+    trim_info,
+):
     if not trim_info:
         return input_path
 
@@ -329,7 +378,10 @@ async def trim_video_file(input_path, trim_info):
     return input_path
 
 
-async def compress_video(input_path, output_path=None):
+async def compress_video(
+    input_path,
+    output_path=None,
+):
     input_path = Path(input_path)
 
     if output_path is None:
@@ -362,12 +414,16 @@ async def compress_video(input_path, output_path=None):
     if output_path.exists():
         if output_path != input_path:
             cleanup_task_artifacts(input_path)
+
         return output_path
 
     return input_path
 
 
-async def apply_watermark(input_path, output_path=None):
+async def apply_watermark(
+    input_path,
+    output_path=None,
+):
     input_path = Path(input_path)
 
     if output_path is None:
@@ -399,12 +455,16 @@ async def apply_watermark(input_path, output_path=None):
     if output_path.exists():
         if output_path != input_path:
             cleanup_task_artifacts(input_path)
+
         return output_path
 
     return input_path
 
 
-async def filter_audio_tracks(input_path, mode=None):
+async def filter_audio_tracks(
+    input_path,
+    mode=None,
+):
     input_path = Path(input_path)
 
     if mode is None:
@@ -416,14 +476,21 @@ async def filter_audio_tracks(input_path, mode=None):
     if mode == "all":
         return input_path
 
-    if mode not in {"first", "second"}:
+    if mode not in {
+        "first",
+        "second",
+    }:
         return input_path
 
     output_path = input_path.with_name(
         f"{input_path.stem}.audio{input_path.suffix}"
     )
 
-    audio_index = "0" if mode == "first" else "1"
+    audio_index = (
+        "0"
+        if mode == "first"
+        else "1"
+    )
 
     command = [
         "ffmpeg",
@@ -441,6 +508,7 @@ async def filter_audio_tracks(input_path, mode=None):
 
     try:
         await run_command_async(command)
+
     except Exception:
         return input_path
 
@@ -457,7 +525,9 @@ async def apply_resolution_downscale(
 ):
     input_path = Path(input_path)
 
-    resolution = str(resolution).lower()
+    resolution = str(
+        resolution
+    ).lower()
 
     height_map = {
         "360p": 360,
@@ -466,13 +536,15 @@ async def apply_resolution_downscale(
         "1080p": 1080,
     }
 
-    height = height_map.get(resolution)
+    height = height_map.get(
+        resolution
+    )
 
     if not height:
         return input_path
 
-    width, current_height = get_video_dimensions(
-        input_path
+    _, current_height = (
+        get_video_dimensions(input_path)
     )
 
     if current_height and current_height <= height:
@@ -509,18 +581,114 @@ async def apply_resolution_downscale(
     return input_path
 
 
-async def extract_subtitles_from_video(video_path):
-    video_path = Path(video_path)
+async def generate_sample_clip(
+    input_path,
+    output_path,
+    seconds=30,
+):
+    duration = get_video_duration(
+        input_path
+    )
 
-    output_path = video_path.with_suffix(".srt")
+    clip_length = min(
+        float(seconds),
+        duration,
+    )
+
+    if clip_length <= 0:
+        return None
 
     command = [
         "ffmpeg",
         "-y",
         "-i",
-        str(video_path),
-        "-map",
-        "0:s:0",
+        str(input_path),
+        "-t",
+        str(clip_length),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+
+    try:
+        await run_command_async(command)
+        return output_path
+    except Exception:
+        return None
+
+
+async def generate_screenshots_collage(
+    input_path,
+    output_path,
+    count=4,
+):
+    duration = get_video_duration(
+        input_path
+    )
+
+    if duration <= 0:
+        return None
+
+    count = max(
+        1,
+        int(count),
+    )
+
+    fps = count / duration
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        (
+            f"fps={fps},"
+            "scale=320:-1,"
+            "tile=2x2"
+        ),
+        "-frames:v",
+        "1",
+        str(output_path),
+    ]
+
+    try:
+        await run_command_async(command)
+        return output_path
+    except Exception:
+        return None
+
+
+async def generate_auto_thumbnail(
+    input_path,
+    output_path,
+):
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    duration = get_video_duration(
+        input_path
+    )
+
+    if duration <= 0:
+        return None
+
+    timestamp = min(
+        5.0,
+        max(0.0, duration / 2),
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(timestamp),
+        "-i",
+        str(input_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:-2",
         str(output_path),
     ]
 
@@ -531,7 +699,7 @@ async def extract_subtitles_from_video(video_path):
             return output_path
 
     except Exception:
-        return None
+        pass
 
     return None
 
@@ -554,7 +722,9 @@ def split_large_file(
         index = 1
 
         while True:
-            chunk = source.read(max_size)
+            chunk = source.read(
+                max_size
+            )
 
             if not chunk:
                 break
@@ -572,7 +742,9 @@ def split_large_file(
     return parts
 
 
-def cleanup_task_artifacts(*paths):
+def cleanup_task_artifacts(
+    *paths,
+):
     for path in paths:
         if not path:
             continue
@@ -581,7 +753,9 @@ def cleanup_task_artifacts(*paths):
             path = Path(path)
 
             if path.is_file() or path.is_symlink():
-                path.unlink(missing_ok=True)
+                path.unlink(
+                    missing_ok=True
+                )
 
             elif path.is_dir():
                 shutil.rmtree(
@@ -599,10 +773,14 @@ def update_stats(
     downloaded_bytes=None,
 ):
     if successful is not None:
-        STATS["successful"] += int(successful)
+        STATS["successful"] += int(
+            successful
+        )
 
     if failed is not None:
-        STATS["failed"] += int(failed)
+        STATS["failed"] += int(
+            failed
+        )
 
     if downloaded_bytes is not None:
         STATS["total_downloaded"] += int(
