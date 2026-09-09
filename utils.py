@@ -580,7 +580,31 @@ async def apply_resolution_downscale(
 
     return input_path
 
+async def extract_subtitles_from_video(video_path):
+    video_path = Path(video_path)
 
+    output_path = video_path.with_suffix(".srt")
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:s:0",
+        str(output_path),
+    ]
+
+    try:
+        await run_command_async(command)
+
+        if output_path.exists():
+            return output_path
+
+    except Exception:
+        return None
+
+    return None
 async def generate_sample_clip(
     input_path,
     output_path,
