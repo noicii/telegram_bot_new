@@ -1,10 +1,6 @@
-cd ~/telegram_bot_new
-source venv/bin/activate
-
-cat > bot.py <<'PY'
 import logging
 
-from pyrogram import Client, idle
+from pyrogram import Client
 
 from config import (
     API_HASH,
@@ -32,6 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram_bot")
 
 
+# Validate required configuration before starting.
 if not API_ID:
     raise RuntimeError("API_ID is missing")
 
@@ -42,12 +39,14 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
 
+# Initialize database.
 init_db()
 
 logger.info("Bot configuration loaded")
 logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
 
 
+# Create the Pyrogram client.
 app = Client(
     "telegram_bot_session",
     api_id=API_ID,
@@ -56,18 +55,19 @@ app = Client(
     workers=8,
 )
 
+
+# Register all bot handlers.
 register_handlers(app)
 
 
 if __name__ == "__main__":
     try:
+        logger.info("Starting Telegram bot...")
         app.run()
+
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+
     except Exception:
         logger.exception("Bot crashed")
         raise
-PY
-
-python -m py_compile bot.py
-echo "BOT.PY FIXED AND COMPILES OK"
