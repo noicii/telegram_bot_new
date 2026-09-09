@@ -151,7 +151,7 @@ def register_handlers(app):
             setting_name = data.replace("toggle_", "")
             await callback_query.answer(f"✅ Setting {setting_name} toggled!", show_alert=False)
         elif data == "cancel" or data == "cancel_process":
-            CANCELLED_TASKS.add(user_id)
+            CANCELLED_TASKS.add("all")
             await callback_query.answer("🛑 Task cancelled successfully!", show_alert=True)
         else:
             await callback_query.answer(f"⚙️ Action received: {data}", show_alert=False)
@@ -197,7 +197,7 @@ async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="
         clean_file_label = re.sub(r"[/\\*?:\"<>|]", "", t).strip()
         all_channels = [ch] + [ec for ec in SETTINGS.get("extra_channels", []) if ec != ch]
 
-        split_files = await split_large_file(f)
+        split_files = split_large_file(f)
         for p_idx, part_path in enumerate(split_files, 1):
             part_label = f"{clean_file_label} (Part {p_idx})" if len(split_files) > 1 else clean_file_label
             p_sz = os.path.getsize(part_path) / 1048576
