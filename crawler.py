@@ -259,3 +259,56 @@ def parse_input_lines(lines):
             results.append(item)
 
     return results
+def crawl_blog_episodes(raw_url):
+    raw_url = raw_url.strip()
+
+    if not raw_url or not is_http_url(raw_url):
+        return []
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    try:
+        response = requests.get(
+            raw_url,
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return []
+
+    soup = BeautifulSoup(response.text, "lxml")
+    results = []
+    current_episode = None
+
+    for element in soup.select(".entry-content h5"):
+        text = element.get_text(" ", strip=True)
+
+        match = re.search(
+            r"Download\s+Episode\s+(\d+)",
+            text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            current_episode = f"Episode {match.group(1)}"
+            continue
+
+        if not current_episode:
+            continue
+
+        for anchor in element.find_all("a", href=True):
+            href = anchor.get("href", "").strip()
+
+            if "luluvid.com" in href.lower():
+                results.append({
+                    "title": current_episode,
+                    "url": href,
+                })
+                break
+
+    return results
