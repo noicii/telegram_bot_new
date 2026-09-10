@@ -10,3 +10,6 @@ logs/
 data/
 
 assets/
+
+# Local development backups
+*.backup_before_*

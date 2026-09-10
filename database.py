@@ -150,11 +150,32 @@ def clear_crawl_items_db(chat_id):
         conn.execute("DELETE FROM crawl_items WHERE chat_id = ?", (chat_id,))
         conn.commit()
 
-def add_crawl_item_db(chat_id, title, episode, url):
+def add_crawl_item_db(
+    chat_id,
+    title,
+    episode,
+    url,
+    source=None,
+    resolution=None,
+    source_url=None,
+):
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO crawl_items (chat_id, title, episode, url, selected, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-            (chat_id, title, episode, url, datetime.utcnow().isoformat()),
+            """
+            INSERT INTO crawl_items
+            (chat_id, title, episode, url, selected, created_at, source, resolution, source_url)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                title,
+                episode,
+                url,
+                datetime.utcnow().isoformat(),
+                source or "Unknown",
+                resolution or "Unknown",
+                source_url or url,
+            ),
         )
         conn.commit()
         return cursor.lastrowid

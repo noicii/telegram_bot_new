@@ -269,7 +269,6 @@ def crawl_blog_episodes(raw_url):
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml",
     }
-
     try:
         response = requests.get(
             raw_url,
@@ -280,7 +279,6 @@ def crawl_blog_episodes(raw_url):
 
         if response.status_code == 403:
             return []
-
         response.raise_for_status()
 
     except requests.RequestException:
@@ -292,9 +290,7 @@ def crawl_blog_episodes(raw_url):
         "just a moment...",
         "__cf_chl_",
         "cf-chl-",
-        "cloudflare",
     )
-
     if sum(
         1 for marker in challenge_markers
         if marker in response_text_lower
@@ -306,113 +302,168 @@ def crawl_blog_episodes(raw_url):
     from html import unescape
 
     results = []
-    current_episode = None
-    current_title = None
-    current_lulu_url = None
-    title_template = None
+    current_episode = "Unknown Episode"
+    def clean_text(value):
+        value = unescape(unquote(value or ""))
+        value = value.replace("+", " ")
+        return re.sub(r"\s+", " ", value).strip()
 
-    for element in soup.select(".entry-content *"):
-        if element.name == "h5":
-            heading = element.get_text(" ", strip=True)
+    def detect_episode(value):
+        value = clean_text(value)
 
-            match = re.search(
-                r"Download\s+Episode\s+(\d+)",
-                heading,
-                re.IGNORECASE,
-            )
-
+        patterns = (
+            r"\bS\d{1,2}E(\d{1,4})\b",
+            r"\bEpisode[\s._-]*(\d{1,4})\b",
+            r"\bEp[\s._-]*(\d{1,4})\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, value, re.IGNORECASE)
             if match:
-                current_episode = f"Episode {match.group(1)}"
-                current_title = current_episode
-                current_lulu_url = None
+                return f"Episode {int(match.group(1))}"
 
-            continue
+        return None
 
-        if element.name != "a" or not current_episode:
-            continue
+    def detect_resolution(value):
+        value = clean_text(value)
 
-        href = element.get("href", "").strip()
+        if re.search(r"\b1080p\b", value, re.IGNORECASE):
+            if re.search(r"\b(?:HEVC|H265|H\.265|x265)\b", value, re.IGNORECASE):
+                return "1080p HEVC"
+            return "1080p"
 
-        if not href:
-            continue
+        if re.search(r"\b720p\b", value, re.IGNORECASE):
+            return "720p"
+
+        if re.search(r"\b480p\b", value, re.IGNORECASE):
+            return "480p"
+
+        if re.search(r"\b2160p\b|\b4K\b", value, re.IGNORECASE):
+            return "2160p"
+
+        return "Unknown"
+    def detect_source(href, link_text):
+        combined = f"{href} {link_text}".lower()
+
+        source_patterns = (
+            ("FRDL", ("frdl.my", "frdl.io")),
+            ("LuluStream", ("luluvid.com", "lulustream")),
+            ("DoodStream", ("doodstream", "myvidplay.com")),
+            ("StreamWish", ("streamwish",)),
+            ("Vidhide", ("vidhide",)),
+        )
+
+        for source_name, markers in source_patterns:
+            if any(marker in combined for marker in markers):
+                return source_name
+
+        parsed = urlparse(href)
+        return parsed.netloc or "Unknown"
+    def make_title(episode, source, resolution, href, link_text):
+        decoded_href = clean_text(href)
+
+        filename_match = re.search(
+            r"/([^/?#]+\.(?:mkv|mp4|m4v|webm|mov))(?:[?#].*)?$",
+            decoded_href,
+            re.IGNORECASE,
+        )
+
+        if filename_match:
+            return filename_match.group(1)
+
+        parts = [episode]
+
+        if resolution != "Unknown":
+            parts.append(resolution)
+
+        if source != "Unknown":
+            parts.append(source)
+
+        return " • ".join(parts)
+    def add_result(episode, href, link_text):
+        href = clean_text(href)
+
+        if not href or not is_http_url(href):
+            return
 
         href_lower = href.lower()
 
-        # LuluStream/Luluvid link for the current episode.
-        if "luluvid.com" in href_lower:
-            current_lulu_url = href
-
-            display_title = current_title
-
-            if (
-                display_title == current_episode
-                and title_template
-                and current_episode
-            ):
-                episode_match = re.search(
-                    r"(\d+)$",
-                    current_episode,
-                )
-
-                if episode_match:
-                    display_title = title_template.format(
-                        episode=episode_match.group(1).zfill(2)
-                    )
-
-            if current_lulu_url:
-                results.append({
-                    "title": display_title,
-                    "episode": current_episode,
-                    "url": current_lulu_url,
-                })
-
-            current_lulu_url = None
-            current_title = current_episode
-            continue
-
-        # FRDL filename for the current episode.
-        if "frdl.io" in href_lower:
-            decoded = unescape(unquote(href))
-
-            filename_match = re.search(
-                r"/([^/?#]+\.(?:mkv|mp4|m4v|webm|mov))(?:[?#].*)?$",
-                decoded,
+        media_like = bool(
+            re.search(
+                r"\.(?:mkv|mp4|m4v|webm|mov)(?:[?#].*)?$",
+                href_lower,
                 re.IGNORECASE,
             )
+        )
 
-            if filename_match:
-                current_title = filename_match.group(1)
-                current_title = current_title.replace("+", " ").strip()
+        protected_like = any(
+            domain in href_lower
+            for domain in PROTECTED_DOMAINS
+        )
 
-                # Save the naming pattern from the first available
-                # episode so episodes without FRDL filenames can
-                # still receive a meaningful display title.
-                if title_template is None:
-                    template_match = re.search(
-                        r"^(.*S\d+)E\d+(\.\w+)$",
-                        current_title,
-                        re.IGNORECASE,
-                    )
+        source = detect_source(href, link_text)
+        resolution = detect_resolution(
+            f"{href} {link_text}"
+        )
 
-                    if template_match:
-                        title_template = (
-                            template_match.group(1)
-                            + "E{episode}"
-                            + template_match.group(2)
-                        )
+        if not (media_like or protected_like or source != "Unknown"):
+            return
+        detected_episode = detect_episode(f"{href} {link_text}")
+        final_episode = detected_episode or episode
 
-    # Remove duplicate Luluvid URLs while preserving order.
+        title = make_title(
+            final_episode,
+            source,
+            resolution,
+            href,
+            link_text,
+        )
+
+        results.append({
+            "title": title,
+            "episode": final_episode,
+            "url": href,
+            "source": source,
+            "resolution": resolution,
+            "source_url": raw_url,
+        })
+
+    content = soup.select_one(".entry-content") or soup
+
+    for element in content.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "h6", "a"]
+    ):
+        if element.name != "a":
+            heading_text = clean_text(
+                element.get_text(" ", strip=True)
+            )
+            detected_episode = detect_episode(heading_text)
+
+            if detected_episode:
+                current_episode = detected_episode
+
+            continue
+
+        href = element.get("href", "").strip()
+        link_text = element.get_text(" ", strip=True)
+
+        detected_episode = detect_episode(
+            f"{link_text} {href}"
+        )
+
+        add_result(
+            detected_episode or current_episode,
+            href,
+            link_text,
+        )
+
     unique_results = []
     seen_urls = set()
 
     for item in results:
-        url = item["url"]
-
-        if url in seen_urls:
+        if item["url"] in seen_urls:
             continue
 
-        seen_urls.add(url)
+        seen_urls.add(item["url"])
         unique_results.append(item)
 
     return unique_results
-

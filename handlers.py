@@ -18,22 +18,49 @@ current_active_task = None
 def build_crawl_keyboard(items):
     buttons = []
 
+    # Group items by episode while preserving crawler order.
+    episodes = {}
     for item in items:
-        icon = "✅" if item["selected"] else "⬜"
-        title = item["title"]
-        if len(title) > 42:
-            title = title[:39] + "..."
+        episode = item.get("episode") or "Unknown Episode"
+        episodes.setdefault(episode, []).append(item)
+
+    for episode, episode_items in episodes.items():
         buttons.append([
             InlineKeyboardButton(
-                f"{icon} {item['episode']} - {title}",
-                callback_data=f"crawl_toggle_{item['id']}",
+                f"🎬 {episode}",
+                callback_data="crawl_noop",
             )
         ])
 
+        for item in episode_items:
+            icon = "✅" if item["selected"] else "⬜"
+            source = item.get("source") or "Unknown"
+            resolution = item.get("resolution") or "Unknown"
+
+            label = f"{icon} {source} • {resolution}"
+
+            # Telegram inline button text should stay reasonably short.
+            if len(label) > 60:
+                label = label[:57] + "..."
+
+            buttons.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"crawl_toggle_{item['id']}",
+                )
+            ])
+
     buttons.append([
-        InlineKeyboardButton("☑️ Select All", callback_data="crawl_select_all"),
-        InlineKeyboardButton("❌ Clear", callback_data="crawl_clear_all"),
+        InlineKeyboardButton(
+            "☑️ Select All",
+            callback_data="crawl_select_all",
+        ),
+        InlineKeyboardButton(
+            "❌ Clear",
+            callback_data="crawl_clear_all",
+        ),
     ])
+
     buttons.append([
         InlineKeyboardButton(
             "🚀 Download Selected",
@@ -193,6 +220,9 @@ def register_handlers(app):
                 episode["title"],
                 episode["episode"],
                 episode["url"],
+                episode.get("source", "Unknown"),
+                episode.get("resolution", "Unknown"),
+                episode.get("source_url", episode["url"]),
             )
 
         items = get_crawl_items_db(m.from_user.id)
@@ -218,9 +248,13 @@ def register_handlers(app):
         data = callback_query.data
         chat_id = callback_query.message.chat.id
 
+        if data == "crawl_noop":
+            return await callback_query.answer("📂 Episode options નીચે છે.", show_alert=False)
+
         if data == "crawl_select_all":
             select_all_crawl_items_db(chat_id)
             items = get_crawl_items_db(chat_id)
+            await callback_query.answer("☑️ બધા options select થયા.", show_alert=False)
             await callback_query.message.edit_reply_markup(
                 build_crawl_keyboard(items)
             )
@@ -229,6 +263,7 @@ def register_handlers(app):
         if data == "crawl_clear_all":
             clear_selected_crawl_items_db(chat_id)
             items = get_crawl_items_db(chat_id)
+            await callback_query.answer("❌ Selection clear થઈ ગઈ.", show_alert=False)
             await callback_query.message.edit_reply_markup(
                 build_crawl_keyboard(items)
             )
@@ -239,12 +274,18 @@ def register_handlers(app):
 
             if not selected_items:
                 return await callback_query.answer(
-                    "⚠️ પહેલા ઓછામાં ઓછું એક Episode select કરો.",
+                    "⚠️ પહેલા ઓછામાં ઓછું એક option select કરો.",
                     show_alert=True,
                 )
 
+            await callback_query.answer(
+                f"🚀 {len(selected_items)} options queueમાં ઉમેરાઈ રહ્યા છે...",
+                show_alert=False,
+            )
+
             await callback_query.message.edit_text(
-                f"🚀 **{len(selected_items)} Episodes selected.**\n\n⏳ Queue માં ઉમેરાઈ રહ્યા છે..."
+                f"🚀 **{len(selected_items)} options selected.**\n\n"
+                "⏳ Queue માં ઉમેરાઈ રહ્યા છે..."
             )
 
             queue_items = [
@@ -252,6 +293,9 @@ def register_handlers(app):
                     "url": item["url"],
                     "chat_id": chat_id,
                     "custom_name": item["title"],
+                    "source": item.get("source", "Unknown"),
+                    "resolution": item.get("resolution", "Unknown"),
+                    "source_url": item.get("source_url", item["url"]),
                 }
                 for item in selected_items
             ]
@@ -268,28 +312,33 @@ def register_handlers(app):
             try:
                 item_id = int(data.rsplit("_", 1)[1])
             except ValueError:
-                return await callback_query.answer("❌ Invalid item", show_alert=True)
+                return await callback_query.answer(
+                    "❌ Invalid item",
+                    show_alert=True,
+                )
 
             item = get_crawl_item_db(item_id, chat_id)
             if not item:
-                return await callback_query.answer("❌ Item not found", show_alert=True)
+                return await callback_query.answer(
+                    "❌ Item not found",
+                    show_alert=True,
+                )
 
             toggle_crawl_item_db(item_id, chat_id)
 
             items = get_crawl_items_db(chat_id)
-            lines = [
-                "🎬 **Crawl Complete**",
-                "",
-                f"📦 કુલ Episodes: **{len(items)}**",
-                "",
-                "👇 Download માટે Episodes select કરો.",
-            ]
+            selected_count = sum(1 for current_item in items if current_item["selected"])
 
-            for index, current_item in enumerate(items, 1):
-                lines.append(f"**{index}. {current_item['title']}**")
+            await callback_query.answer(
+                f"Selection: {selected_count}/{len(items)}",
+                show_alert=False,
+            )
 
             await callback_query.message.edit_text(
-                "\\n".join(lines),
+                "🎬 **Crawl Complete**\n\n"
+                f"📦 Total options: **{len(items)}**\n"
+                f"✅ Selected: **{selected_count}**\n\n"
+                "👇 દરેક Episodeમાંથી Source/Resolution પસંદ કરો.",
                 reply_markup=build_crawl_keyboard(items),
             )
             return
