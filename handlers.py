@@ -102,7 +102,7 @@ def register_handlers(app):
             reply_markup=get_main_keyboard()
         )
 
-    @app.on_message(filters.text & filters.private)
+    @app.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
     async def _tx(c, m):
         global current_active_task
         if not is_authorized(m.from_user.id, ADMIN_IDS) or m.text.startswith("/"):
