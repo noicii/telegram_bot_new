@@ -309,6 +309,7 @@ def crawl_blog_episodes(raw_url):
     current_episode = None
     current_title = None
     current_lulu_url = None
+    title_template = None
 
     for element in soup.select(".entry-content *"):
         if element.name == "h5":
@@ -341,9 +342,26 @@ def crawl_blog_episodes(raw_url):
         if "luluvid.com" in href_lower:
             current_lulu_url = href
 
-            if current_title and current_lulu_url:
+            display_title = current_title
+
+            if (
+                display_title == current_episode
+                and title_template
+                and current_episode
+            ):
+                episode_match = re.search(
+                    r"(\d+)$",
+                    current_episode,
+                )
+
+                if episode_match:
+                    display_title = title_template.format(
+                        episode=episode_match.group(1).zfill(2)
+                    )
+
+            if current_lulu_url:
                 results.append({
-                    "title": current_title,
+                    "title": display_title,
                     "episode": current_episode,
                     "url": current_lulu_url,
                 })
@@ -365,6 +383,23 @@ def crawl_blog_episodes(raw_url):
             if filename_match:
                 current_title = filename_match.group(1)
                 current_title = current_title.replace("+", " ").strip()
+
+                # Save the naming pattern from the first available
+                # episode so episodes without FRDL filenames can
+                # still receive a meaningful display title.
+                if title_template is None:
+                    template_match = re.search(
+                        r"^(.*S\d+)E\d+(\.\w+)$",
+                        current_title,
+                        re.IGNORECASE,
+                    )
+
+                    if template_match:
+                        title_template = (
+                            template_match.group(1)
+                            + "E{episode}"
+                            + template_match.group(2)
+                        )
 
     # Remove duplicate Luluvid URLs while preserving order.
     unique_results = []
