@@ -114,6 +114,17 @@ def resolve_blog_links(raw_url):
     )
 
     results = []
+    # Search video/source tags.
+    media_ext = (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".m3u8", ".mpd")
+
+    for tag in soup.find_all(["video", "source"]):
+        for attr in ("src", "data-src", "data-url", "data-video", "data-file"):
+            value = tag.get(attr)
+            if value:
+                absolute_url = urljoin(response.url, value.strip())
+                clean_url = absolute_url.split("?", 1)[0].lower()
+                if clean_url.endswith(media_ext):
+                    results.append(absolute_url)
 
     # Search links from href attributes.
     for anchor in soup.find_all("a", href=True):
@@ -138,7 +149,7 @@ def resolve_blog_links(raw_url):
     # Preserve order and remove duplicates.
     results = list(dict.fromkeys(results))
 
-    return results if results else [raw_url]
+    return results
 
 
 def parse_time_range(value):
