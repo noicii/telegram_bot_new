@@ -67,7 +67,7 @@ if __name__ == "__main__":
 
     async def run_bot():
         logger.info("Starting Telegram bot...")
-        app.start()
+        await app.start()
 
         logger.info("Telegram client started")
 
@@ -81,7 +81,7 @@ if __name__ == "__main__":
             await stop_queue_worker()
 
             logger.info("Stopping Telegram bot...")
-            app.stop()
+            await app.stop()
             logger.info("Telegram bot stopped")
 
     try:
