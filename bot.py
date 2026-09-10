@@ -11,6 +11,7 @@ from config import (
 )
 from database import init_db
 from handlers import register_handlers
+from queue_worker import start_queue_worker, stop_queue_worker
 
 
 logging.basicConfig(
@@ -61,9 +62,30 @@ register_handlers(app)
 
 
 if __name__ == "__main__":
-    try:
+    import asyncio
+    from pyrogram import idle
+
+    async def run_bot():
         logger.info("Starting Telegram bot...")
-        app.run()
+        app.start()
+
+        logger.info("Telegram client started")
+
+        start_queue_worker(app)
+        logger.info("Queue worker started")
+
+        try:
+            await idle()
+        finally:
+            logger.info("Stopping queue worker...")
+            await stop_queue_worker()
+
+            logger.info("Stopping Telegram bot...")
+            app.stop()
+            logger.info("Telegram bot stopped")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(run_bot())
 
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")

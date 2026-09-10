@@ -15,21 +15,22 @@ from utils import (
     trim_video_file, compress_video, apply_watermark, filter_audio_tracks, apply_resolution_downscale
 )
 
-download_semaphore = asyncio.Semaphore(2)
+segment_semaphore = asyncio.Semaphore(8)
 CANCELLED_TASKS = set()
 
 class DashboardTracker:
-    def __init__(self, msg, cur_idx, total_items, item_name, start_time):
+    def __init__(self, msg, cur_idx, total_items, item_name, start_time, task_id=None):
         self.msg = msg
         self.cur_idx = cur_idx
         self.total = total_items
         self.name = item_name
+        self.task_id = task_id
         self.batch_start = start_time
         self.upload_start = time.time()
         self.last_update = 0
 
     async def callback(self, cur, tot):
-        if str(self.cur_idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS:
+        if self.task_id is not None and str(self.task_id) in CANCELLED_TASKS:
             raise asyncio.CancelledError()
         now = time.time()
         if now - self.last_update < 3 and cur != tot:
@@ -76,7 +77,7 @@ async def fetch_segment_with_backoff(session, index, url, sem, max_retries=3):
                     await asyncio.sleep(2 ** attempt)
         return index, None
 
-async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is_audio_mode=False, audio_bitrate="192"):
+async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is_audio_mode=False, audio_bitrate="192", task_id=None):
     f_file = None
     
     if "playmogo" in url.lower():
@@ -279,7 +280,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                     stderr=asyncio.subprocess.PIPE
                 )
 
-                sem = download_semaphore
+                sem = segment_semaphore
                 tasks = [asyncio.create_task(fetch_segment_with_backoff(session, i, u, sem)) for i, u in enumerate(segment_urls)]
                 buffer = {}
                 next_index = 0
@@ -289,7 +290,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 pipeline_failed = False
 
                 for completed_task in asyncio.as_completed(tasks):
-                    if str(idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS:
+                    if task_id is not None and str(task_id) in CANCELLED_TASKS:
                         pipeline_failed = True
                         break
 

@@ -7,13 +7,12 @@ from pyrogram import filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
-from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings
-from database import get_pending_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
+from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings, save_stats
+from database import get_pending_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, get_queue_tasks_db, update_task_status_message_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
-from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, download_semaphore
+from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS
 
-current_active_task = None
 
 def build_crawl_keyboard(items):
     buttons = []
@@ -69,6 +68,39 @@ def build_crawl_keyboard(items):
     ])
 
     return InlineKeyboardMarkup(buttons)
+
+
+async def enqueue_items(items, status_message, client, is_audio=False, audio_bitrate="192"):
+    if not items:
+        return []
+
+    status_chat_id = status_message.chat.id
+    status_message_id = status_message.id
+    task_ids = []
+
+    for item in items:
+        if isinstance(item, dict):
+            url = item.get("url", "")
+            chat_id = item.get("chat_id", DEFAULT_CHANNEL_ID)
+            custom_name = item.get("custom_name", "")
+        else:
+            url = item[0] if len(item) > 0 else ""
+            chat_id = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
+            custom_name = item[2] if len(item) > 2 else ""
+
+        if not url:
+            continue
+
+        task_id = add_task_db(
+            url,
+            chat_id,
+            custom_name,
+            status_chat_id=status_chat_id,
+            status_message_id=status_message_id,
+        )
+        task_ids.append(task_id)
+
+    return task_ids
 
 
 def register_handlers(app):
@@ -153,10 +185,27 @@ def register_handlers(app):
         await q.answer(f"જૂના {len(items)} ટાસ્ક ફરી શરૂ થયા છે!", show_alert=True)
         s_msg = await q.message.edit_text(f"⚡ **જૂના {len(items)} ટાસ્કનું ડાઉનલોડિંગ ફરી શરૂ થાય છે...**")
         
-        global current_active_task
-        current_active_task = asyncio.create_task(
-            process_all_urls(items, s_msg, c, existing_task_ids=task_ids)
+        from queue_worker import start_queue_worker
+
+        for task in pending:
+            task_id = task.get("id")
+            if task_id:
+                update_task_status_db(task_id, "pending")
+                update_task_status_message_db(
+                    task_id,
+                    s_msg.chat.id,
+                    s_msg.id,
+                )
+
+        await s_msg.edit_text(
+            f"⚡ **જૂના {len(items)} ટાસ્ક Queue માં પાછા મૂકાયા છે.**\n\n"
+            "⏳ FIFO Queue મુજબ processing ફરી શરૂ થશે...",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
+            ]),
         )
+
+        start_queue_worker(c)
 
     @app.on_callback_query(filters.regex("^clear_old_tasks$"))
     async def _cb_clear_queue(c, q):
@@ -170,16 +219,28 @@ def register_handlers(app):
 
     @app.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
     async def _tx(c, m):
-        global current_active_task
         if not is_authorized(m.from_user.id, ADMIN_IDS) or m.text.startswith("/"):
             return
         items = parse_input_lines(m.text.splitlines())
         if not items:
             return await m.reply_text("કોઈ માન્ય લિંક નથી.")
-        mk = InlineKeyboardMarkup([[InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]])
-        CANCELLED_TASKS.clear()
-        s = await m.reply_text(f"{len(items)} લિંક્સ મળી. પ્રોસેસિંગ શરૂ થાય છે...", reply_markup=mk)
-        current_active_task = asyncio.create_task(process_all_urls(items, s, c))
+
+        mk = InlineKeyboardMarkup([
+            [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
+        ])
+
+        s = await m.reply_text(
+            f"{len(items)} લિંક્સ મળી. Queue માં ઉમેરાઈ રહી છે...",
+            reply_markup=mk,
+        )
+
+        task_ids = await enqueue_items(items, s, c)
+
+        await s.edit_text(
+            f"📥 **{len(task_ids)} ટાસ્ક Queue માં ઉમેરાયા.**\n\n"
+            "⏳ FIFO Queue મુજબ processing શરૂ થશે...",
+            reply_markup=mk,
+        )
 
     @app.on_message(filters.command("crawl") & filters.private)
     async def _cmd_crawl(c, m):
@@ -300,11 +361,15 @@ def register_handlers(app):
                 for item in selected_items
             ]
 
-            CANCELLED_TASKS.clear()
-
             status_msg = callback_query.message
-            asyncio.create_task(
-                process_all_urls(queue_items, status_msg, client)
+            task_ids = await enqueue_items(queue_items, status_msg, client)
+
+            await status_msg.edit_text(
+                f"📥 **{len(task_ids)} crawl options Queue માં ઉમેરાયા.**\n\n"
+                "⏳ FIFO Queue મુજબ processing શરૂ થશે...",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
+                ]),
             )
             return
 
@@ -482,14 +547,29 @@ def register_handlers(app):
             )
             return
 
-        # Cancel
+        # Cancel only tasks belonging to this status-message batch.
         if data in ("cancel", "cancel_process"):
-            CANCELLED_TASKS.add("all")
+            status_chat_id = callback_query.message.chat.id
+            status_message_id = callback_query.message.id
 
-            await callback_query.answer(
-                "🛑 Task cancelled successfully!",
-                show_alert=True,
+            cancelled_ids = cancel_tasks_by_status_message_db(
+                status_chat_id,
+                status_message_id,
             )
+
+            for task_id in cancelled_ids:
+                CANCELLED_TASKS.add(str(task_id))
+
+            if cancelled_ids:
+                await callback_query.answer(
+                    f"🛑 {len(cancelled_ids)} task(s) cancelled.",
+                    show_alert=True,
+                )
+            else:
+                await callback_query.answer(
+                    "ℹ️ આ batch માં cancel કરવા માટે કોઈ pending/processing task નથી.",
+                    show_alert=True,
+                )
             return
 
         # Unknown callback
@@ -498,166 +578,193 @@ def register_handlers(app):
             show_alert=False,
         )
 
-async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="192", existing_task_ids=None):
-    from config import STATS, CAPTION_PATH, CUSTOM_THUMB_PATH
-    from config import save_stats
-    
-    succ, fail = [], []
-    batch_start_time = time.time()
-    total_count = len(items)
+async def finalize_queue_file(client, status_message, file_path, title, chat_id, task_id):
+    from config import CUSTOM_THUMB_PATH, CAPTION_PATH, STATS, save_stats
 
-    if existing_task_ids is not None:
-        task_ids = list(existing_task_ids)
-        if len(task_ids) != len(items):
-            raise ValueError("existing_task_ids count does not match items count")
-    else:
-        task_ids = []
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError("Downloaded file not found")
 
-        for idx, item in enumerate(items, 1):
-            if isinstance(item, dict):
-                item_url = item.get("url", "")
-                item_chat_id = item.get("chat_id", DEFAULT_CHANNEL_ID)
-                item_custom_name = item.get("custom_name", "")
-            else:
-                item_url = item[0] if len(item) > 0 else ""
-                item_chat_id = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
-                item_custom_name = item[2] if len(item) > 2 else ""
+    split_files = split_large_file(file_path)
+    if not split_files:
+        raise FileNotFoundError("No output file after splitting")
 
-            task_id = add_task_db(item_url, item_chat_id, item_custom_name)
-            task_ids.append(task_id)
-
-    caption_template = ""
-    if os.path.exists(CAPTION_PATH):
-        try:
-            with open(CAPTION_PATH, "r", encoding="utf-8") as cf:
-                caption_template = cf.read().strip()
-        except Exception:
-            pass
-
-    tasks = []
-    for idx, item in enumerate(items, 1):
-        if str(idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS:
-            break
-        task = process_single_url_safe_with_semaphore(
-            client,
-            s_msg,
-            item,
-            total_count,
-            idx,
-            is_audio,
-            audio_bitrate,
-            task_ids[idx - 1],
+    for p_idx, part_path in enumerate(split_files, 1):
+        part_label = f"{title} (Part {p_idx})" if len(split_files) > 1 else title
+        tracker = DashboardTracker(
+            status_message,
+            1,
+            1,
+            part_label,
+            time.time(),
+            task_id=task_id,
         )
-        tasks.append(task)
 
-    results = await asyncio.gather(*tasks)
+        dur, w, h = await async_get_video_metadata(part_path)
 
-    for idx, res_tuple in enumerate(results, 1):
-        f, t, ch, sz, ok = res_tuple
+        try:
+            dur = int(round(float(dur or 0)))
+        except (TypeError, ValueError):
+            dur = 0
 
-        current_item = items[idx - 1]
-        if isinstance(current_item, dict):
-            orig_url = current_item.get("url", "")
+        try:
+            w = int(round(float(w or 0)))
+        except (TypeError, ValueError):
+            w = 0
+
+        try:
+            h = int(round(float(h or 0)))
+        except (TypeError, ValueError):
+            h = 0
+
+        th = CUSTOM_THUMB_PATH if os.path.exists(CUSTOM_THUMB_PATH) else await generate_auto_thumbnail(
+            part_path,
+            os.path.join(DOWNLOAD_DIR, f"t_{task_id}_{p_idx}.jpg"),
+        )
+
+        if th and (not os.path.exists(th) or os.path.getsize(th) == 0):
+            th = None
+
+        all_channels = [chat_id] + [
+            ec for ec in SETTINGS.get("extra_channels", [])
+            if ec != chat_id
+        ]
+
+        p_sz = os.path.getsize(part_path) / 1048576
+        dur_m, dur_s = divmod(int(dur or 0), 60)
+        dur_h, dur_m = divmod(dur_m, 60)
+        dur_str = (
+            f"{dur_h:02d}:{dur_m:02d}:{dur_s:02d}"
+            if dur_h > 0
+            else f"{dur_m:02d}:{dur_s:02d}"
+        )
+
+        if os.path.exists(CAPTION_PATH):
+            try:
+                with open(CAPTION_PATH, "r", encoding="utf-8") as cf:
+                    caption_template = cf.read().strip()
+            except Exception:
+                caption_template = ""
         else:
-            orig_url = current_item[0] if len(current_item) > 0 else ""
-        if not ok or not f or not os.path.exists(f):
-            update_task_status_db(task_ids[idx - 1], "failed")
-            fail.append((idx, orig_url, "Download or processing failed"))
-            STATS["failed_items"] += 1
-            continue
+            caption_template = ""
 
-        tracker = DashboardTracker(s_msg, idx, total_count, t, time.time())
-        clean_file_label = re.sub(r"[/\\*?:\"<>|]", "", t).strip()
-        all_channels = [ch] + [ec for ec in SETTINGS.get("extra_channels", []) if ec != ch]
+        if caption_template:
+            c_cap = (
+                caption_template
+                .replace("{title}", part_label)
+                .replace("{size}", f"{p_sz:.2f} MB")
+                .replace("{duration}", dur_str)
+            )
+        else:
+            c_cap = f"🎬 **{part_label}**\n⏱ `{dur_str}` | 💾 `{p_sz:.2f} MB`"
 
-        split_files = split_large_file(f)
-        for p_idx, part_path in enumerate(split_files, 1):
-            part_label = f"{clean_file_label} (Part {p_idx})" if len(split_files) > 1 else clean_file_label
-            p_sz = os.path.getsize(part_path) / 1048576
-            dur, w, h = await async_get_video_metadata(part_path)
+        for target_chat in all_channels:
+            v_kwargs = {
+                "chat_id": target_chat,
+                "video": part_path,
+                "file_name": f"{part_label}.mp4",
+                "caption": c_cap,
+                "duration": dur,
+                "width": w,
+                "height": h,
+                "supports_streaming": True,
+                "progress": tracker.callback if target_chat == chat_id else None,
+            }
 
-            # Pyrogram requires integer media metadata.
-            try:
-                dur = int(round(float(dur or 0)))
-            except (TypeError, ValueError):
-                dur = 0
+            if th and os.path.exists(th):
+                v_kwargs["thumb"] = th
 
-            try:
-                w = int(round(float(w or 0)))
-            except (TypeError, ValueError):
-                w = 0
+            while True:
+                try:
+                    await client.send_video(**v_kwargs)
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 1)
 
-            try:
-                h = int(round(float(h or 0)))
-            except (TypeError, ValueError):
-                h = 0
-
-            th = CUSTOM_THUMB_PATH if os.path.exists(CUSTOM_THUMB_PATH) else await generate_auto_thumbnail(part_path, os.path.join(DOWNLOAD_DIR, f"t_{idx}_{p_idx}.jpg"))
-            if th and (not os.path.exists(th) or os.path.getsize(th) == 0):
-                th = None
-
-            dur_m, dur_s = divmod(int(dur or 0), 60)
-            dur_h, dur_m = divmod(dur_m, 60)
-            dur_str = f"{dur_h:02d}:{dur_m:02d}:{dur_s:02d}" if dur_h > 0 else f"{dur_m:02d}:{dur_s:02d}"
-
-            if caption_template:
-                c_cap = caption_template.replace("{title}", part_label).replace("{size}", f"{p_sz:.2f} MB").replace("{duration}", dur_str)
-            else:
-                c_cap = f"🎬 **{part_label}**\n⏱ `{dur_str}` | 💾 `{p_sz:.2f} MB`"
-
-            for target_chat in all_channels:
-                v_kwargs = {
-                    "chat_id": target_chat,
-                    "video": part_path,
-                    "file_name": f"{part_label}.mp4",
-                    "caption": c_cap,
-                    "duration": dur,
-                    "width": w,
-                    "height": h,
-                    "supports_streaming": True,
-                    "progress": tracker.callback if target_chat == ch else None
-                }
-                if th and os.path.exists(th):
-                    v_kwargs["thumb"] = th
-
-                while True:
-                    try:
-                        await client.send_video(**v_kwargs)
-                        break
-                    except FloodWait as fw:
-                        await asyncio.sleep(fw.value + 1)
-                    except Exception:
-                        raise
-
+        try:
             if os.path.exists(part_path):
                 os.remove(part_path)
-
-        update_task_status_db(task_ids[idx - 1], "completed")
-        succ.append((idx, t, f"{sz:.2f} MB"))
-        STATS["total_downloaded_items"] += 1
-        STATS["total_downloaded_mb"] += sz
-
-    save_stats()
-
-    total_time = time.strftime("%H:%M:%S", time.gmtime(time.time() - batch_start_time))
-    rep = (
-        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-        f"┃ 📋 **ટાસ્ક પ્રોસેસિંગ રિપોર્ટ**\n"
-        f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
-        f"┃ ⏱ **કુલ સમય:** `{total_time}`\n"
-    )
-    if succ:
-        rep += f"┃ ✅ **સફળ:** `{len(succ)}/{total_count}` ફાઇલ્સ\n"
-    if fail:
-        rep += f"┃ ❌ **ફેલ:** `{len(fail)}` ફાઇલ્સ\n"
-    rep += "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        except OSError:
+            pass
 
     try:
-        await s_msg.edit_text(rep, reply_markup=get_main_keyboard())
-    except Exception:
-        await s_msg.reply_text(rep, reply_markup=get_main_keyboard())
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError:
+        pass
 
-async def process_single_url_safe(client, message, item, total_count, idx, user_settings, is_audio=False, audio_bitrate="192"):
+    return True
+
+async def process_queue_task(client, task, status_message):
+    task_id = task["id"]
+
+    item = {
+        "url": task.get("url", ""),
+        "chat_id": task.get("chat_id", DEFAULT_CHANNEL_ID),
+        "custom_name": task.get("custom_name") or "",
+    }
+
+    try:
+        if status_message is None:
+            status_message = await client.send_message(
+                task.get("status_chat_id") or task.get("chat_id") or DEFAULT_CHANNEL_ID,
+                f"📥 Task #{task_id} processing શરૂ...",
+            )
+            update_task_status_message_db(
+                task_id,
+                status_message.chat.id,
+                status_message.id,
+            )
+
+        result = await process_single_url_safe(
+            client,
+            status_message,
+            item,
+            1,
+            1,
+            user_settings=None,
+            task_id=task_id,
+        )
+
+        file_path, title, result_chat_id, size_mb, ok = result
+
+        if not ok or not file_path or not os.path.exists(file_path):
+            current_task = get_task_db(task_id)
+            if not current_task or current_task.get("status") != "cancelled":
+                update_task_status_db(task_id, "failed")
+            return None, None, result_chat_id, 0, False
+
+        await finalize_queue_file(
+            client,
+            status_message,
+            file_path,
+            title,
+            result_chat_id,
+            task_id,
+        )
+
+        STATS["total_downloaded_items"] += 1
+        STATS["total_downloaded_mb"] += size_mb
+        save_stats()
+
+        update_task_status_db(task_id, "completed")
+        return None, title, result_chat_id, size_mb, True
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        print(
+            f"⚠️ Queue task {task_id} processing error: {exc}",
+            flush=True,
+        )
+        current_task = get_task_db(task_id)
+        if not current_task or current_task.get("status") != "cancelled":
+            update_task_status_db(task_id, "failed")
+        return None, None, item["chat_id"], 0, False
+
+
+
+async def process_single_url_safe(client, message, item, total_count, idx, user_settings, is_audio=False, audio_bitrate="192", task_id=None):
     from config import MAX_RETRIES, TASK_TIMEOUT
     try:
         if isinstance(item, dict):
@@ -675,11 +782,23 @@ async def process_single_url_safe(client, message, item, total_count, idx, user_
             raise ValueError("URL is empty")
 
         for att in range(1, MAX_RETRIES + 1):
-            if str(idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS:
+            if (
+                (task_id is not None and str(task_id) in CANCELLED_TASKS)
+                or (task_id is None and (str(idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS))
+            ):
                 break
             try:
                 f, t = await asyncio.wait_for(
-                    download_single_item(u, idx, message, custom_name=c_name, trim_info=trim_t, is_audio_mode=is_audio, audio_bitrate=audio_bitrate),
+                    download_single_item(
+                        u,
+                        idx,
+                        message,
+                        custom_name=c_name,
+                        trim_info=trim_t,
+                        is_audio_mode=is_audio,
+                        audio_bitrate=audio_bitrate,
+                        task_id=task_id,
+                    ),
                     timeout=TASK_TIMEOUT
                 )
                 if f and os.path.exists(f):
@@ -697,10 +816,3 @@ async def process_single_url_safe(client, message, item, total_count, idx, user_
             error_channel = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
 
         return None, None, error_channel, 0, False
-
-async def process_single_url_safe_with_semaphore(client, message, item, total_count, idx, is_audio, audio_bitrate="192", task_id=None):
-    async with download_semaphore:
-        if task_id is not None:
-            update_task_status_db(task_id, "processing")
-
-        return await process_single_url_safe(client, message, item, total_count, idx, user_settings=None, is_audio=is_audio, audio_bitrate=audio_bitrate)

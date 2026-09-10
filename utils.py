@@ -479,17 +479,12 @@ async def filter_audio_tracks(
     if mode not in {
         "first",
         "second",
+        "none",
     }:
         return input_path
 
     output_path = input_path.with_name(
         f"{input_path.stem}.audio{input_path.suffix}"
-    )
-
-    audio_index = (
-        "0"
-        if mode == "first"
-        else "1"
     )
 
     command = [
@@ -499,12 +494,24 @@ async def filter_audio_tracks(
         str(input_path),
         "-map",
         "0:v:0",
-        "-map",
-        f"0:a:{audio_index}",
+    ]
+
+    if mode == "first":
+        command.extend([
+            "-map",
+            "0:a:0",
+        ])
+    elif mode == "second":
+        command.extend([
+            "-map",
+            "0:a:1",
+        ])
+
+    command.extend([
         "-c",
         "copy",
         str(output_path),
-    ]
+    ])
 
     try:
         await run_command_async(command)
