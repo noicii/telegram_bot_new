@@ -256,6 +256,8 @@ def register_handlers(app):
                 for item in selected_items
             ]
 
+            CANCELLED_TASKS.clear()
+
             status_msg = callback_query.message
             asyncio.create_task(
                 process_all_urls(queue_items, status_msg, client)
