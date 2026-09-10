@@ -15,7 +15,7 @@ from utils import (
     trim_video_file, compress_video, apply_watermark, filter_audio_tracks, apply_resolution_downscale
 )
 
-download_semaphore = asyncio.Semaphore(30)
+download_semaphore = asyncio.Semaphore(2)
 CANCELLED_TASKS = set()
 
 class DashboardTracker:

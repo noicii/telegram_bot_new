@@ -8,12 +8,41 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings
-from database import get_pending_tasks_db, clear_pending_tasks_db, add_task_db
+from database import get_pending_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
-from crawler import resolve_blog_links, parse_input_lines
+from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, download_semaphore
 
 current_active_task = None
+
+def build_crawl_keyboard(items):
+    buttons = []
+
+    for item in items:
+        icon = "✅" if item["selected"] else "⬜"
+        title = item["title"]
+        if len(title) > 42:
+            title = title[:39] + "..."
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {item['episode']} - {title}",
+                callback_data=f"crawl_toggle_{item['id']}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton("☑️ Select All", callback_data="crawl_select_all"),
+        InlineKeyboardButton("❌ Clear", callback_data="crawl_clear_all"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(
+            "🚀 Download Selected",
+            callback_data="crawl_download_selected",
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
 
 def register_handlers(app):
     @app.on_message(filters.command("setcookie") & filters.private)
@@ -85,12 +114,22 @@ def register_handlers(app):
         if not pending:
             return await q.answer("કોઈ જૂના ટાસ્ક બાકી નથી!", show_alert=True)
         
-        items = [(t[1], DEFAULT_CHANNEL_ID, t[3] or "", "") for t in pending]
+        task_ids = [t.get("id") for t in pending]
+        items = [
+            {
+                "url": t.get("url", ""),
+                "chat_id": t.get("chat_id", DEFAULT_CHANNEL_ID),
+                "custom_name": t.get("custom_name") or "",
+            }
+            for t in pending
+        ]
         await q.answer(f"જૂના {len(items)} ટાસ્ક ફરી શરૂ થયા છે!", show_alert=True)
         s_msg = await q.message.edit_text(f"⚡ **જૂના {len(items)} ટાસ્કનું ડાઉનલોડિંગ ફરી શરૂ થાય છે...**")
         
         global current_active_task
-        current_active_task = asyncio.create_task(process_all_urls(items, s_msg, c))
+        current_active_task = asyncio.create_task(
+            process_all_urls(items, s_msg, c, existing_task_ids=task_ids)
+        )
 
     @app.on_callback_query(filters.regex("^clear_old_tasks$"))
     async def _cb_clear_queue(c, q):
@@ -117,32 +156,141 @@ def register_handlers(app):
 
     @app.on_message(filters.command("crawl") & filters.private)
     async def _cmd_crawl(c, m):
-        global current_active_task
         if not is_authorized(m.from_user.id, ADMIN_IDS):
             return
-        
-        urls_found = re.findall(r"https?://[^\s<>]+", m.text)
+
+        urls_found = re.findall(r"https?://[^\s<>]+", m.text or "")
+
         if not urls_found and m.reply_to_message and m.reply_to_message.text:
-            urls_found = re.findall(r"https?://[^\s<>]+", m.reply_to_message.text)
-            
+            urls_found = re.findall(
+                r"https?://[^\s<>]+",
+                m.reply_to_message.text,
+            )
+
         if not urls_found:
-            return await m.reply_text("⚠️ કૃપા કરીને `/crawl <બ્લોગ_લિંક>` આ રીતે લિંક મોકલો.")
-            
-        blog_url = urls_found[0].strip("[]()<>\"\x27")
-        await m.reply_text(f"🔍 બ્લોગ ક્રોલ થઈ રહ્યો છે: `{blog_url}`...")
-        
-        resolved_links = resolve_blog_links(blog_url)
-        if not resolved_links:
-            return await m.reply_text("❌ આ બ્લોગમાંથી કોઈ માન્ય વિડિયો લિંક મળી નથી.")
-            
-        items = []
-        for r_url in resolved_links:
-            items.append((r_url, DEFAULT_CHANNEL_ID, "", ""))
-            
-        mk = InlineKeyboardMarkup([[InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]])
-        CANCELLED_TASKS.clear()
-        s = await m.reply_text(f"📦 કુલ {len(items)} વિડિયો લિંક્સ મળી છે. ડાઉનલોડિંગ શરૂ થાય છે...", reply_markup=mk)
-        current_active_task = asyncio.create_task(process_all_urls(items, s, c))
+            return await m.reply_text(
+                "⚠️ કૃપા કરીને `/crawl <બ્લોગ_લિંક>` આ રીતે લિંક મોકલો."
+            )
+
+        blog_url = urls_found[0].strip("[]()<>\"\\x27")
+
+        status_msg = await m.reply_text(
+            f"🔍 બ્લોગ ક્રોલ થઈ રહ્યો છે: `{blog_url}`..."
+        )
+
+        episodes = crawl_blog_episodes(blog_url)
+
+        if not episodes:
+            return await status_msg.edit_text(
+                "❌ આ બ્લોગમાંથી કોઈ Episode/LuluStream લિંક મળી નથી."
+            )
+
+        clear_crawl_items_db(m.from_user.id)
+
+        for episode in episodes:
+            add_crawl_item_db(
+                m.from_user.id,
+                episode["title"],
+                episode["episode"],
+                episode["url"],
+            )
+
+        items = get_crawl_items_db(m.from_user.id)
+
+        lines = [
+            "🎬 **Crawl Complete**",
+            "",
+            f"📦 કુલ Episodes: **{len(items)}**",
+            "",
+            "👇 Download માટે Episodes select કરો.",
+        ]
+
+        for index, item in enumerate(items, 1):
+            lines.append(f"**{index}. {item['title']}**")
+
+        await status_msg.edit_text("\n".join(lines), reply_markup=build_crawl_keyboard(items))
+
+    @app.on_callback_query(filters.regex(r"^crawl_.*"))
+    async def _handle_crawl_callback(client, callback_query):
+        if not is_authorized(callback_query.from_user.id, ADMIN_IDS):
+            return await callback_query.answer("❌ Unauthorized", show_alert=True)
+
+        data = callback_query.data
+        chat_id = callback_query.message.chat.id
+
+        if data == "crawl_select_all":
+            select_all_crawl_items_db(chat_id)
+            items = get_crawl_items_db(chat_id)
+            await callback_query.message.edit_reply_markup(
+                build_crawl_keyboard(items)
+            )
+            return
+
+        if data == "crawl_clear_all":
+            clear_selected_crawl_items_db(chat_id)
+            items = get_crawl_items_db(chat_id)
+            await callback_query.message.edit_reply_markup(
+                build_crawl_keyboard(items)
+            )
+            return
+
+        if data == "crawl_download_selected":
+            selected_items = get_selected_crawl_items_db(chat_id)
+
+            if not selected_items:
+                return await callback_query.answer(
+                    "⚠️ પહેલા ઓછામાં ઓછું એક Episode select કરો.",
+                    show_alert=True,
+                )
+
+            await callback_query.message.edit_text(
+                f"🚀 **{len(selected_items)} Episodes selected.**\n\n⏳ Queue માં ઉમેરાઈ રહ્યા છે..."
+            )
+
+            queue_items = [
+                {
+                    "url": item["url"],
+                    "chat_id": chat_id,
+                    "custom_name": item["title"],
+                }
+                for item in selected_items
+            ]
+
+            status_msg = callback_query.message
+            asyncio.create_task(
+                process_all_urls(queue_items, status_msg, client)
+            )
+            return
+
+        if data.startswith("crawl_toggle_"):
+            try:
+                item_id = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                return await callback_query.answer("❌ Invalid item", show_alert=True)
+
+            item = get_crawl_item_db(item_id, chat_id)
+            if not item:
+                return await callback_query.answer("❌ Item not found", show_alert=True)
+
+            toggle_crawl_item_db(item_id, chat_id)
+
+            items = get_crawl_items_db(chat_id)
+            lines = [
+                "🎬 **Crawl Complete**",
+                "",
+                f"📦 કુલ Episodes: **{len(items)}**",
+                "",
+                "👇 Download માટે Episodes select કરો.",
+            ]
+
+            for index, current_item in enumerate(items, 1):
+                lines.append(f"**{index}. {current_item['title']}**")
+
+            await callback_query.message.edit_text(
+                "\\n".join(lines),
+                reply_markup=build_crawl_keyboard(items),
+            )
+            return
 
     @app.on_callback_query(
         filters.regex(
@@ -299,26 +447,33 @@ def register_handlers(app):
             show_alert=False,
         )
 
-async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="192"):
+async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="192", existing_task_ids=None):
     from config import STATS, CAPTION_PATH, CUSTOM_THUMB_PATH
-    from database import clear_pending_tasks_db
     from config import save_stats
     
     succ, fail = [], []
     batch_start_time = time.time()
     total_count = len(items)
 
-    for idx, item in enumerate(items, 1):
-        if isinstance(item, dict):
-            item_url = item.get("url", "")
-            item_chat_id = item.get("chat_id", DEFAULT_CHANNEL_ID)
-            item_custom_name = item.get("custom_name", "")
-        else:
-            item_url = item[0] if len(item) > 0 else ""
-            item_chat_id = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
-            item_custom_name = item[2] if len(item) > 2 else ""
+    if existing_task_ids is not None:
+        task_ids = list(existing_task_ids)
+        if len(task_ids) != len(items):
+            raise ValueError("existing_task_ids count does not match items count")
+    else:
+        task_ids = []
 
-        add_task_db(item_url, item_chat_id, item_custom_name)
+        for idx, item in enumerate(items, 1):
+            if isinstance(item, dict):
+                item_url = item.get("url", "")
+                item_chat_id = item.get("chat_id", DEFAULT_CHANNEL_ID)
+                item_custom_name = item.get("custom_name", "")
+            else:
+                item_url = item[0] if len(item) > 0 else ""
+                item_chat_id = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
+                item_custom_name = item[2] if len(item) > 2 else ""
+
+            task_id = add_task_db(item_url, item_chat_id, item_custom_name)
+            task_ids.append(task_id)
 
     caption_template = ""
     if os.path.exists(CAPTION_PATH):
@@ -332,7 +487,16 @@ async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="
     for idx, item in enumerate(items, 1):
         if str(idx) in CANCELLED_TASKS or "all" in CANCELLED_TASKS:
             break
-        task = process_single_url_safe_with_semaphore(client, s_msg, item, total_count, idx, is_audio, audio_bitrate)
+        task = process_single_url_safe_with_semaphore(
+            client,
+            s_msg,
+            item,
+            total_count,
+            idx,
+            is_audio,
+            audio_bitrate,
+            task_ids[idx - 1],
+        )
         tasks.append(task)
 
     results = await asyncio.gather(*tasks)
@@ -346,6 +510,7 @@ async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="
         else:
             orig_url = current_item[0] if len(current_item) > 0 else ""
         if not ok or not f or not os.path.exists(f):
+            update_task_status_db(task_ids[idx - 1], "failed")
             fail.append((idx, orig_url, "Download or processing failed"))
             STATS["failed_items"] += 1
             continue
@@ -416,11 +581,11 @@ async def process_all_urls(items, s_msg, client, is_audio=False, audio_bitrate="
             if os.path.exists(part_path):
                 os.remove(part_path)
 
+        update_task_status_db(task_ids[idx - 1], "completed")
         succ.append((idx, t, f"{sz:.2f} MB"))
         STATS["total_downloaded_items"] += 1
         STATS["total_downloaded_mb"] += sz
 
-    clear_pending_tasks_db()
     save_stats()
 
     total_time = time.strftime("%H:%M:%S", time.gmtime(time.time() - batch_start_time))
@@ -482,6 +647,9 @@ async def process_single_url_safe(client, message, item, total_count, idx, user_
 
         return None, None, error_channel, 0, False
 
-async def process_single_url_safe_with_semaphore(client, message, item, total_count, idx, is_audio, audio_bitrate="192"):
+async def process_single_url_safe_with_semaphore(client, message, item, total_count, idx, is_audio, audio_bitrate="192", task_id=None):
     async with download_semaphore:
+        if task_id is not None:
+            update_task_status_db(task_id, "processing")
+
         return await process_single_url_safe(client, message, item, total_count, idx, user_settings=None, is_audio=is_audio, audio_bitrate=audio_bitrate)
