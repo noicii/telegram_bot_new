@@ -79,11 +79,34 @@ def resolve_blog_links(raw_url):
             allow_redirects=True,
         )
 
+        # Do not treat an inaccessible blog page as a video URL.
+        if response.status_code == 403:
+            return []
+
         response.raise_for_status()
 
     except requests.RequestException:
-        # If crawling fails, let the downloader try the original URL.
-        return [raw_url]
+        # Crawling failed, so do not send the original blog URL
+        # to the downloader as if it were a media URL.
+        return []
+
+    # Detect Cloudflare challenge pages.
+    # A challenge page is not the actual blog content, so never
+    # return the blog URL as if it were a discovered video URL.
+    challenge_markers = (
+        "just a moment...",
+        "__cf_chl_",
+        "cf-chl-",
+        "cloudflare",
+    )
+
+    response_text_lower = response.text.lower()
+
+    if sum(
+        1 for marker in challenge_markers
+        if marker in response_text_lower
+    ) >= 2:
+        return []
 
     soup = BeautifulSoup(
         response.text,
