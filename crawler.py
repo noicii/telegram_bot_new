@@ -1,5 +1,5 @@
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -277,38 +277,107 @@ def crawl_blog_episodes(raw_url):
             timeout=30,
             allow_redirects=True,
         )
+
+        if response.status_code == 403:
+            return []
+
         response.raise_for_status()
+
     except requests.RequestException:
         return []
 
+    response_text_lower = response.text.lower()
+
+    challenge_markers = (
+        "just a moment...",
+        "__cf_chl_",
+        "cf-chl-",
+        "cloudflare",
+    )
+
+    if sum(
+        1 for marker in challenge_markers
+        if marker in response_text_lower
+    ) >= 2:
+        return []
+
     soup = BeautifulSoup(response.text, "lxml")
+
+    from html import unescape
+
     results = []
     current_episode = None
+    current_title = None
+    current_lulu_url = None
 
-    for element in soup.select(".entry-content h5"):
-        text = element.get_text(" ", strip=True)
+    for element in soup.select(".entry-content *"):
+        if element.name == "h5":
+            heading = element.get_text(" ", strip=True)
 
-        match = re.search(
-            r"Download\s+Episode\s+(\d+)",
-            text,
-            re.IGNORECASE,
-        )
+            match = re.search(
+                r"Download\s+Episode\s+(\d+)",
+                heading,
+                re.IGNORECASE,
+            )
 
-        if match:
-            current_episode = f"Episode {match.group(1)}"
+            if match:
+                current_episode = f"Episode {match.group(1)}"
+                current_title = current_episode
+                current_lulu_url = None
+
             continue
 
-        if not current_episode:
+        if element.name != "a" or not current_episode:
             continue
 
-        for anchor in element.find_all("a", href=True):
-            href = anchor.get("href", "").strip()
+        href = element.get("href", "").strip()
 
-            if "luluvid.com" in href.lower():
+        if not href:
+            continue
+
+        href_lower = href.lower()
+
+        # LuluStream/Luluvid link for the current episode.
+        if "luluvid.com" in href_lower:
+            current_lulu_url = href
+
+            if current_title and current_lulu_url:
                 results.append({
-                    "title": current_episode,
-                    "url": href,
+                    "title": current_title,
+                    "episode": current_episode,
+                    "url": current_lulu_url,
                 })
-                break
 
-    return results
+            current_lulu_url = None
+            current_title = current_episode
+            continue
+
+        # FRDL filename for the current episode.
+        if "frdl.io" in href_lower:
+            decoded = unescape(unquote(href))
+
+            filename_match = re.search(
+                r"/([^/?#]+\.(?:mkv|mp4|m4v|webm|mov))(?:[?#].*)?$",
+                decoded,
+                re.IGNORECASE,
+            )
+
+            if filename_match:
+                current_title = filename_match.group(1)
+                current_title = current_title.replace("+", " ").strip()
+
+    # Remove duplicate Luluvid URLs while preserving order.
+    unique_results = []
+    seen_urls = set()
+
+    for item in results:
+        url = item["url"]
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        unique_results.append(item)
+
+    return unique_results
+
