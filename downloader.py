@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import logging
 import asyncio
 import aiohttp
 import yt_dlp
@@ -11,11 +12,12 @@ from curl_cffi import requests as cffi_requests
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import DOWNLOAD_DIR, USER_AGENT, PROTECTED_DOMAINS, COOKIES_PATH, SETTINGS
 from utils import (
-    clean_media_title, clean_title, check_disk_space_guard, cleanup_task_artifacts,
+    clean_media_title, clean_title, sanitize_filename, check_disk_space_guard, cleanup_task_artifacts,
     trim_video_file, compress_video, apply_watermark, filter_audio_tracks, apply_resolution_downscale
 )
+logger = logging.getLogger(__name__)
 
-segment_semaphore = asyncio.Semaphore(8)
+PER_TASK_SEGMENT_CONCURRENCY = 4
 CANCELLED_TASKS = set()
 LIVE_TASKS = {}
 
@@ -101,8 +103,83 @@ async def fetch_segment_with_backoff(session, index, url, sem, max_retries=3):
                     await asyncio.sleep(2 ** attempt)
         return index, None
 
-async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is_audio_mode=False, audio_bitrate="192", task_id=None):
+def clean_full_video_title(title, source_url="", idx=None):
+    if not title:
+        return ""
+
+    title = str(title).strip()
+
+    # Remove common website/domain suffixes.
+    title = re.sub(
+        r"\s*[|\-–—]\s*(?:https?://)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}\s*$",
+        "",
+        title,
+        flags=re.I,
+    ).strip()
+
+    # Never use a raw URL or domain as the video title.
+    low = title.lower()
+    source_low = str(source_url or "").strip().rstrip("/").lower()
+
+    if source_low and low.rstrip("/") == source_low:
+        return ""
+
+    if re.match(r"^(https?://|www\.)", low):
+        return ""
+
+    if re.match(r"^[a-z0-9.-]+\.[a-z]{2,}(?:/.*)?$", low):
+        return ""
+
+    # Keep the full actual title. Only filesystem-unsafe characters are cleaned.
+    # Do not remove brackets/parentheses and do not append the item index.
+    return sanitize_filename(title).strip()
+
+
+def get_preset_settings(preset):
+    preset = str(preset or "custom").lower().strip()
+
+    presets = {
+        "mobile": {
+            "resolution": "480p",
+            "audio": False,
+            "compress": True,
+        },
+        "720p": {
+            "resolution": "720p",
+            "audio": False,
+            "compress": False,
+        },
+        "1080p": {
+            "resolution": "1080p",
+            "audio": False,
+            "compress": False,
+        },
+        "audio": {
+            "resolution": "original",
+            "audio": True,
+            "compress": False,
+        },
+        "custom": {
+            "resolution": SETTINGS.get("target_resolution", "original"),
+            "audio": False,
+            "compress": SETTINGS.get("compress", False),
+        },
+    }
+
+    return presets.get(preset, presets["custom"])
+
+
+async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is_audio_mode=False, audio_bitrate="192", preset="custom", task_id=None):
     f_file = None
+
+    preset_cfg = get_preset_settings(preset)
+    # Preset overrides only the task-specific download mode.
+    # Custom keeps the existing global settings.
+    effective_audio_mode = bool(is_audio_mode or preset_cfg["audio"])
+    effective_resolution = preset_cfg["resolution"]
+    effective_compress = bool(preset_cfg["compress"])
+    limit_rate = SETTINGS["speed_limit"]
+    title = custom_name.strip() if custom_name else ""
     
     if "playmogo" in url.lower():
         try:
@@ -114,6 +191,20 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
             resp = cffi_requests.get(url, impersonate="chrome", timeout=20)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
+
+                page_title = ""
+                og_tag = soup.find("meta", attrs={"property": "og:title"})
+                if og_tag and og_tag.get("content"):
+                    page_title = og_tag.get("content", "").strip()
+
+                if not page_title and soup.title:
+                    page_title = soup.title.get_text(" ", strip=True)
+
+                if not page_title:
+                    h1 = soup.find("h1")
+                    if h1:
+                        page_title = h1.get_text(" ", strip=True)
+
                 download_link = ""
                 for a in soup.find_all("a"):
                     href = a.get("href", "")
@@ -136,19 +227,23 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                                     f.write(chunk)
                         f_file = output_filename
         except Exception as e:
-            print(f"[Playmogo Error] {e}")
+            logger.exception("Task %s Playmogo download failed", task_id or idx)
             
         if f_file and os.path.exists(f_file):
-            return f_file, custom_name or f"Video {idx}"
+            title = clean_full_video_title(
+                custom_name or page_title,
+                url,
+                idx,
+            ) or f"Video {idx}"
 
-    limit_rate = SETTINGS["speed_limit"]
-    title = custom_name.strip() if custom_name else ""
-    task_token = f"item_{idx}_{int(time.time())}"
+    task_token = f"task_{task_id or 0}_{idx}_{time.time_ns()}"
 
     check_disk_space_guard()
 
     try:
-        if any(d in url.lower() for d in PROTECTED_DOMAINS):
+        if not (f_file and os.path.exists(f_file)) and any(
+            d in url.lower() for d in PROTECTED_DOMAINS
+        ):
             e_url = url
             if "/d/" in url:
                 e_url = url.replace("/d/", "/e/")
@@ -184,8 +279,12 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                         await page.goto(e_url, wait_until="domcontentloaded", timeout=30000)
                         await asyncio.sleep(4)
                         raw_t = await page.title()
-                        if raw_t:
-                            r_title = clean_media_title(raw_t)
+                        og_t = ""
+                        try:
+                            og_t = await page.locator("meta[property=\"og:title\"]").get_attribute("content") or ""
+                        except Exception:
+                            pass
+                        r_title = clean_media_title(og_t or raw_t)
                         
                         for frame in page.frames:
                             try:
@@ -209,7 +308,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                     await asyncio.wait_for(run_browser_tasks(), timeout=40.0)
                     await browser.close()
             except Exception as e:
-                print(f"⚠️ Playwright Error: {e}", flush=True)
+                logger.exception("Task %s Playwright processing failed", task_id or idx)
 
             if not v_url:
                 await s_msg.edit_text(f"❌ **[{idx}]** વિડિયો સ્ટ્રીમ URL એક્સટ્રેક્ટ થઈ શકી નથી.")
@@ -217,9 +316,9 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
 
             if not title:
                 title = r_title or f"Video {idx}"
-            safe_title = clean_media_title(title)
+            safe_title = clean_full_video_title(title, url, idx) or f"Video {idx}"
             final_out = os.path.join(DOWNLOAD_DIR, f"{safe_title}_{task_token}.mp4")
-            if is_audio_mode:
+            if effective_audio_mode:
                 final_out = os.path.join(DOWNLOAD_DIR, f"{safe_title}_{task_token}.mp3")
 
             headers = {
@@ -285,7 +384,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 total_segs = len(segment_urls)
                 cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 કેન્સલ કરો", callback_data=f"cancel_task_{task_id}")]])
 
-                if is_audio_mode:
+                if effective_audio_mode:
                     ffmpeg_cmd = [
                         "ffmpeg", "-y", "-f", "mpegts", "-i", "pipe:0",
                         "-vn", "-c:a", "libmp3lame", "-b:a", f"{audio_bitrate}k", final_out
@@ -304,7 +403,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                     stderr=asyncio.subprocess.PIPE
                 )
 
-                sem = segment_semaphore
+                sem = asyncio.Semaphore(PER_TASK_SEGMENT_CONCURRENCY)
                 tasks = [asyncio.create_task(fetch_segment_with_backoff(session, i, u, sem)) for i, u in enumerate(segment_urls)]
                 buffer = {}
                 next_index = 0
@@ -398,7 +497,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 mult = 1048576 if "M" in limit_rate.upper() else 1024
                 ydl_rate = int(re.sub(r"[^\d]", "", limit_rate)) * mult
 
-            out_tmpl = os.path.join(DOWNLOAD_DIR, f"%(title).50s_{task_token}.%(ext)s")
+            out_tmpl = os.path.join(DOWNLOAD_DIR, f"%(title)s_{task_token}.%(ext)s")
             def ydl_progress_hook(progress):
                 if task_id is not None and str(task_id) in CANCELLED_TASKS:
                     raise yt_dlp.utils.DownloadError("Task cancelled by user")
@@ -412,7 +511,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
             if os.path.exists(COOKIES_PATH):
                 ydl_opts["cookiefile"] = COOKIES_PATH
 
-            if is_audio_mode:
+            if effective_audio_mode:
                 ydl_opts.update({
                     "format": "bestaudio/best",
                     "outtmpl": out_tmpl,
@@ -429,7 +528,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 with yt_dlp.YoutubeDL(ydl_opts) as y:
                     inf = y.extract_info(url, download=True)
                     fn = y.prepare_filename(inf)
-                    ext = ".mp3" if is_audio_mode else ".mp4"
+                    ext = ".mp3" if effective_audio_mode else ".mp4"
                     b, _ = os.path.splitext(fn)
                     res_f = b + ext
                     r_t = inf.get("title", f"Video {idx}")
@@ -437,20 +536,18 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
 
             f_file, r_t = await asyncio.get_event_loop().run_in_executor(None, run_ydl)
             if not title:
-                title = clean_title(r_t, idx)
+                title = clean_full_video_title(r_t, url, idx)
             if not title:
                 title = f"Video {idx}"
 
-            if f_file and os.path.exists(f_file) and not is_audio_mode:
-                if trim_info:
-                    f_file = await trim_video_file(f_file, trim_info)
-                if SETTINGS["compress"]:
-                    f_file = await compress_video(f_file)
-                f_file = await apply_watermark(f_file)
-
-        if f_file and os.path.exists(f_file) and not is_audio_mode:
+        if f_file and os.path.exists(f_file) and not effective_audio_mode:
+            if trim_info:
+                f_file = await trim_video_file(f_file, trim_info)
+            if effective_compress:
+                f_file = await compress_video(f_file)
+            f_file = await apply_watermark(f_file)
             f_file = await filter_audio_tracks(f_file)
-            f_file = await apply_resolution_downscale(f_file, SETTINGS.get("target_resolution", "original"))
+            f_file = await apply_resolution_downscale(f_file, effective_resolution)
 
         return f_file, title
     finally:

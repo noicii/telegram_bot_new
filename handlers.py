@@ -3,16 +3,18 @@ import os
 import re
 import asyncio
 import time
+import logging
 import psutil
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings, save_stats, MAX_CONCURRENT_DOWNLOADS
-from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, update_task_status_message_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, cancel_task_db, clear_summary_history_db, get_queue_tasks_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
+from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, update_task_status_message_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, cancel_task_db, clear_summary_history_db, retry_failed_task_db, retry_all_failed_tasks_db, move_task_next_db, update_task_title_db, get_queue_tasks_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
+logger = logging.getLogger(__name__)
 
 
 def build_crawl_keyboard(items):
@@ -71,9 +73,12 @@ def build_crawl_keyboard(items):
     return InlineKeyboardMarkup(buttons)
 
 
-async def enqueue_items(items, status_message, client, is_audio=False, audio_bitrate="192"):
+async def enqueue_items(items, status_message, client, is_audio=False, audio_bitrate="192", preset=None):
     if not items:
         return []
+
+    if preset is None:
+        preset = SETTINGS.get("download_preset", "custom")
 
     status_chat_id = status_message.chat.id
     task_ids = []
@@ -83,10 +88,12 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
             url = item.get("url", "")
             chat_id = item.get("chat_id", DEFAULT_CHANNEL_ID)
             custom_name = item.get("custom_name", "")
+            title = item.get("title", "")
         else:
             url = item[0] if len(item) > 0 else ""
             chat_id = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
             custom_name = item[2] if len(item) > 2 else ""
+            title = item[3] if len(item) > 3 else ""
 
         if not url:
             continue
@@ -97,6 +104,8 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
             custom_name,
             status_chat_id=status_chat_id,
             status_message_id=None,
+            preset=preset,
+            title=title or None,
         )
         task_ids.append(task_id)
 
@@ -139,7 +148,11 @@ def format_bytes(size):
 
 
 def _display_task_name(task):
-    return (task.get("custom_name") or "").strip() or task.get("url") or "Unknown video"
+    return (
+        (task.get("custom_name") or "").strip()
+        or (task.get("title") or "").strip()
+        or "Unknown video"
+    )
 
 
 def _task_source(task):
@@ -297,11 +310,32 @@ def register_handlers(app):
     async def _pending_cmd(c, m):
         if not is_authorized(m.from_user.id, ADMIN_IDS):
             return
+
         tasks = get_pending_only_tasks_db()
         if not tasks:
-            await m.reply_text("⏳ **PENDING QUEUE**\n\n✅ હાલ કોઈ video pending નથી.")
+            await m.reply_text(
+                "⏳  **PENDING QUEUE**\n\n"
+                "✅  હાલ કોઈ video pending નથી."
+            )
             return
-        await m.reply_text(build_pending_text())
+
+        buttons = []
+        for task in tasks[:30]:
+            task_id = task.get("id")
+            name = _display_task_name(task)
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f"⏫  #{task_id} • {name[:38]}",
+                    callback_data=f"move_task_next_{task_id}",
+                )
+            ])
+
+        await m.reply_text(
+            build_pending_text()
+            + "\n\n👇 Queue માં આગળ મોકલવા માટે task પસંદ કરો:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
     @app.on_message(filters.command("diskclean"))
     async def _diskclean_cmd(c, m):
@@ -580,7 +614,7 @@ def register_handlers(app):
 
     @app.on_callback_query(
         filters.regex(
-            r"^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel|confirm_restart|restart_bot|restart_cancel|diskclean_confirm|diskclean_cancel|clear_summary_history|clear_summary_confirm|clear_summary_cancel|cancel_task_\d+|btn_pending).*"
+            r"^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel|confirm_restart|restart_bot|restart_cancel|diskclean_confirm|diskclean_cancel|clear_summary_history|clear_summary_confirm|clear_summary_cancel|retry_failed|retry_all|retry_task_\d+|retry_failed_close|cancel_task_\d+|btn_pending).*"
         )
     )
     async def _handle_all_settings_callbacks(client, callback_query):
@@ -718,7 +752,46 @@ def register_handlers(app):
             )
             return
 
+        # Download preset cycle
+        if data == "cycle_preset":
+            presets = ["custom", "mobile", "720p", "1080p", "audio"]
+            current = str(SETTINGS.get("download_preset", "custom")).lower()
+            try:
+                index = presets.index(current)
+            except ValueError:
+                index = 0
+            SETTINGS["download_preset"] = presets[(index + 1) % len(presets)]
+            save_settings()
+            await callback_query.answer(
+                f"🎚 Preset: {SETTINGS['download_preset']}",
+                show_alert=False,
+            )
+            await callback_query.message.edit_reply_markup(
+                reply_markup=get_main_keyboard()
+            )
+            return
+
         # Resolution cycle
+        if data == "toggle_queue_pause":
+            SETTINGS["queue_paused"] = not bool(
+                SETTINGS.get("queue_paused", False)
+            )
+            save_settings()
+
+            if SETTINGS["queue_paused"]:
+                message = "⏸ Queue paused\n\nRunning downloads continue, but new pending tasks will wait."
+            else:
+                message = "▶️ Queue resumed\n\nPending tasks will start automatically."
+
+            await callback_query.answer(
+                message,
+                show_alert=True,
+            )
+            await callback_query.message.edit_reply_markup(
+                reply_markup=get_main_keyboard()
+            )
+            return
+
         if data == "cycle_resolution":
             resolutions = ["original", "1080p", "720p", "480p"]
             current = SETTINGS.get("target_resolution", "original")
@@ -802,6 +875,51 @@ def register_handlers(app):
             )
             return
 
+        if data.startswith("move_task_next_"):
+            try:
+                task_id = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                await callback_query.answer(
+                    "❌ Invalid task ID",
+                    show_alert=True,
+                )
+                return
+
+            task = get_task_db(task_id)
+            if not task:
+                await callback_query.answer(
+                    "ℹ️ Task not found.",
+                    show_alert=True,
+                )
+                return
+
+            if task.get("status") != "pending":
+                await callback_query.answer(
+                    "ℹ️ Only pending tasks can be moved to next.",
+                    show_alert=True,
+                )
+                return
+
+            if not move_task_next_db(task_id):
+                await callback_query.answer(
+                    "⚠️ Could not move task to next.",
+                    show_alert=True,
+                )
+                return
+
+            await callback_query.answer(
+                f"⏫ Task #{task_id} moved to next.",
+                show_alert=True,
+            )
+
+            try:
+                await callback_query.message.edit_reply_markup(
+                    reply_markup=get_main_keyboard()
+                )
+            except Exception:
+                pass
+            return
+
         if data.startswith("cancel_task_"):
             try:
                 task_id = int(data.rsplit("_", 1)[1])
@@ -828,6 +946,70 @@ def register_handlers(app):
                 )
             except Exception:
                 pass
+            return
+
+        if data.startswith("retry_task_"):
+            try:
+                task_id = int(data.split("_")[-1])
+            except (TypeError, ValueError):
+                await callback_query.answer(
+                    "❌ Invalid task ID",
+                    show_alert=True,
+                )
+                return
+
+            new_id = retry_failed_task_db(task_id)
+
+            if new_id:
+                await callback_query.answer(
+                    f"🔄 Task #{task_id} added as #{new_id}",
+                    show_alert=True,
+                )
+                return
+
+            await callback_query.answer(
+                "⚠️ Task is no longer failed/cancelled",
+                show_alert=True,
+            )
+            return
+
+        if data == "retry_failed_close":
+            await callback_query.answer()
+            await callback_query.message.edit_reply_markup(
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        if data == "retry_failed":
+            new_ids = retry_all_failed_tasks_db()
+
+            if new_ids:
+                await callback_query.answer(
+                    f"🔄 {len(new_ids)} task(s) added to queue",
+                    show_alert=True,
+                )
+            else:
+                await callback_query.answer(
+                    "ℹ️ No failed/cancelled tasks to retry",
+                    show_alert=True,
+                )
+
+            return
+
+        if data == "retry_all":
+            new_ids = retry_all_failed_tasks_db()
+
+            if new_ids:
+                await callback_query.answer(
+                    f"🔄 Retrying {len(new_ids)} task(s)",
+                    show_alert=True,
+                )
+            else:
+                await callback_query.answer(
+                    "ℹ️ No failed/cancelled tasks to retry",
+                    show_alert=True,
+                )
+
             return
 
         if data == "clear_summary_history":
@@ -868,7 +1050,7 @@ def register_handlers(app):
         )
 
 async def finalize_queue_file(client, status_message, file_path, title, chat_id, task_id):
-    from config import CUSTOM_THUMB_PATH, CAPTION_PATH, STATS, save_stats
+    from config import CUSTOM_THUMB_PATH, CAPTION_PATH, STATS, save_stats, MAX_RETRIES
 
     if not file_path or not os.path.exists(file_path):
         raise FileNotFoundError("Downloaded file not found")
@@ -913,9 +1095,10 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
         if th and (not os.path.exists(th) or os.path.getsize(th) == 0):
             th = None
 
-        all_channels = [chat_id] + [
+        primary_upload_chat = DEFAULT_CHANNEL_ID
+        all_channels = [primary_upload_chat] + [
             ec for ec in SETTINGS.get("extra_channels", [])
-            if ec != chat_id
+            if ec != primary_upload_chat
         ]
 
         p_sz = os.path.getsize(part_path) / 1048576
@@ -956,18 +1139,45 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
                 "width": w,
                 "height": h,
                 "supports_streaming": True,
-                "progress": tracker.callback if target_chat == chat_id else None,
+                "progress": tracker.callback if target_chat == primary_upload_chat else None,
             }
 
             if th and os.path.exists(th):
                 v_kwargs["thumb"] = th
 
-            while True:
+            upload_ok = False
+            upload_error = None
+
+            for upload_attempt in range(1, MAX_RETRIES + 1):
                 try:
                     await client.send_video(**v_kwargs)
+                    upload_ok = True
                     break
                 except FloodWait as fw:
-                    await asyncio.sleep(fw.value + 1)
+                    wait_seconds = int(fw.value) + 1
+                    print(
+                        f"⚠️ Task {task_id} upload FloodWait on channel "
+                        f"{target_chat}; waiting {wait_seconds}s "
+                        f"(attempt {upload_attempt}/{MAX_RETRIES})",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                except Exception as exc:
+                    upload_error = exc
+                    print(
+                        f"⚠️ Task {task_id} upload error on channel "
+                        f"{target_chat}: {exc} "
+                        f"(attempt {upload_attempt}/{MAX_RETRIES})",
+                        flush=True,
+                    )
+                    if upload_attempt < MAX_RETRIES:
+                        await asyncio.sleep(2 ** (upload_attempt - 1))
+
+            if not upload_ok:
+                raise RuntimeError(
+                    f"Upload failed for task {task_id} "
+                    f"to channel {target_chat}: {upload_error}"
+                )
 
         try:
             if os.path.exists(part_path):
@@ -999,6 +1209,7 @@ async def process_queue_task(client, task, status_message):
         "url": task.get("url", ""),
         "chat_id": task.get("chat_id", DEFAULT_CHANNEL_ID),
         "custom_name": task.get("custom_name") or "",
+        "preset": task.get("preset") or "custom",
     }
 
     file_path = None
@@ -1104,6 +1315,7 @@ async def process_single_url_safe(client, message, item, total_count, idx, user_
             ch = item.get("chat_id", DEFAULT_CHANNEL_ID)
             c_name = item.get("custom_name", "")
             trim_t = item.get("trim_info", "")
+            preset = item.get("preset") or "custom"
         else:
             u = item[0] if len(item) > 0 else ""
             ch = item[1] if len(item) > 1 else DEFAULT_CHANNEL_ID
@@ -1129,18 +1341,27 @@ async def process_single_url_safe(client, message, item, total_count, idx, user_
                         trim_info=trim_t,
                         is_audio_mode=is_audio,
                         audio_bitrate=audio_bitrate,
+                        preset=preset,
                         task_id=task_id,
                     ),
                     timeout=TASK_TIMEOUT
                 )
                 if f and os.path.exists(f):
+                    if task_id is not None and t:
+                        try:
+                            update_task_title_db(task_id, t)
+                        except Exception:
+                            logger.exception(
+                                "Task %s title database update failed",
+                                task_id,
+                            )
                     sz = os.path.getsize(f) / 1048576
                     return f, t, ch, sz, True
             except Exception as e:
-                print(f"⚠️ Task attempt {att} error: {e}", flush=True)
+                logger.exception("Task %s attempt %s failed", task_id or idx, att)
         return None, None, ch, 0, False
     except Exception as e:
-        print(f"⚠️ Process single URL error: {e}", flush=True)
+        logger.exception("Task %s process_single_url failed", task_id or idx)
 
         if isinstance(item, dict):
             error_channel = item.get("chat_id", DEFAULT_CHANNEL_ID)

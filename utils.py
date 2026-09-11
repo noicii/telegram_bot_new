@@ -301,12 +301,38 @@ def get_main_keyboard():
         ],
         [
             InlineKeyboardButton(
+                f"🎚 Preset: {SETTINGS.get('download_preset', 'custom')}",
+                callback_data="cycle_preset",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 f"📺 Resolution: {SETTINGS.get('target_resolution', 'original')}",
                 callback_data="cycle_resolution",
             ),
             InlineKeyboardButton(
                 f"⚡ Speed: {SETTINGS.get('speed_limit', '0')}",
                 callback_data="cycle_speed",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Retry Failed",
+                callback_data="retry_failed",
+            ),
+            InlineKeyboardButton(
+                "🔄 Retry All",
+                callback_data="retry_all",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                (
+                    "▶️ Resume Queue"
+                    if SETTINGS.get("queue_paused", False)
+                    else "⏸ Pause Queue"
+                ),
+                callback_data="toggle_queue_pause",
             ),
         ],
         [

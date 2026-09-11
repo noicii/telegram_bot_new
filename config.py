@@ -94,6 +94,8 @@ DEFAULT_SETTINGS = {
     "extract_subtitles": False,
     "target_resolution": "original",
     "audio_track_mode": "all",
+    "download_preset": "custom",
+    "queue_paused": False,
     "extra_channels": [],
 }
 

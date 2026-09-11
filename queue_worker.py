@@ -6,7 +6,7 @@ from database import (
     update_task_status_db,
     reset_processing_tasks_db,
 )
-from config import MAX_CONCURRENT_DOWNLOADS
+from config import MAX_CONCURRENT_DOWNLOADS, SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,10 @@ async def queue_worker(client):
 
     try:
         while _queue_worker_running:
+            if SETTINGS.get("queue_paused", False):
+                await asyncio.sleep(0.5)
+                continue
+
             while len(_worker_tasks) < MAX_WORKERS:
                 task = get_next_queued_task_db()
 
@@ -93,6 +97,12 @@ async def queue_worker(client):
                     break
 
                 task_id = task["id"]
+
+                # "Move to Next" priority is one-time.
+                # Once the task is picked, return it to normal priority.
+                if task.get("priority", 0):
+                    from database import update_task_priority_db
+                    update_task_priority_db(task_id, 0)
 
                 update_task_status_db(task_id, "processing")
 

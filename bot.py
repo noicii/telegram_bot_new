@@ -71,6 +71,22 @@ if __name__ == "__main__":
 
         logger.info("Telegram client started")
 
+        # Verify the configured upload channel before starting the queue.
+        try:
+            channel = await app.get_chat(DEFAULT_CHANNEL_ID)
+            me = await app.get_chat_member(DEFAULT_CHANNEL_ID, "me")
+            logger.info(
+                "Default channel check OK: %s | bot status: %s",
+                getattr(channel, "title", DEFAULT_CHANNEL_ID),
+                getattr(me, "status", "unknown"),
+            )
+        except Exception as channel_exc:
+            logger.exception(
+                "Default channel check failed for %s: %s",
+                DEFAULT_CHANNEL_ID,
+                channel_exc,
+            )
+
         start_queue_worker(app)
         logger.info("Queue worker started")
 

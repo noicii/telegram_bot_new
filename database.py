@@ -30,6 +30,31 @@ def init_db():
             """
         )
 
+        # Migrate older task_queue databases without deleting existing data.
+        task_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(task_queue)").fetchall()
+        }
+        if "preset" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN preset TEXT NOT NULL DEFAULT 'custom'"
+            )
+
+        if "title" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN title TEXT"
+            )
+
+        if "retry_of" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN retry_of INTEGER"
+            )
+
+        if "priority" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
+
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_task_status
@@ -51,6 +76,22 @@ def init_db():
             """
         )
 
+        # Migrate older crawl_items databases without deleting existing data.
+        existing_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(crawl_items)").fetchall()
+        }
+
+        for column, definition in (
+            ("source", "TEXT"),
+            ("resolution", "TEXT"),
+            ("source_url", "TEXT"),
+        ):
+            if column not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE crawl_items ADD COLUMN {column} {definition}"
+                )
+
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_crawl_items_chat
@@ -67,6 +108,8 @@ def add_task_db(
     custom_name=None,
     status_chat_id=None,
     status_message_id=None,
+    preset="custom",
+    title=None,
 ):
     with get_connection() as conn:
         cursor = conn.execute(
@@ -76,17 +119,21 @@ def add_task_db(
                 url,
                 chat_id,
                 custom_name,
+                title,
+                preset,
                 status,
                 created_at,
                 status_chat_id,
                 status_message_id
             )
-            VALUES (?, ?, ?, 'pending', ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
             (
                 url,
                 chat_id,
                 custom_name,
+                title,
+                preset,
                 datetime.utcnow().isoformat(),
                 status_chat_id,
                 status_message_id,
@@ -117,11 +164,52 @@ def get_next_queued_task_db():
             """
             SELECT * FROM task_queue
             WHERE status = 'pending'
-            ORDER BY id ASC
+            ORDER BY priority DESC, id ASC
             LIMIT 1
             """
         ).fetchone()
         return dict(row) if row else None
+
+
+def update_task_priority_db(task_id, priority=0):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET priority = ?
+            WHERE id = ?
+            """,
+            (int(priority), task_id),
+        )
+        return True
+
+
+def move_task_next_db(task_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, status
+            FROM task_queue
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+
+        if not row:
+            return False
+
+        if row["status"] != "pending":
+            return False
+
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET priority = 1
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+        return True
 
 
 def get_queue_counts_db():
@@ -232,6 +320,98 @@ def cancel_task_db(task_id):
         return True
 
 
+
+def retry_failed_task_db(task_id):
+    """Create a fresh pending task from one failed/cancelled task."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT url, chat_id, custom_name, title, status_chat_id, status_message_id, preset
+            FROM task_queue
+            WHERE id = ?
+              AND status IN ('failed', 'cancelled')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM task_queue AS retry_task
+                  WHERE retry_task.retry_of = task_queue.id
+                    AND retry_task.status IN ('pending', 'processing')
+              )
+            """,
+            (task_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        cursor = conn.execute(
+            """
+            INSERT INTO task_queue
+                (url, chat_id, custom_name, title, preset, status,
+                 created_at, status_chat_id, status_message_id, retry_of)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            """,
+            (
+                row["url"],
+                row["chat_id"],
+                row["custom_name"],
+                row["title"],
+                row["preset"] or "custom",
+                datetime.utcnow().isoformat(),
+                row["status_chat_id"],
+                row["status_message_id"],
+                task_id,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def retry_all_failed_tasks_db():
+    """Create fresh pending tasks for every failed/cancelled task."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, chat_id, custom_name, title, status_chat_id,
+                   status_message_id, preset
+            FROM task_queue
+            WHERE status IN ('failed', 'cancelled')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM task_queue AS retry_task
+                  WHERE retry_task.retry_of = task_queue.id
+                    AND retry_task.status IN ('pending', 'processing')
+              )
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        new_ids = []
+
+        for row in rows:
+            cursor = conn.execute(
+                """
+                INSERT INTO task_queue
+                    (url, chat_id, custom_name, title, preset, status,
+                     created_at, status_chat_id, status_message_id, retry_of)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                """,
+                (
+                    row["url"],
+                    row["chat_id"],
+                    row["custom_name"],
+                    row["title"],
+                    row["preset"] or "custom",
+                    datetime.utcnow().isoformat(),
+                    row["status_chat_id"],
+                    row["status_message_id"],
+                    row["id"],
+                ),
+            )
+            new_ids.append(cursor.lastrowid)
+
+        conn.commit()
+        return new_ids
+
 def clear_summary_history_db():
     with get_connection() as conn:
         cursor = conn.execute(
@@ -278,6 +458,19 @@ def update_task_status_db(task_id, status):
             (status, task_id),
         )
 
+        conn.commit()
+
+
+def update_task_title_db(task_id, title):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET title = ?
+            WHERE id = ?
+            """,
+            (title, task_id),
+        )
         conn.commit()
 
 
