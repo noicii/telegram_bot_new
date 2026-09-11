@@ -747,6 +747,19 @@ async def process_queue_task(client, task, status_message):
         save_stats()
 
         update_task_status_db(task_id, "completed")
+
+        try:
+            await status_message.edit_text(
+                f"✅ **Task #{task_id} completed successfully.**\n\n"
+                f"🎬 `{title}`\n"
+                f"💾 `{size_mb:.2f} MB`"
+            )
+        except Exception as status_exc:
+            print(
+                f"⚠️ Could not update completion status for task {task_id}: {status_exc}",
+                flush=True,
+            )
+
         return None, title, result_chat_id, size_mb, True
 
     except asyncio.CancelledError:
