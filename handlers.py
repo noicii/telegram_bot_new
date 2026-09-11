@@ -3,15 +3,16 @@ import os
 import re
 import asyncio
 import time
+import psutil
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
-from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings, save_stats
-from database import get_pending_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, get_queue_tasks_db, update_task_status_message_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
+from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings, save_stats, MAX_CONCURRENT_DOWNLOADS
+from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, update_task_status_message_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, cancel_task_db, clear_summary_history_db, get_queue_tasks_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
-from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS
+from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
 
 
 def build_crawl_keyboard(items):
@@ -75,7 +76,6 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
         return []
 
     status_chat_id = status_message.chat.id
-    status_message_id = status_message.id
     task_ids = []
 
     for item in items:
@@ -96,12 +96,151 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
             chat_id,
             custom_name,
             status_chat_id=status_chat_id,
-            status_message_id=status_message_id,
+            status_message_id=None,
         )
         task_ids.append(task_id)
 
     return task_ids
 
+
+
+
+DISK_CLEAN_VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+    ".ts", ".m2ts", ".flv", ".wmv", ".mpeg", ".mpg",
+}
+DISK_CLEAN_TEMP_EXTENSIONS = {".part", ".ytdl", ".tmp"}
+
+def get_disk_cleanup_files():
+    """Return downloadable media/temp files inside downloads/."""
+    files = []
+    if not os.path.isdir(DOWNLOAD_DIR):
+        return files
+
+    for root, _dirs, filenames in os.walk(DOWNLOAD_DIR):
+        for filename in filenames:
+            path = os.path.join(root, filename)
+            ext = os.path.splitext(filename)[1].lower()
+            is_generated_thumb = filename.startswith("t_") and ext in {".jpg", ".jpeg", ".png"}
+            if ext in DISK_CLEAN_VIDEO_EXTENSIONS or ext in DISK_CLEAN_TEMP_EXTENSIONS or is_generated_thumb:
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+                files.append((path, size, ext in DISK_CLEAN_TEMP_EXTENSIONS))
+    return files
+
+def format_bytes(size):
+    size = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+
+def _display_task_name(task):
+    return (task.get("custom_name") or "").strip() or task.get("url") or "Unknown video"
+
+
+def _task_source(task):
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(task.get("url") or "").netloc.lower()
+        return host.replace("www.", "") or "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def _active_task_line(task, number=1):
+    task_id = str(task.get("id"))
+    live = LIVE_TASKS.get(task_id, {})
+    title = live.get("title") or _display_task_name(task)
+    pct = live.get("percent")
+    if pct is None:
+        progress = "Starting..."
+    else:
+        pct = float(pct)
+        fill = max(0, min(10, int(pct // 10)))
+        progress = f"{('▰' * fill) + ('▱' * (10 - fill))} {pct:.1f}%"
+    current = live.get("current_mb")
+    total = live.get("total_mb")
+    size = f"{current:.1f} MB" if current is not None else "Calculating..."
+    if total:
+        size += f" / {total:.1f} MB"
+    speed = live.get("speed_mb")
+    speed_text = f"{speed:.2f} MB/s" if speed is not None else "—"
+    eta = live.get("eta") or "—"
+    operation = live.get("operation") or "Downloading"
+    return (
+        f"{number}️⃣ **#{task_id} — {title[:45]}**\n"
+        f"   📺 {SETTINGS.get('target_resolution', 'original')} • MP4 • {_task_source(task)}\n"
+        f"   📊 `{progress}`\n"
+        f"   💾 {size} • ⚡ {speed_text} • ⏳ ETA {eta}\n"
+        f"   🔧 {operation}"
+    )
+
+
+def build_status_text():
+    counts = get_queue_counts_db()
+    tasks = get_queue_tasks_db()
+    processing_tasks = [task for task in tasks if task.get("status") == "processing"]
+    cpu = psutil.cpu_percent(interval=0.2)
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage(str(DOWNLOAD_DIR))
+    memory_used_gb = memory.used / (1024 ** 3)
+    memory_total_gb = memory.total / (1024 ** 3)
+    disk_used_gb = disk.used / (1024 ** 3)
+    disk_total_gb = disk.total / (1024 ** 3)
+    disk_free_gb = disk.free / (1024 ** 3)
+
+    lines = [
+        "🤖 **BOT STATUS**",
+        "",
+        "🟢 **Bot:** Online / Running",
+        f"🖥️ **CPU:** {cpu:.1f}%",
+        f"🧠 **RAM:** {memory_used_gb:.2f} / {memory_total_gb:.2f} GB ({memory.percent:.1f}%)",
+        f"💽 **Disk:** {disk_used_gb:.2f} / {disk_total_gb:.2f} GB",
+        f"🟢 **Free Disk:** {disk_free_gb:.2f} GB",
+        "",
+        "📊 **QUEUE SUMMARY**",
+        f"⏳ Pending: **{counts.get('pending', 0)}**",
+        f"🚀 Processing: **{counts.get('processing', 0)}/{MAX_CONCURRENT_DOWNLOADS if 'MAX_CONCURRENT_DOWNLOADS' in globals() else 2}**",
+        f"✅ Completed: **{counts.get('completed', 0)}**",
+        f"❌ Failed: **{counts.get('failed', 0)}**",
+        f"🚫 Cancelled: **{counts.get('cancelled', 0)}**",
+        "",
+        "🚀 **PROCESSING / ACTIVE**",
+    ]
+    if processing_tasks:
+        for number, task in enumerate(processing_tasks, 1):
+            lines.append(_active_task_line(task, number))
+            lines.append("")
+    else:
+        lines.append("— હાલ કોઈ video processingમાં નથી.")
+    lines.extend([
+        f"⏳ **PENDING QUEUE: {counts.get('pending', 0)} video(s)**",
+        "📌 Full pending list માટે `/pending` ચલાવો.",
+    ])
+    return "\n".join(lines)
+
+
+def build_pending_text():
+    tasks = get_pending_only_tasks_db()
+    if not tasks:
+        return "⏳ **PENDING QUEUE**\n\n✅ હાલ કોઈ video pending નથી."
+    lines = [
+        "⏳ **PENDING QUEUE**",
+        "",
+        f"📦 Total pending: **{len(tasks)}**",
+        "",
+    ]
+    for n, task in enumerate(tasks, 1):
+        lines.extend([
+            f"**{n}. #{task.get('id')} — {_display_task_name(task)[:55]}**",
+            f"   🌐 {_task_source(task)} • 📺 {SETTINGS.get('target_resolution', 'original')} • MP4",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
 
 def register_handlers(app):
     @app.on_message(filters.command("setcookie") & filters.private)
@@ -132,40 +271,83 @@ def register_handlers(app):
     async def _start(c, m):
         if not is_authorized(m.from_user.id, ADMIN_IDS):
             return
-        
-        pending = get_pending_tasks_db()
-        if pending:
-            preview_items = []
-            for t in pending[:3]:
-                if isinstance(t, dict):
-                    task_url = t.get("url", "")
-                else:
-                    task_url = t[1] if len(t) > 1 else ""
 
-                if task_url:
-                    preview_items.append(f"• `{task_url[:35]}...`")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Bot Restart", callback_data="confirm_restart")]])
+        await m.reply_text(
+            "🤖 **Bot Control**\n\n"
+            "બોટ restart કરવા માટે નીચેનું button દબાવો.\n"
+            "⚠️ Restart આપમેળે નહીં થાય.",
+            reply_markup=kb,
+        )
 
-            task_preview = "\n".join(preview_items)
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 જૂના ટાસ્ક ચાલુ કરો", callback_data="resume_old_tasks"),
-                 InlineKeyboardButton("🗑 ક્યૂ સાફ કરો", callback_data="clear_old_tasks")]
-            ])
+    @app.on_message(filters.command("status"))
+    async def _status_cmd(c, m):
+        if not is_authorized(m.from_user.id, ADMIN_IDS):
+            return
+
+        try:
             await m.reply_text(
-                f"⚠️ **બોટ રીસ્ટાર્ટ થયો છે! ક્યૂમાં અધૂરા ટાસ્ક મળ્યા છે:**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 **બાકી ટાસ્ક:** `{len(pending)}`\n"
-                f"{task_preview}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"તમે શું કરવા માંગો છો?",
-                reply_markup=kb
+                build_status_text(),
+                reply_markup=get_main_keyboard(),
             )
-        else:
-            text = (
-                "🤖 **ઓલ-ઇન-વન વિડિયો ડાઉનલોડર કંટ્રોલ પેનલ**\n\n"
-                "✨ ક્યૂ ખાલી છે. તમે નવી લિંક અથવા `.txt` ફાઇલ મોકલી શકો છો.\n\n"
-                "નીચેના બટન્સથી ફીચર્સ **ON / OFF** કરો 👇"
+        except Exception as exc:
+            await m.reply_text(f"❌ Status error: {exc}")
+
+    @app.on_message(filters.command("pending"))
+    async def _pending_cmd(c, m):
+        if not is_authorized(m.from_user.id, ADMIN_IDS):
+            return
+        tasks = get_pending_only_tasks_db()
+        if not tasks:
+            await m.reply_text("⏳ **PENDING QUEUE**\n\n✅ હાલ કોઈ video pending નથી.")
+            return
+        await m.reply_text(build_pending_text())
+
+    @app.on_message(filters.command("diskclean"))
+    async def _diskclean_cmd(c, m):
+        if not is_authorized(m.from_user.id, ADMIN_IDS):
+            return
+
+        counts = get_queue_counts_db()
+        pending = int(counts.get("pending", 0))
+        processing = int(counts.get("processing", 0))
+        if pending or processing:
+            await m.reply_text(
+                "⚠️ **Disk Cleanup અટકાવ્યું**\n\n"
+                f"📥 Pending: {pending}\n"
+                f"⚙️ Processing: {processing}\n\n"
+                "હાલ queue active છે, એટલે કોઈ file delete નહીં કરું.\n"
+                "બધા videos send થયા પછી ફરી `/diskclean` ચલાવો."
             )
-            await m.reply_text(text, reply_markup=get_main_keyboard())
+            return
+
+        files = get_disk_cleanup_files()
+        if not files:
+            await m.reply_text(
+                "🧹 **Disk Cleanup**\n\n"
+                "✅ Downloads folder માં delete કરવા માટે કોઈ video અથવા temporary file નથી."
+            )
+            return
+
+        video_count = sum(1 for _path, _size, is_temp in files if not is_temp)
+        temp_count = sum(1 for _path, _size, is_temp in files if is_temp)
+        total_size = sum(size for _path, size, _is_temp in files)
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Clean Disk", callback_data="diskclean_confirm"),
+                InlineKeyboardButton("❌ Cancel", callback_data="diskclean_cancel"),
+            ]
+        ])
+        await m.reply_text(
+            "🧹 **Disk Cleanup**\n\n"
+            f"🎬 Video files: {video_count}\n"
+            f"🗑️ Temporary files: {temp_count}\n"
+            f"💾 Space to free: {format_bytes(total_size)}\n\n"
+            "🟢 Queue હાલમાં idle છે.\n"
+            "⚠️ Confirm કર્યા પછી downloads/ માંની આ files delete થશે.",
+            reply_markup=kb,
+        )
 
     @app.on_callback_query(filters.regex("^resume_old_tasks$"))
     async def _cb_resume(c, q):
@@ -194,15 +376,12 @@ def register_handlers(app):
                 update_task_status_message_db(
                     task_id,
                     s_msg.chat.id,
-                    s_msg.id,
+                    None,
                 )
 
         await s_msg.edit_text(
             f"⚡ **જૂના {len(items)} ટાસ્ક Queue માં પાછા મૂકાયા છે.**\n\n"
             "⏳ FIFO Queue મુજબ processing ફરી શરૂ થશે...",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
-            ]),
         )
 
         start_queue_worker(c)
@@ -225,21 +404,15 @@ def register_handlers(app):
         if not items:
             return await m.reply_text("કોઈ માન્ય લિંક નથી.")
 
-        mk = InlineKeyboardMarkup([
-            [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
-        ])
-
         s = await m.reply_text(
             f"{len(items)} લિંક્સ મળી. Queue માં ઉમેરાઈ રહી છે...",
-            reply_markup=mk,
         )
 
         task_ids = await enqueue_items(items, s, c)
 
         await s.edit_text(
             f"📥 **{len(task_ids)} ટાસ્ક Queue માં ઉમેરાયા.**\n\n"
-            "⏳ FIFO Queue મુજબ processing શરૂ થશે...",
-            reply_markup=mk,
+            "⏳ FIFO Queue મુજબ processing શરૂ થશે..."
         )
 
     @app.on_message(filters.command("crawl") & filters.private)
@@ -366,10 +539,7 @@ def register_handlers(app):
 
             await status_msg.edit_text(
                 f"📥 **{len(task_ids)} crawl options Queue માં ઉમેરાયા.**\n\n"
-                "⏳ FIFO Queue મુજબ processing શરૂ થશે...",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]
-                ]),
+                "⏳ FIFO Queue મુજબ processing શરૂ થશે..."
             )
             return
 
@@ -410,7 +580,7 @@ def register_handlers(app):
 
     @app.on_callback_query(
         filters.regex(
-            "^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel).*"
+            r"^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel|confirm_restart|restart_bot|restart_cancel|diskclean_confirm|diskclean_cancel|clear_summary_history|clear_summary_confirm|clear_summary_cancel|cancel_task_\d+|btn_pending).*"
         )
     )
     async def _handle_all_settings_callbacks(client, callback_query):
@@ -424,14 +594,99 @@ def register_handlers(app):
             )
             return
 
-        # Status
-        if data in ("status", "btn_status"):
-            await callback_query.answer(
-                "📊 Bot is running smoothly and active!",
-                show_alert=True,
+        if data == "diskclean_confirm":
+            counts = get_queue_counts_db()
+            pending = int(counts.get("pending", 0))
+            processing = int(counts.get("processing", 0))
+            if pending or processing:
+                await callback_query.answer(
+                    "⚠️ Queue active છે. Cleanup કરવામાં આવ્યું નથી.",
+                    show_alert=True,
+                )
+                return
+
+            files = get_disk_cleanup_files()
+            deleted = 0
+            failed = 0
+            freed = 0
+            for path, size, _is_temp in files:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        deleted += 1
+                        freed += size
+                except OSError:
+                    failed += 1
+
+            await callback_query.answer("🧹 Disk cleanup complete!", show_alert=True)
+            await callback_query.message.edit_text(
+                "✅ **Disk Cleanup Complete**\n\n"
+                f"🎬/🗑️ Files deleted: {deleted}\n"
+                f"💾 Space freed: {format_bytes(freed)}\n"
+                f"⚠️ Could not delete: {failed}"
             )
             return
 
+        if data == "diskclean_cancel":
+            await callback_query.answer("Cleanup cancel થયું.")
+            await callback_query.message.edit_text(
+                "🧹 **Disk Cleanup**\n\n"
+                "❌ Cleanup cancel થયું. કોઈ file delete થઈ નથી."
+            )
+            return
+
+        if data == "restart_bot":
+            await callback_query.answer("🔄 Bot restart થઈ રહ્યો છે...", show_alert=True)
+            await callback_query.message.edit_text(
+                "🔄 **Bot Restart થઈ રહ્યો છે...**\n\n"
+                "થોડી ક્ષણમાં bot પાછો online થશે."
+            )
+            await asyncio.sleep(1)
+            os._exit(0)
+
+        if data == "btn_pending":
+            await callback_query.answer()
+            await callback_query.message.edit_text(
+                build_pending_text(),
+                reply_markup=get_main_keyboard(),
+            )
+            return
+
+        # Status
+        if data == "restart_cancel":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Bot Restart", callback_data="confirm_restart")]
+            ])
+            await callback_query.answer("Restart cancel થયું.")
+            await callback_query.message.edit_text(
+                "🤖 **Bot Control**\n\nRestart cancel થયું.",
+                reply_markup=kb,
+            )
+            return
+        if data == "confirm_restart":
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ હા, Restart", callback_data="restart_bot"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="restart_cancel")]
+            ])
+            await callback_query.answer()
+            await callback_query.message.edit_text(
+                "⚠️ **Bot Restart કરવો છે?**",
+                reply_markup=kb
+            )
+            return
+        if data in ("status", "btn_status"):
+            try:
+                await callback_query.answer()
+                await callback_query.message.edit_text(
+                    build_status_text(),
+                    reply_markup=get_main_keyboard(),
+                )
+            except Exception as exc:
+                await callback_query.answer(
+                    f"❌ Status error: {exc}",
+                    show_alert=True,
+                )
+            return
         # Clear cache
         if data in ("clear_cache", "btn_clearcache"):
             await callback_query.answer(
@@ -547,29 +802,63 @@ def register_handlers(app):
             )
             return
 
-        # Cancel only tasks belonging to this status-message batch.
-        if data in ("cancel", "cancel_process"):
-            status_chat_id = callback_query.message.chat.id
-            status_message_id = callback_query.message.id
+        if data.startswith("cancel_task_"):
+            try:
+                task_id = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                return await callback_query.answer("❌ Invalid task ID", show_alert=True)
 
-            cancelled_ids = cancel_tasks_by_status_message_db(
-                status_chat_id,
-                status_message_id,
+            task = get_task_db(task_id)
+            if not task or task.get("status") not in ("pending", "processing"):
+                await callback_query.answer("ℹ️ આ task હવે active નથી.", show_alert=True)
+                return
+
+            if not cancel_task_db(task_id):
+                await callback_query.answer("ℹ️ Task પહેલેથી પૂર્ણ/રદ થઈ ગઈ છે.", show_alert=True)
+                return
+
+            CANCELLED_TASKS.add(str(task_id))
+            clear_live_task(task_id)
+
+            await callback_query.answer(f"🛑 Task #{task_id} cancelled.", show_alert=True)
+            try:
+                await callback_query.message.edit_text(
+                    f"🚫 **Task #{task_id} Cancelled**\n\n"
+                    f"🎬 `{_display_task_name(task)[:60]}`"
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "clear_summary_history":
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ હા, Clear History", callback_data="clear_summary_confirm"),
+                InlineKeyboardButton("❌ Cancel", callback_data="clear_summary_cancel"),
+            ]])
+            await callback_query.answer()
+            await callback_query.message.edit_text(
+                "⚠️ **Clear Queue Summary History?**\n\n"
+                "Completed / Failed / Cancelled records delete થશે.\n"
+                "⏳ Pending અને 🚀 Processing tasks safe રહેશે.",
+                reply_markup=kb,
             )
+            return
 
-            for task_id in cancelled_ids:
-                CANCELLED_TASKS.add(str(task_id))
+        if data == "clear_summary_confirm":
+            deleted = clear_summary_history_db()
+            await callback_query.answer(f"🗑 {deleted} history record(s) cleared.", show_alert=True)
+            await callback_query.message.edit_text(
+                build_status_text(),
+                reply_markup=get_main_keyboard(),
+            )
+            return
 
-            if cancelled_ids:
-                await callback_query.answer(
-                    f"🛑 {len(cancelled_ids)} task(s) cancelled.",
-                    show_alert=True,
-                )
-            else:
-                await callback_query.answer(
-                    "ℹ️ આ batch માં cancel કરવા માટે કોઈ pending/processing task નથી.",
-                    show_alert=True,
-                )
+        if data == "clear_summary_cancel":
+            await callback_query.answer("Clear Summary cancel થયું.")
+            await callback_query.message.edit_text(
+                build_status_text(),
+                reply_markup=get_main_keyboard(),
+            )
             return
 
         # Unknown callback
@@ -686,6 +975,15 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
         except OSError:
             pass
 
+        # Remove only thumbnails generated for this upload. Never remove the
+        # user's configured/custom thumbnail from assets/.
+        if th and os.path.abspath(th) != os.path.abspath(CUSTOM_THUMB_PATH):
+            try:
+                if os.path.exists(th):
+                    os.remove(th)
+            except OSError:
+                pass
+
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -703,17 +1001,25 @@ async def process_queue_task(client, task, status_message):
         "custom_name": task.get("custom_name") or "",
     }
 
+    file_path = None
     try:
         if status_message is None:
             status_message = await client.send_message(
                 task.get("status_chat_id") or task.get("chat_id") or DEFAULT_CHANNEL_ID,
-                f"📥 Task #{task_id} processing શરૂ...",
+                f"📥 **Task #{task_id} starting...**\n\n"
+                f"🎬 `{_display_task_name(task)[:60]}`\n"
+                "⏳ Preparing download...",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛑 Cancel this video", callback_data=f"cancel_task_{task_id}")
+                ]]),
             )
             update_task_status_message_db(
                 task_id,
                 status_message.chat.id,
                 status_message.id,
             )
+
+        set_live_task(task_id, title=_display_task_name(task), percent=0, current_mb=0, speed_mb=0, eta="—", operation="Preparing download")
 
         result = await process_single_url_safe(
             client,
@@ -726,11 +1032,11 @@ async def process_queue_task(client, task, status_message):
         )
 
         file_path, title, result_chat_id, size_mb, ok = result
-
         if not ok or not file_path or not os.path.exists(file_path):
             current_task = get_task_db(task_id)
             if not current_task or current_task.get("status") != "cancelled":
                 update_task_status_db(task_id, "failed")
+            clear_live_task(task_id)
             return None, None, result_chat_id, 0, False
 
         await finalize_queue_file(
@@ -741,12 +1047,14 @@ async def process_queue_task(client, task, status_message):
             result_chat_id,
             task_id,
         )
+        file_path = None  # finalize_queue_file has already deleted it.
 
         STATS["total_downloaded_items"] += 1
         STATS["total_downloaded_mb"] += size_mb
         save_stats()
 
         update_task_status_db(task_id, "completed")
+        clear_live_task(task_id)
 
         try:
             await status_message.edit_text(
@@ -763,6 +1071,12 @@ async def process_queue_task(client, task, status_message):
         return None, title, result_chat_id, size_mb, True
 
     except asyncio.CancelledError:
+        clear_live_task(task_id)
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
         raise
 
     except Exception as exc:
@@ -770,11 +1084,16 @@ async def process_queue_task(client, task, status_message):
             f"⚠️ Queue task {task_id} processing error: {exc}",
             flush=True,
         )
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
         current_task = get_task_db(task_id)
         if not current_task or current_task.get("status") != "cancelled":
             update_task_status_db(task_id, "failed")
+        clear_live_task(task_id)
         return None, None, item["chat_id"], 0, False
-
 
 
 async def process_single_url_safe(client, message, item, total_count, idx, user_settings, is_audio=False, audio_bitrate="192", task_id=None):

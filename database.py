@@ -203,6 +203,43 @@ def cancel_tasks_by_status_message_db(status_chat_id, status_message_id):
         return task_ids
 
 
+
+def get_pending_only_tasks_db():
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM task_queue
+            WHERE status = 'pending'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def cancel_task_db(task_id):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM task_queue WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] not in ("pending", "processing"):
+            return False
+        conn.execute(
+            "UPDATE task_queue SET status = 'cancelled' WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        return True
+
+
+def clear_summary_history_db():
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM task_queue WHERE status IN ('completed', 'failed', 'cancelled')"
+        )
+        conn.commit()
+        return cursor.rowcount
+
 def get_queue_tasks_db(limit=None):
     query = """
         SELECT * FROM task_queue

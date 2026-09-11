@@ -17,6 +17,20 @@ from utils import (
 
 segment_semaphore = asyncio.Semaphore(8)
 CANCELLED_TASKS = set()
+LIVE_TASKS = {}
+
+
+def set_live_task(task_id, **data):
+    if task_id is None:
+        return
+    entry = LIVE_TASKS.setdefault(str(task_id), {})
+    entry.update(data)
+
+
+def clear_live_task(task_id):
+    if task_id is not None:
+        LIVE_TASKS.pop(str(task_id), None)
+
 
 class DashboardTracker:
     def __init__(self, msg, cur_idx, total_items, item_name, start_time, task_id=None):
@@ -45,6 +59,16 @@ class DashboardTracker:
         items_done = self.cur_idx - 1 + (cur / tot)
         eta_sec = int((elapsed / items_done) * (self.total - items_done)) if items_done > 0 else 0
         eta_str = time.strftime("%M:%S", time.gmtime(eta_sec))
+        set_live_task(
+            self.task_id,
+            title=self.name,
+            percent=pct,
+            current_mb=c_mb,
+            total_mb=t_mb,
+            speed_mb=spd,
+            eta=eta_str,
+            operation="Telegram upload",
+        )
         text = (
             f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
             f"┃ 🚀 **ટેલિગ્રામ અપલોડિંગ પ્રગતિ**\n"
@@ -56,7 +80,7 @@ class DashboardTracker:
             f"┃ 📦 **ક્યૂ:** `{self.cur_idx}/{self.total}`\n"
             f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         )
-        mk = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 ટાસ્ક કેન્સલ કરો", callback_data="cancel_process")]])
+        mk = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 ટાસ્ક કેન્સલ કરો", callback_data=f"cancel_task_{self.task_id}")]])
         try:
             await self.msg.edit_text(text, reply_markup=mk)
         except Exception:
@@ -259,7 +283,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                     return None, None
 
                 total_segs = len(segment_urls)
-                cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 કેન્સલ કરો", callback_data=f"cancel_{idx}")]])
+                cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 કેન્સલ કરો", callback_data=f"cancel_task_{task_id}")]])
 
                 if is_audio_mode:
                     ffmpeg_cmd = [
@@ -324,6 +348,17 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                             eta_sec = int((elapsed / next_index) * (total_segs - next_index)) if next_index > 0 else 0
                             eta_str = f"{eta_sec // 60:02d}:{eta_sec % 60:02d}"
 
+                            set_live_task(
+                                task_id,
+                                title=safe_title,
+                                percent=pct,
+                                current_mb=current_mb,
+                                total_mb=None,
+                                speed_mb=speed_mb,
+                                eta=eta_str,
+                                operation="Live merge / download",
+                            )
+
                             ui_card = (
                                 f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
                                 f"┃ ⚡ **હાઇ-સ્પીડ લાઈવ સ્ટ્રીમિંગ પાઇપ**\n"
@@ -364,10 +399,15 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 ydl_rate = int(re.sub(r"[^\d]", "", limit_rate)) * mult
 
             out_tmpl = os.path.join(DOWNLOAD_DIR, f"%(title).50s_{task_token}.%(ext)s")
+            def ydl_progress_hook(progress):
+                if task_id is not None and str(task_id) in CANCELLED_TASKS:
+                    raise yt_dlp.utils.DownloadError("Task cancelled by user")
+
             ydl_opts = {
                 "ratelimit": ydl_rate,
                 "socket_timeout": 30,
-                "quiet": True
+                "quiet": True,
+                "progress_hooks": [ydl_progress_hook],
             }
             if os.path.exists(COOKIES_PATH):
                 ydl_opts["cookiefile"] = COOKIES_PATH

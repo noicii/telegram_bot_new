@@ -315,15 +315,19 @@ def get_main_keyboard():
                 callback_data="btn_status",
             ),
             InlineKeyboardButton(
-                "🧹 Clear Cache",
-                callback_data="btn_clearcache",
+                "🗑 Clear Summary",
+                callback_data="clear_summary_history",
             ),
         ],
         [
             InlineKeyboardButton(
-                "❌ Cancel",
-                callback_data="cancel_process",
-            )
+                "🧹 Clear Cache",
+                callback_data="btn_clearcache",
+            ),
+            InlineKeyboardButton(
+                "📋 Pending",
+                callback_data="btn_pending",
+            ),
         ],
     ]
 

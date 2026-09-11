@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _queue_worker_task = None
 _queue_worker_running = False
 _worker_tasks = set()
+RUNNING_TASKS = {}
 MAX_WORKERS = MAX_CONCURRENT_DOWNLOADS
 
 
@@ -49,7 +50,6 @@ async def process_one_queue_task(client, task):
             task,
             status_message,
         )
-
 
         logger.info("Queue worker finished task %s", task_id)
 
@@ -101,9 +101,11 @@ async def queue_worker(client):
                 )
 
                 _worker_tasks.add(worker_task)
+                RUNNING_TASKS[task_id] = worker_task
 
-                def _task_done(done_task):
+                def _task_done(done_task, tid=task_id):
                     _worker_tasks.discard(done_task)
+                    RUNNING_TASKS.pop(tid, None)
 
                 worker_task.add_done_callback(_task_done)
 
@@ -136,6 +138,14 @@ async def queue_worker(client):
 
         logger.info("Queue worker stopped")
 
+
+
+def cancel_running_task(task_id):
+    task = RUNNING_TASKS.get(int(task_id))
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
 
 def start_queue_worker(client):
     global _queue_worker_task
