@@ -85,70 +85,42 @@ def _dashboard_task_line(task, live, upload=False):
 def build_batch_summary_text(batch_id):
     tasks = get_batch_tasks_db(batch_id) or []
 
-    active = []
-    downloads = []
-    uploads = []
+    downloading = 0
+    uploading = 0
+    pending = 0
+    completed = 0
+    failed = 0
 
     for task in tasks:
-        task_id = str(task.get("id"))
-        live = LIVE_TASKS.get(task_id, {})
+        status = str(task.get("status") or "").lower()
 
-        if not live:
-            continue
+        if status == "pending":
+            pending += 1
+        elif status == "completed":
+            completed += 1
+        elif status == "failed":
+            failed += 1
+        elif status == "processing":
+            task_id = str(task.get("id"))
+            live = LIVE_TASKS.get(task_id, {})
+            operation = str(live.get("operation") or "").lower()
 
-        operation = str(live.get("operation") or "").lower()
-        is_upload = "upload" in operation
+            if "upload" in operation:
+                uploading += 1
+            else:
+                downloading += 1
 
-        line = _dashboard_task_line(task, live, upload=is_upload)
-        active.append(line)
-
-        if is_upload:
-            uploads.append(task)
-        else:
-            downloads.append(task)
-
-    if not active:
-        for task in tasks:
-            if task.get("status") == "processing":
-                active.append(
-                    _dashboard_task_line(
-                        task,
-                        {
-                            "title": _display_task_name(task),
-                            "percent": 0,
-                            "speed_mb": None,
-                            "eta": "—",
-                        },
-                        upload=False,
-                    )
-                )
-                downloads.append(task)
-
-    completed = sum(1 for t in tasks if t.get("status") == "completed")
-    failed = sum(1 for t in tasks if t.get("status") == "failed")
-    pending = sum(1 for t in tasks if t.get("status") == "pending")
-
-    lines = ["🎬 **LIVE DASHBOARD**", ""]
-
-    if active:
-        lines.extend(active)
-        lines.append("")
-
-    lines.extend([
-        "────────────",
-        f"⬇️ Downloads: {len(downloads)}/2",
-        f"⬆️ Uploads:   {len(uploads)}/4",
+    return "\n".join([
+        "📊 **QUEUE STATUS**",
+        "",
+        f"⬇️ Downloads: {downloading}/2",
+        f"⬆️ Uploads: {uploading}/4",
         "",
         f"⏳ Queue: {pending}",
         f"✅ Done: {completed}",
         f"❌ Failed: {failed}",
     ])
 
-    return "\n".join(lines)
-
-
-
-CRAWL_PAGE_SIZE = 8
 
 def build_crawl_keyboard(items, page=1):
     total_pages=max(1,(len(items)+CRAWL_PAGE_SIZE-1)//CRAWL_PAGE_SIZE)
