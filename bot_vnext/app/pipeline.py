@@ -24,8 +24,8 @@ class Pipeline:
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_failed = on_failed
-        self.upload = UploadManager(client, workers=4, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
-        self.download = DownloadManager(output_dir, workers=2, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
+        self.upload = UploadManager(client, workers=4, database=self.db, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
+        self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
 
     async def start(self) -> None:
