@@ -31,6 +31,8 @@ class DownloadManager:
         self.on_failed = on_failed
         self.pool = WorkerPool("download", workers, self._handle)
         self.contexts: dict[str, TaskContext] = {}
+        self.running_tasks: dict[str, asyncio.Task] = {}
+        self._cancelled: set[str] = set()
 
     async def start(self) -> None:
         await self.pool.start()
@@ -39,20 +41,30 @@ class DownloadManager:
         key = str(task_id)
         if key in self.contexts:
             raise RuntimeError(f"Download task {task_id} is already active")
+        self._cancelled.discard(key)
         self.contexts[key] = TaskContext(task_id)
         await self.pool.put(QueueItem(task_id, payload))
 
     async def cancel(self, task_id: int | str) -> bool:
-        ctx = self.contexts.get(str(task_id))
+        key = str(task_id)
+        ctx = self.contexts.get(key)
         if not ctx:
+            self._cancelled.add(key)
             return False
+        self._cancelled.add(key)
         await ctx.cancel()
+        running = self.running_tasks.get(key)
+        if running and not running.done() and running is not asyncio.current_task():
+            running.cancel()
         return True
 
     async def _handle(self, item: QueueItem) -> None:
         key = str(item.task_id)
         ctx = self.contexts[key]
         payload = item.payload
+        current_task = asyncio.current_task()
+        if current_task:
+            self.running_tasks[key] = current_task
 
         async def report(*args):
             if self.on_progress:
@@ -61,6 +73,9 @@ class DownloadManager:
                     await result
 
         try:
+            if key in self._cancelled:
+                raise TaskCancelled(f"Download task {item.task_id} cancelled before start")
+
             ctx.metadata.update(payload.get("metadata") or {})
             result = await self.engine.download(
                 payload["url"],
@@ -74,17 +89,33 @@ class DownloadManager:
         except TaskCancelled:
             logger.info("download task %s cancelled", item.task_id)
         except asyncio.CancelledError:
+            logger.info("download task %s asyncio-cancelled", item.task_id)
             raise
         except Exception as exc:
             logger.exception("download task %s failed", item.task_id)
             if self.on_failed:
                 await self.on_failed(item, exc)
         finally:
+            self.running_tasks.pop(key, None)
             await ctx.cleanup()
             self.contexts.pop(key, None)
+            self._cancelled.discard(key)
+
+    def queue_size(self) -> int:
+        return self.pool.qsize()
+
+    def active_workers(self) -> int:
+        return self.pool.active_workers()
 
     async def stop(self) -> None:
         for ctx in list(self.contexts.values()):
             await ctx.cancel()
+        for task in list(self.running_tasks.values()):
+            if not task.done():
+                task.cancel()
         await self.pool.stop(cancel_pending=True)
+        if self.running_tasks:
+            await asyncio.gather(*self.running_tasks.values(), return_exceptions=True)
+        self.running_tasks.clear()
         self.contexts.clear()
+        self._cancelled.clear()
