@@ -62,7 +62,6 @@ class UploadManager:
 
         self._cancelled.add(key)
         await ctx.cancel()
-
         running = self.running_tasks.get(key)
         if running and not running.done() and running is not asyncio.current_task():
             running.cancel()
@@ -78,6 +77,12 @@ class UploadManager:
         current_task = asyncio.current_task()
         if current_task:
             self.running_tasks[key] = current_task
+
+        async def report(*args):
+            if self.on_progress:
+                result = self.on_progress(item.task_id, *args)
+                if asyncio.iscoroutine(result):
+                    await result
 
         file_path = Path(payload["file_path"])
         try:
@@ -100,7 +105,7 @@ class UploadManager:
                 width=payload.get("width"),
                 height=payload.get("height"),
                 supports_streaming=payload.get("supports_streaming", True),
-                progress=self.on_progress,
+                progress=report,
                 reply_to_message_id=payload.get("reply_to_message_id"),
             )
             ctx.check_cancelled()
