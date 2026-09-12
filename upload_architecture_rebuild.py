@@ -3,11 +3,14 @@ from pathlib import Path
 HANDLERS = Path("handlers.py")
 WORKER = Path("queue_worker.py")
 
+# Apply everything to temporary text first, then write only after both files
+# have been validated. This prevents a half-applied rebuild.
 s = HANDLERS.read_text()
+w = WORKER.read_text()
 
 old = '''MAX_CONCURRENT_UPLOADS = 4\nUPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)\nUPLOAD_TASKS = {}\n\ndef register_upload_task(task_id, task):\n    UPLOAD_TASKS[int(task_id)] = task\n\ndef get_upload_task(task_id):\n    task = UPLOAD_TASKS.get(int(task_id))\n    return task if task and not task.done() else None\n\ndef cancel_upload_task(task_id):\n    task = get_upload_task(task_id)\n    if task:\n        task.cancel()\n        return True\n    return False\n\ndef cancel_all_upload_tasks():\n    tasks = list(UPLOAD_TASKS.values())\n    for task in tasks:\n        if task and not task.done():\n            task.cancel()\n    return len(tasks)\n'''
 
-new = '''MAX_CONCURRENT_UPLOADS = 4\nUPLOAD_TASKS = {}\nUPLOAD_QUEUE = None\nUPLOAD_WORKERS = set()\nUPLOAD_CANCELLED = set()\n\ndef register_upload_task(task_id, task):\n    UPLOAD_TASKS[int(task_id)] = task\n\ndef get_upload_task(task_id):\n    task = UPLOAD_TASKS.get(int(task_id))\n    return task if task and not task.done() else None\n\ndef cancel_upload_task(task_id):\n    tid = int(task_id)\n    UPLOAD_CANCELLED.add(tid)\n    task = get_upload_task(tid)\n    if task:\n        task.cancel()\n        return True\n    return True\n\ndef cancel_all_upload_tasks():\n    tids = list(UPLOAD_TASKS)\n    for tid in tids:\n        UPLOAD_CANCELLED.add(int(tid))\n        task = UPLOAD_TASKS.get(int(tid))\n        if task and not task.done():\n            task.cancel()\n    return len(tids)\n\n\ndef _ensure_upload_workers():\n    global UPLOAD_QUEUE\n    if UPLOAD_QUEUE is None:\n        UPLOAD_QUEUE = asyncio.Queue()\n    alive = {t for t in UPLOAD_WORKERS if not t.done()}\n    UPLOAD_WORKERS.clear()\n    UPLOAD_WORKERS.update(alive)\n    while len(UPLOAD_WORKERS) < MAX_CONCURRENT_UPLOADS:\n        worker = asyncio.create_task(_upload_worker_loop())\n        UPLOAD_WORKERS.add(worker)\n\n\ndef _cleanup_upload_file(file_path, task_id):\n    if file_path:\n        try:\n            original = Path(file_path)\n            if original.exists():\n                original.unlink()\n            for part in original.parent.glob(f"{original.stem}.part*{original.suffix}"):\n                if part.is_file():\n                    part.unlink()\n        except OSError:\n            pass\n    try:\n        for thumb in Path(DOWNLOAD_DIR).glob(f"t_{task_id}_*.jpg"):\n            if thumb.is_file():\n                thumb.unlink()\n    except OSError:\n        pass\n\n\nasync def _upload_worker_loop():\n    while True:\n        job = await UPLOAD_QUEUE.get()\n        if job is None:\n            UPLOAD_QUEUE.task_done()\n            return\n        task_id = job[-1]\n        try:\n            if int(task_id) in UPLOAD_CANCELLED:\n                update_task_status_db(task_id, "cancelled")\n                _cleanup_upload_file(job[3], task_id)\n                clear_live_task(task_id)\n                continue\n            upload_task = asyncio.create_task(_run_upload_pipeline(*job))\n            register_upload_task(task_id, upload_task)\n            try:\n                await upload_task\n            except asyncio.CancelledError:\n                if not upload_task.done():\n                    upload_task.cancel()\n                    await asyncio.gather(upload_task, return_exceptions=True)\n                raise\n            finally:\n                UPLOAD_TASKS.pop(int(task_id), None)\n                UPLOAD_CANCELLED.discard(int(task_id))\n        except asyncio.CancelledError:\n            current = get_task_db(task_id)\n            if current and current.get("status") == "processing":\n                update_task_status_db(task_id, "pending")\n            raise\n        except Exception:\n            logger.exception("Upload worker failed for task %s", task_id)\n        finally:\n            UPLOAD_QUEUE.task_done()\n\n\nasync def stop_upload_workers():\n    if UPLOAD_QUEUE is None:\n        return\n    workers = list(UPLOAD_WORKERS)\n    cancel_all_upload_tasks()\n    for _ in workers:\n        await UPLOAD_QUEUE.put(None)\n    if workers:\n        await asyncio.gather(*workers, return_exceptions=True)\n    UPLOAD_WORKERS.clear()\n'''
+new = '''MAX_CONCURRENT_UPLOADS = 4\nUPLOAD_TASKS = {}\nUPLOAD_QUEUE = None\nUPLOAD_WORKERS = set()\nUPLOAD_CANCELLED = set()\n\ndef register_upload_task(task_id, task):\n    UPLOAD_TASKS[int(task_id)] = task\n\ndef get_upload_task(task_id):\n    task = UPLOAD_TASKS.get(int(task_id))\n    return task if task and not task.done() else None\n\ndef cancel_upload_task(task_id):\n    tid = int(task_id)\n    UPLOAD_CANCELLED.add(tid)\n    task = get_upload_task(tid)\n    if task:\n        task.cancel()\n    return True\n\ndef cancel_all_upload_tasks():\n    tids = list(UPLOAD_TASKS)\n    for tid in tids:\n        UPLOAD_CANCELLED.add(int(tid))\n        task = UPLOAD_TASKS.get(int(tid))\n        if task and not task.done():\n            task.cancel()\n    return len(tids)\n\ndef _ensure_upload_workers():\n    global UPLOAD_QUEUE\n    if UPLOAD_QUEUE is None:\n        UPLOAD_QUEUE = asyncio.Queue()\n    alive = {t for t in UPLOAD_WORKERS if not t.done()}\n    UPLOAD_WORKERS.clear()\n    UPLOAD_WORKERS.update(alive)\n    while len(UPLOAD_WORKERS) < MAX_CONCURRENT_UPLOADS:\n        UPLOAD_WORKERS.add(asyncio.create_task(_upload_worker_loop()))\n\ndef _cleanup_upload_file(file_path, task_id):\n    if file_path:\n        try:\n            original = Path(file_path)\n            if original.exists():\n                original.unlink()\n            for part in original.parent.glob(f"{original.stem}.part*{original.suffix}"):\n                if part.is_file():\n                    part.unlink()\n        except OSError:\n            pass\n    try:\n        for thumb in Path(DOWNLOAD_DIR).glob(f"t_{task_id}_*.jpg"):\n            if thumb.is_file():\n                thumb.unlink()\n    except OSError:\n        pass\n\nasync def _upload_worker_loop():\n    while True:\n        job = await UPLOAD_QUEUE.get()\n        if job is None:\n            UPLOAD_QUEUE.task_done()\n            return\n        task_id = job[-1]\n        try:\n            if int(task_id) in UPLOAD_CANCELLED:\n                update_task_status_db(task_id, "cancelled")\n                _cleanup_upload_file(job[3], task_id)\n                clear_live_task(task_id)\n                continue\n            upload_task = asyncio.create_task(_run_upload_pipeline(*job))\n            register_upload_task(task_id, upload_task)\n            try:\n                await upload_task\n            finally:\n                UPLOAD_TASKS.pop(int(task_id), None)\n                UPLOAD_CANCELLED.discard(int(task_id))\n        except asyncio.CancelledError:\n            current = get_task_db(task_id)\n            if current and current.get("status") == "processing":\n                update_task_status_db(task_id, "pending")\n            raise\n        except Exception:\n            logger.exception("Upload worker failed for task %s", task_id)\n        finally:\n            UPLOAD_QUEUE.task_done()\n\nasync def stop_upload_workers():\n    if UPLOAD_QUEUE is None:\n        return\n    workers = list(UPLOAD_WORKERS)\n    cancel_all_upload_tasks()\n    for _ in workers:\n        await UPLOAD_QUEUE.put(None)\n    if workers:\n        await asyncio.gather(*workers, return_exceptions=True)\n    UPLOAD_WORKERS.clear()\n'''
 
 if old not in s:
     raise SystemExit("handlers.py upload manager header not found")
@@ -43,10 +46,8 @@ block = r'''async def finalize_queue_file(client, status_message, file_path, tit
         duration = f"{dh:02d}:{dm:02d}:{ds:02d}" if dh else f"{dm:02d}:{ds:02d}"
         caption_template = ""
         if os.path.exists(CAPTION_PATH):
-            try:
-                caption_template = Path(CAPTION_PATH).read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
+            try: caption_template = Path(CAPTION_PATH).read_text(encoding="utf-8").strip()
+            except Exception: pass
         caption = (caption_template.replace("{title}", part_label).replace("{size}", f"{size_mb:.2f} MB").replace("{duration}", duration)
                    if caption_template else f"🎬 **{part_label}**\n⏱ `{duration}` | 💾 `{size_mb:.2f} MB`")
         tracker = DashboardTracker(status_message, 1, 1, part_label, time.time(), task_id=task_id)
@@ -83,7 +84,6 @@ block = r'''async def finalize_queue_file(client, status_message, file_path, tit
     except OSError: pass
     return True
 
-
 async def update_batch_summary_message(client, task):
     batch_id = task.get("batch_id")
     if not batch_id: return
@@ -100,7 +100,6 @@ async def update_batch_summary_message(client, task):
         msg = await client.send_message(chat_id, text)
         set_batch_status_message_db(batch_id, msg.chat.id, msg.id)
     except Exception: logger.exception("Failed to update batch summary for batch %s", batch_id)
-
 
 async def process_queue_task(client, task, status_message):
     task_id = task["id"]
@@ -137,7 +136,6 @@ async def process_queue_task(client, task, status_message):
         clear_live_task(task_id); await update_batch_summary_message(client, task)
         return None, None, item["chat_id"], 0, False
 
-
 async def _run_upload_pipeline(client, task, status_message, file_path, title, result_chat_id, size_mb, task_id):
     try:
         set_live_task(task_id, title=title, percent=0, current_mb=0, speed_mb=0, eta="—", operation="Telegram upload")
@@ -161,18 +159,21 @@ async def _run_upload_pipeline(client, task, status_message, file_path, title, r
             await status_message.edit_text(f"🎬 **{title[:55]}**\n\n❌ **UPLOAD FAILED**\n⚠️ Upload failed after retries.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"retry_task_{task_id}")]]))
         except Exception: pass
-
 '''
 
 s = s[:start] + block + s[end:]
+
+# Match the real shutdown section by anchors instead of fragile escaped text.
+shutdown_start = w.index('        try:\n            from handlers import cancel_all_upload_tasks')
+shutdown_end = w.index('        logger.info("Queue worker stopped")', shutdown_start)
+shutdown_end += len('        logger.info("Queue worker stopped")')
+new_shutdown = '''        try:\n            from handlers import cancel_all_upload_tasks, stop_upload_workers\n            n = cancel_all_upload_tasks()\n            if n:\n                logger.info("Stopping %s upload task(s)", n)\n            await stop_upload_workers()\n        except Exception:\n            logger.exception("Could not stop upload workers")\n        logger.info("Queue worker stopped")'''
+w = w[:shutdown_start] + new_shutdown + w[shutdown_end:]
+
+# Syntax-check the generated source before touching the real files.
+compile(s, "handlers.py", "exec")
+compile(w, "queue_worker.py", "exec")
+
 HANDLERS.write_text(s)
-
-w = WORKER.read_text()
-old_finally = '''        try:\n            from handlers import cancel_all_upload_tasks\n            n = cancel_all_upload_tasks()\n            if n:\n                logger.info("Stopping %s upload task(s)", n)\n        except Exception:\n            logger.exception("Could not stop upload tasks")\n        logger.info("Queue worker stopped")'''
-new_finally = '''        try:\n            from handlers import cancel_all_upload_tasks, stop_upload_workers\n            n = cancel_all_upload_tasks()\n            if n:\n                logger.info("Stopping %s upload task(s)", n)\n            await stop_upload_workers()\n        except Exception:\n            logger.exception("Could not stop upload workers")\n        logger.info("Queue worker stopped")'''
-if old_finally not in w:
-    raise SystemExit("queue_worker shutdown block not found")
-w = w.replace(old_finally, new_finally, 1)
 WORKER.write_text(w)
-
 print("COMPLETE 4-WORKER UPLOAD REBUILD APPLIED")
