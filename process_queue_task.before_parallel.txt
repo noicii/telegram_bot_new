@@ -1,0 +1,106 @@
+async def process_queue_task(client, task, status_message):
+    task_id = task["id"]
+
+    item = {
+        "url": task.get("url", ""),
+        "chat_id": task.get("chat_id", DEFAULT_CHANNEL_ID),
+        "custom_name": task.get("custom_name") or "",
+        "preset": task.get("preset") or "custom",
+    }
+
+    file_path = None
+    try:
+        if status_message is None:
+            status_message = await client.send_message(
+                task.get("status_chat_id") or task.get("chat_id") or DEFAULT_CHANNEL_ID,
+                f"📥 **Task #{task_id} starting...**\n\n"
+                f"🎬 `{_display_task_name(task)[:60]}`\n"
+                "⏳ Preparing download...",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛑 Cancel this video", callback_data=f"cancel_task_{task_id}")
+                ]]),
+            )
+            update_task_status_message_db(
+                task_id,
+                status_message.chat.id,
+                status_message.id,
+            )
+
+        set_live_task(task_id, title=_display_task_name(task), percent=0, current_mb=0, speed_mb=0, eta="—", operation="Preparing download")
+
+        result = await process_single_url_safe(
+            client,
+            status_message,
+            item,
+            1,
+            1,
+            user_settings=None,
+            task_id=task_id,
+        )
+
+        file_path, title, result_chat_id, size_mb, ok = result
+        if not ok or not file_path or not os.path.exists(file_path):
+            current_task = get_task_db(task_id)
+            if not current_task or current_task.get("status") != "cancelled":
+                update_task_status_db(task_id, "failed")
+            clear_live_task(task_id)
+            await update_batch_summary_message(client, task)
+            return None, None, result_chat_id, 0, False
+
+        await finalize_queue_file(
+            client,
+            status_message,
+            file_path,
+            title,
+            result_chat_id,
+            task_id,
+        )
+        file_path = None  # finalize_queue_file has already deleted it.
+
+        STATS["total_downloaded_items"] += 1
+        STATS["total_downloaded_mb"] += size_mb
+        save_stats()
+
+        update_task_status_db(task_id, "completed")
+        clear_live_task(task_id)
+        await update_batch_summary_message(client, task)
+
+        try:
+            await status_message.edit_text(
+                f"✅ **Task #{task_id} completed successfully.**\n\n"
+                f"🎬 `{title}`\n"
+                f"💾 `{size_mb:.2f} MB`"
+            )
+        except Exception as status_exc:
+            print(
+                f"⚠️ Could not update completion status for task {task_id}: {status_exc}",
+                flush=True,
+            )
+
+        return None, title, result_chat_id, size_mb, True
+
+    except asyncio.CancelledError:
+        clear_live_task(task_id)
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        raise
+
+    except Exception as exc:
+        print(
+            f"⚠️ Queue task {task_id} processing error: {exc}",
+            flush=True,
+        )
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+        current_task = get_task_db(task_id)
+        if not current_task or current_task.get("status") != "cancelled":
+            update_task_status_db(task_id, "failed")
+        clear_live_task(task_id)
+        await update_batch_summary_message(client, task)
+        return None, None, item["chat_id"], 0, False
