@@ -17,15 +17,10 @@ logger = logging.getLogger(__name__)
 class Pipeline:
     """Connect persistent tasks to the independent 2-download/4-upload pools."""
 
-    def __init__(
-        self,
-        client,
-        output_dir: str | Path,
-        database: Database | None = None,
-        on_progress: Callable[..., Awaitable[None] | None] | None = None,
-        on_complete: Callable[[str], Awaitable[None]] | None = None,
-        on_failed: Callable[[str, Exception], Awaitable[None]] | None = None,
-    ) -> None:
+    def __init__(self, client, output_dir: str | Path, database: Database | None = None,
+                 on_progress: Callable[..., Awaitable[None] | None] | None = None,
+                 on_complete: Callable[[str], Awaitable[None]] | None = None,
+                 on_failed: Callable[[str, Exception], Awaitable[None]] | None = None) -> None:
         self.db = database or Database()
         self.on_progress = on_progress
         self.on_complete = on_complete
@@ -55,16 +50,10 @@ class Pipeline:
         task_id = str(row["id"])
         task_type = str(row.get("task_type") or "download")
         payload = {
-            "url": row.get("url"),
-            "filename": Path(row.get("file_path") or f"{task_id}.mp4").name,
-            "file_path": row.get("file_path"),
-            "chat_id": row.get("chat_id"),
-            "message_id": row.get("message_id"),
-            "caption": row.get("caption"),
-            "thumbnail": row.get("thumbnail"),
-            "mode": row.get("mode") or "video",
-            "title": row.get("title"),
-            "metadata": row.get("metadata") or {},
+            "url": row.get("url"), "filename": Path(row.get("file_path") or f"{task_id}.mp4").name,
+            "file_path": row.get("file_path"), "chat_id": row.get("chat_id"), "message_id": row.get("message_id"),
+            "caption": row.get("caption"), "thumbnail": row.get("thumbnail"), "mode": row.get("mode") or "video",
+            "title": row.get("title"), "metadata": row.get("metadata") or {},
         }
         if task_type == "upload":
             await self.upload.submit(task_id, payload)
@@ -72,15 +61,21 @@ class Pipeline:
             await self.download.submit(task_id, payload)
 
     async def submit(self, task_id: int | str, payload: dict[str, Any]) -> None:
-        await self.db.create_task(
-            str(task_id),
-            payload.get("task_type", "download"),
-            **{k: v for k, v in payload.items() if k != "task_type"},
-        )
+        await self.db.create_task(str(task_id), payload.get("task_type", "download"), **{k: v for k, v in payload.items() if k != "task_type"})
         row = await self.db.get_task(str(task_id))
         if not row:
             raise RuntimeError(f"Task {task_id} was not persisted")
         await self._dispatch_row(row)
+
+    async def retry(self, task_id: int | str) -> bool:
+        task_id = str(task_id)
+        task = await self.db.get_task(task_id)
+        if not task or task.get("status") not in {"failed", "cancelled"}:
+            return False
+        if not await self.db.reset_for_retry(task_id):
+            return False
+        await self._dispatch_row(await self.db.get_task(task_id))
+        return True
 
     async def cancel_download(self, task_id: int | str) -> bool:
         cancelled = await self.download.cancel(task_id)
@@ -100,14 +95,12 @@ class Pipeline:
     async def _download_progress(self, *args):
         if self.on_progress:
             result = self.on_progress("download", *args)
-            if asyncio.iscoroutine(result):
-                await result
+            if asyncio.iscoroutine(result): await result
 
     async def _upload_progress(self, *args):
         if self.on_progress:
             result = self.on_progress("upload", *args)
-            if asyncio.iscoroutine(result):
-                await result
+            if asyncio.iscoroutine(result): await result
 
     async def _download_complete(self, item: QueueItem, path: Path):
         task_id = str(item.task_id)
