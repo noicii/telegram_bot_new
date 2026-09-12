@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 from app.core.task import TaskCancelled, TaskContext
 
+logger = logging.getLogger(__name__)
+
 ProgressCallback = Callable[[float | None, int | None, int | None, float | None], Awaitable[None] | None]
 
 
