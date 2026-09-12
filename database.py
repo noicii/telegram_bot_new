@@ -54,6 +54,22 @@ def init_db():
             conn.execute(
                 "ALTER TABLE task_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
             )
+        if "batch_id" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN batch_id TEXT"
+            )
+        if "batch_total" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN batch_total INTEGER NOT NULL DEFAULT 1"
+            )
+        if "batch_status_chat_id" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN batch_status_chat_id INTEGER"
+            )
+        if "batch_status_message_id" not in task_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN batch_status_message_id INTEGER"
+            )
 
         conn.execute(
             """
@@ -110,6 +126,8 @@ def add_task_db(
     status_message_id=None,
     preset="custom",
     title=None,
+    batch_id=None,
+    batch_total=1,
 ):
     with get_connection() as conn:
         cursor = conn.execute(
@@ -124,9 +142,11 @@ def add_task_db(
                 status,
                 created_at,
                 status_chat_id,
-                status_message_id
+                status_message_id,
+                batch_id,
+                batch_total
             )
-            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 url,
@@ -134,14 +154,97 @@ def add_task_db(
                 custom_name,
                 title,
                 preset,
+                "pending",
                 datetime.utcnow().isoformat(),
                 status_chat_id,
                 status_message_id,
+                batch_id,
+                int(batch_total or 1),
             ),
         )
-
         conn.commit()
         return cursor.lastrowid
+
+
+def set_batch_status_message_db(batch_id, chat_id, message_id):
+    if not batch_id:
+        return False
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE task_queue
+            SET batch_status_chat_id = ?,
+                batch_status_message_id = ?
+            WHERE batch_id = ?
+            """,
+            (chat_id, message_id, batch_id),
+        )
+        conn.commit()
+        return True
+
+
+def get_batch_status_message_db(batch_id):
+    if not batch_id:
+        return None
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT batch_status_chat_id, batch_status_message_id
+            FROM task_queue
+            WHERE batch_id = ?
+              AND batch_status_message_id IS NOT NULL
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (batch_id,),
+        ).fetchone()
+
+        return dict(row) if row else None
+
+
+def get_batch_tasks_db(batch_id):
+    if not batch_id:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM task_queue
+            WHERE batch_id = ?
+            ORDER BY id ASC
+            """,
+            (batch_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_batch_summary_db(batch_id):
+    tasks = get_batch_tasks_db(batch_id)
+
+    summary = {
+        "batch_id": batch_id,
+        "total": len(tasks),
+        "pending": 0,
+        "processing": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+
+    for task in tasks:
+        status = str(task.get("status") or "").lower()
+        if status in summary:
+            summary[status] += 1
+
+    summary["finished"] = (
+        summary["completed"]
+        + summary["failed"]
+        + summary["cancelled"]
+    )
+
+    return summary
 
 
 def get_pending_tasks_db():

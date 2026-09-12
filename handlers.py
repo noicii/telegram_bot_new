@@ -10,47 +10,69 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 
 from config import DEFAULT_CHANNEL_ID, ADMIN_IDS, COOKIES_PATH, STATS, CAPTION_PATH, DOWNLOAD_DIR, SETTINGS, save_settings, save_stats, MAX_CONCURRENT_DOWNLOADS
-from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, update_task_status_message_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, cancel_task_db, clear_summary_history_db, retry_failed_task_db, retry_all_failed_tasks_db, move_task_next_db, update_task_title_db, get_queue_tasks_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db
+from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pending_tasks_db, add_task_db, update_task_status_db, update_task_status_message_db, get_next_queued_task_db, get_queue_counts_db, get_task_db, reset_processing_tasks_db, cancel_pending_tasks_db, cancel_task_db, clear_summary_history_db, retry_failed_task_db, retry_all_failed_tasks_db, move_task_next_db, update_task_title_db, get_queue_tasks_db, cancel_tasks_by_status_message_db, clear_crawl_items_db, add_crawl_item_db, get_crawl_items_db, get_crawl_item_db, toggle_crawl_item_db, select_all_crawl_items_db, clear_selected_crawl_items_db, get_selected_crawl_items_db, get_batch_tasks_db, get_batch_summary_db, set_batch_status_message_db, get_batch_status_message_db
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
 logger = logging.getLogger(__name__)
 
 
+def build_batch_summary_text(batch_id):
+    summary = get_batch_summary_db(batch_id)
+
+    total = summary["total"]
+    finished = summary["finished"]
+    completed = summary["completed"]
+    failed = summary["failed"]
+    cancelled = summary["cancelled"]
+    pending = summary["pending"]
+    processing = summary["processing"]
+
+    lines = [
+        "📦 **BATCH DOWNLOAD SUMMARY**",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📊 Progress: **{finished}/{total}**",
+        f"✅ Completed: **{completed}**",
+        f"❌ Failed: **{failed}**",
+        f"🚫 Cancelled: **{cancelled}**",
+        f"⏳ Pending: **{pending}**",
+        f"⚡ Processing: **{processing}**",
+    ]
+
+    if total and finished >= total:
+        if failed or cancelled:
+            lines.extend([
+                "",
+                "⚠️ **Batch finished with some unsuccessful tasks.**",
+            ])
+        else:
+            lines.extend([
+                "",
+                "🎉 **All videos completed successfully!**",
+            ])
+
+    return "\n".join(lines)
+
+
 def build_crawl_keyboard(items):
     buttons = []
 
-    # Group items by episode while preserving crawler order.
-    episodes = {}
     for item in items:
-        episode = item.get("episode") or "Unknown Episode"
-        episodes.setdefault(episode, []).append(item)
+        icon = "✅" if item["selected"] else "⬜"
+        title = item.get("title") or "Unknown video"
+        source = item.get("source") or "Unknown"
 
-    for episode, episode_items in episodes.items():
+        label = f"{icon} {title} • 🌐 {source}"
+
+        if len(label) > 64:
+            label = label[:61] + "..."
+
         buttons.append([
             InlineKeyboardButton(
-                f"🎬 {episode}",
-                callback_data="crawl_noop",
+                label,
+                callback_data=f"crawl_toggle_{item['id']}",
             )
         ])
-
-        for item in episode_items:
-            icon = "✅" if item["selected"] else "⬜"
-            source = item.get("source") or "Unknown"
-            resolution = item.get("resolution") or "Unknown"
-
-            label = f"{icon} {source} • {resolution}"
-
-            # Telegram inline button text should stay reasonably short.
-            if len(label) > 60:
-                label = label[:57] + "..."
-
-            buttons.append([
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"crawl_toggle_{item['id']}",
-                )
-            ])
 
     buttons.append([
         InlineKeyboardButton(
@@ -83,6 +105,14 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
     status_chat_id = status_message.chat.id
     task_ids = []
 
+    # One batch represents one user submission containing multiple videos.
+    batch_total = len(items)
+    batch_id = (
+        f"batch_{status_chat_id}_{status_message.id}_{time.time_ns()}"
+        if batch_total > 1
+        else None
+    )
+
     for item in items:
         if isinstance(item, dict):
             url = item.get("url", "")
@@ -106,12 +136,23 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
             status_message_id=None,
             preset=preset,
             title=title or None,
+            batch_id=batch_id,
+            batch_total=batch_total,
         )
         task_ids.append(task_id)
 
+    # Create the shared summary only after all batch tasks exist.
+    if batch_id and task_ids:
+        summary_message = await status_message.reply_text(
+            build_batch_summary_text(batch_id)
+        )
+        set_batch_status_message_db(
+            batch_id,
+            summary_message.chat.id,
+            summary_message.id,
+        )
+
     return task_ids
-
-
 
 
 DISK_CLEAN_VIDEO_EXTENSIONS = {
@@ -495,18 +536,12 @@ def register_handlers(app):
 
         items = get_crawl_items_db(m.from_user.id)
 
-        lines = [
-            "🎬 **Crawl Complete**",
-            "",
-            f"📦 કુલ Episodes: **{len(items)}**",
-            "",
-            "👇 Download માટે Episodes select કરો.",
-        ]
-
-        for index, item in enumerate(items, 1):
-            lines.append(f"**{index}. {item['title']}**")
-
-        await status_msg.edit_text("\n".join(lines), reply_markup=build_crawl_keyboard(items))
+        await status_msg.edit_text(
+            "🎬 **Crawl Complete**\n\n"
+            f"📦 Total options: **{len(items)}**\n\n"
+            "👇 Download માટે option select કરો:",
+            reply_markup=build_crawl_keyboard(items),
+        )
 
     @app.on_callback_query(filters.regex(r"^crawl_.*"))
     async def _handle_crawl_callback(client, callback_query):
@@ -614,7 +649,7 @@ def register_handlers(app):
 
     @app.on_callback_query(
         filters.regex(
-            r"^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel|confirm_restart|restart_bot|restart_cancel|diskclean_confirm|diskclean_cancel|clear_summary_history|clear_summary_confirm|clear_summary_cancel|retry_failed|retry_all|retry_task_\d+|retry_failed_close|cancel_task_\d+|btn_pending).*"
+            r"^(toggle_|cycle_|set_|status|btn_status|clear_cache|btn_clearcache|cancel|confirm_restart|restart_bot|restart_cancel|diskclean_confirm|diskclean_cancel|clear_summary_history|clear_summary_confirm|clear_summary_cancel|retry_failed|retry_all|retry_task_\d+|retry_failed_close|cancel_task_\d+|move_task_next_\d+|btn_pending).*"
         )
     )
     async def _handle_all_settings_callbacks(client, callback_query):
@@ -938,6 +973,8 @@ def register_handlers(app):
             CANCELLED_TASKS.add(str(task_id))
             clear_live_task(task_id)
 
+            await update_batch_summary_message(client, task)
+
             await callback_query.answer(f"🛑 Task #{task_id} cancelled.", show_alert=True)
             try:
                 await callback_query.message.edit_text(
@@ -1202,6 +1239,51 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
 
     return True
 
+async def update_batch_summary_message(client, task):
+    batch_id = task.get("batch_id")
+    if not batch_id:
+        return
+
+    try:
+        text = build_batch_summary_text(batch_id)
+        message_info = get_batch_status_message_db(batch_id)
+
+        if message_info:
+            try:
+                await client.edit_message_text(
+                    message_info["batch_status_chat_id"],
+                    message_info["batch_status_message_id"],
+                    text,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "Could not edit batch summary message for batch %s",
+                    batch_id,
+                )
+
+        chat_id = task.get("status_chat_id") or task.get("chat_id")
+        if not chat_id:
+            return
+
+        message = await client.send_message(
+            chat_id,
+            text,
+        )
+
+        set_batch_status_message_db(
+            batch_id,
+            message.chat.id,
+            message.id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to update batch summary for batch %s",
+            batch_id,
+        )
+
+
 async def process_queue_task(client, task, status_message):
     task_id = task["id"]
 
@@ -1248,6 +1330,7 @@ async def process_queue_task(client, task, status_message):
             if not current_task or current_task.get("status") != "cancelled":
                 update_task_status_db(task_id, "failed")
             clear_live_task(task_id)
+            await update_batch_summary_message(client, task)
             return None, None, result_chat_id, 0, False
 
         await finalize_queue_file(
@@ -1266,6 +1349,7 @@ async def process_queue_task(client, task, status_message):
 
         update_task_status_db(task_id, "completed")
         clear_live_task(task_id)
+        await update_batch_summary_message(client, task)
 
         try:
             await status_message.edit_text(
@@ -1304,6 +1388,7 @@ async def process_queue_task(client, task, status_message):
         if not current_task or current_task.get("status") != "cancelled":
             update_task_status_db(task_id, "failed")
         clear_live_task(task_id)
+        await update_batch_summary_message(client, task)
         return None, None, item["chat_id"], 0, False
 
 

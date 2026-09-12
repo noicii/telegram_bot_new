@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from config import PROTECTED_DOMAINS, SETTINGS, USER_AGENT
 
 
+from utils import sanitize_filename
 def is_protected_url(url):
     if not url:
         return False
@@ -358,27 +359,77 @@ def crawl_blog_episodes(raw_url):
 
         parsed = urlparse(href)
         return parsed.netloc or "Unknown"
+    # Extract the series name from the blog/page itself.
+    page_title = clean_text(
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    page_h1 = ""
+    h1 = content_h1 = soup.find("h1")
+    if h1:
+        page_h1 = clean_text(h1.get_text(" ", strip=True))
+
+    series_name = page_h1 or page_title
+
+    # Remove common website suffixes from the page title.
+    if series_name:
+        series_name = re.sub(
+            r"\\s*[|\\-–—]\\s*(?:https?://)?(?:www\\.)?[a-z0-9.-]+\\.[a-z]{2,}.*$",
+            "",
+            series_name,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Remove page-level words that are not part of the actual series name.
+        series_name = re.sub(
+            r"\s*[|–—-]\s*(?:complete|full|all\s+episodes?)\s*$",
+            "",
+            series_name,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    # Do not accidentally use an episode title as the series name.
+    if detect_episode(series_name):
+        series_name = ""
+
     def make_title(episode, source, resolution, href, link_text):
-        decoded_href = clean_text(href)
+        # Filename/title must contain:
+        # Series Name - Episode - Resolution
+        # Source/provider stays separate in the "source" field.
+        name = clean_text(series_name)
 
-        filename_match = re.search(
-            r"/([^/?#]+\.(?:mkv|mp4|m4v|webm|mov))(?:[?#].*)?$",
-            decoded_href,
-            re.IGNORECASE,
-        )
+        # Remove page-level suffixes such as "Complete", "Full",
+        # "All Episodes", and website names.
+        name = re.sub(
+            r"\s*[|–—-]\s*(?:complete|full|all\s+episodes?)\s*$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        ).strip()
 
-        if filename_match:
-            return filename_match.group(1)
+        name = re.sub(
+            r"\s+(?:complete|full|all\s+episodes?)\s*$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        ).strip()
 
-        parts = [episode]
+        parts = []
 
-        if resolution != "Unknown":
+        if name:
+            parts.append(name)
+
+        if episode:
+            parts.append(episode)
+
+        if resolution and resolution != "Unknown":
             parts.append(resolution)
 
-        if source != "Unknown":
-            parts.append(source)
+        # Never append source/provider here.
+        return sanitize_filename(" - ".join(parts)).strip()
 
-        return " • ".join(parts)
     def add_result(episode, href, link_text):
         href = clean_text(href)
 
