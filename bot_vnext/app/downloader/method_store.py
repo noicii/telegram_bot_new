@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 DB_PATH = Path(__file__).resolve().parents[3] / "bot_vnext.db"
 METHODS = ("auto", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct")
+DEFAULT_KEY = "__default__"
 
 
 def domain_for(url: str) -> str:
@@ -19,11 +20,18 @@ def _connect():
     return conn
 
 
+def _ensure(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS downloader_preferences (domain TEXT PRIMARY KEY, method TEXT NOT NULL)")
+
+
 def _get_sync(domain: str) -> str:
     conn = _connect()
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS downloader_preferences (domain TEXT PRIMARY KEY, method TEXT NOT NULL)")
+        _ensure(conn)
         row = conn.execute("SELECT method FROM downloader_preferences WHERE domain = ?", (domain,)).fetchone()
+        if row and row[0] in METHODS:
+            return row[0]
+        row = conn.execute("SELECT method FROM downloader_preferences WHERE domain = ?", (DEFAULT_KEY,)).fetchone()
         return row[0] if row and row[0] in METHODS else "auto"
     finally:
         conn.close()
@@ -33,8 +41,9 @@ def _set_sync(domain: str, method: str) -> str:
     method = method if method in METHODS else "auto"
     conn = _connect()
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS downloader_preferences (domain TEXT PRIMARY KEY, method TEXT NOT NULL)")
-        conn.execute("INSERT INTO downloader_preferences(domain, method) VALUES(?, ?) ON CONFLICT(domain) DO UPDATE SET method=excluded.method", (domain, method))
+        _ensure(conn)
+        key = domain or DEFAULT_KEY
+        conn.execute("INSERT INTO downloader_preferences(domain, method) VALUES(?, ?) ON CONFLICT(domain) DO UPDATE SET method=excluded.method", (key, method))
         conn.commit()
         return method
     finally:
@@ -47,6 +56,14 @@ async def get_method(url: str) -> str:
 
 async def set_method(url: str, method: str) -> str:
     return await asyncio.to_thread(_set_sync, domain_for(url), method)
+
+
+async def get_default_method() -> str:
+    return await asyncio.to_thread(_get_sync, "")
+
+
+async def set_default_method(method: str) -> str:
+    return await asyncio.to_thread(_set_sync, "", method)
 
 
 def next_method(method: str) -> str:
