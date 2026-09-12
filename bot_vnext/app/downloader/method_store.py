@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlparse
 
-DB_PATH = Path(__file__).resolve().parents[2] / "bot_vnext.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "bot_vnext.db"
 METHODS = ("auto", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct")
 
 
