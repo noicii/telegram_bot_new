@@ -105,7 +105,8 @@ class DownloadManager:
         return self.pool.qsize()
 
     def active_workers(self) -> int:
-        return self.pool.active_workers()
+        """Return the number of currently processing download tasks."""
+        return len(self.running_tasks)
 
     async def stop(self) -> None:
         for ctx in list(self.contexts.values()):
