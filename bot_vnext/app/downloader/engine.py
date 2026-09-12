@@ -7,9 +7,7 @@ operation without touching other queue workers.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,7 +16,6 @@ from urllib.parse import urlparse
 
 from app.core.task import TaskCancelled, TaskContext
 
-logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[float | None, int | None, int | None, float | None], Awaitable[None] | None]
 
 
@@ -45,8 +42,8 @@ class HybridDownloader:
         output = self.output_dir / filename
         task.register_temp(output)
 
-        schemes = {urlparse(url).scheme.lower()}
-        if not schemes & {"http", "https"}:
+        scheme = urlparse(url).scheme.lower()
+        if scheme not in {"http", "https"}:
             raise DownloadError("Unsupported URL scheme")
 
         plan = self._build_plan(url)
@@ -106,6 +103,12 @@ class HybridDownloader:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(url, allow_redirects=True) as response:
                 response.raise_for_status()
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                final_url = str(response.url).lower()
+                if content_type.startswith(("text/html", "text/plain", "application/json")):
+                    raise DownloadError(f"Direct response is not media ({content_type or 'unknown'})")
+                if not any(token in final_url for token in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".m3u8", ".mpd")) and not content_type.startswith(("video/", "audio/", "application/octet-stream")):
+                    raise DownloadError(f"Direct response is not recognized media ({content_type or 'unknown'})")
                 total = int(response.headers.get("Content-Length") or 0) or None
                 done = 0
                 with tmp.open("wb") as fh:
@@ -121,11 +124,10 @@ class HybridDownloader:
         binary = shutil.which("aria2c")
         if not binary:
             raise DownloadError("aria2c is not installed")
-        outdir = output.parent
         proc = await asyncio.create_subprocess_exec(
             binary, "--allow-overwrite=true", "--auto-file-renaming=false",
             "--summary-interval=1", "--console-log-level=warn",
-            "--dir", str(outdir), "--out", output.name, url,
+            "--dir", str(output.parent), "--out", output.name, url,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         task.register_process(proc)
@@ -135,9 +137,6 @@ class HybridDownloader:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                text = line.decode(errors="ignore").strip()
-                # aria2 output is deliberately treated as diagnostics; exact
-                # progress is recovered from the resulting file when possible.
                 if progress and output.exists():
                     await self._report(progress, None, output.stat().st_size, None, None)
             rc = await proc.wait()
@@ -153,7 +152,7 @@ class HybridDownloader:
         proc = await asyncio.create_subprocess_exec(
             binary, "-hide_banner", "-loglevel", "error", "-y", "-i", url,
             "-c", "copy", str(output),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
         task.register_process(proc)
         try:
@@ -164,9 +163,9 @@ class HybridDownloader:
                 except asyncio.TimeoutError:
                     if progress and output.exists():
                         await self._report(progress, None, output.stat().st_size, None, None)
+            err = await proc.stderr.read()
             if proc.returncode != 0:
-                err = (await proc.stderr.read()).decode(errors="ignore")[-1000:]
-                raise DownloadError(err or f"ffmpeg exited with code {proc.returncode}")
+                raise DownloadError(err.decode(errors="ignore")[-1000:] or f"ffmpeg exited with code {proc.returncode}")
         finally:
             task.unregister_process(proc)
 
@@ -176,10 +175,12 @@ class HybridDownloader:
             command = [binary, "-m", "yt_dlp"]
         else:
             command = [binary]
-        command += ["--newline", "--no-part", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(output), url]
-        cookies = task.metadata.get("cookiefile")
-        if cookies:
-            command[1:1] = ["--cookies", str(cookies)]
+        if task.metadata.get("cookiefile"):
+            command += ["--cookies", str(task.metadata["cookiefile"])]
+        command += [
+            "--newline", "--no-part", "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4", "-o", str(output), url,
+        ]
         proc = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
@@ -190,7 +191,6 @@ class HybridDownloader:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                text = line.decode(errors="ignore").strip()
                 if progress and output.exists():
                     await self._report(progress, None, output.stat().st_size, None, None)
             rc = await proc.wait()
