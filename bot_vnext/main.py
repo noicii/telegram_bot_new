@@ -1,7 +1,7 @@
 """Telegram entrypoint for Bot V2.
 
-The old bot remains untouched on its existing service.  This entrypoint is
-self-contained and uses the V2 pipeline with the existing crawler.
+The old bot remains untouched on its existing service. This entrypoint uses
+V2's persistent pipeline with the existing crawler.
 """
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ import sys
 import uuid
 from pathlib import Path
 
-# Keep V2's existing ``app.*`` imports working without putting app/ itself on
-# sys.path (which would shadow Python's standard-library queue module).
 ROOT = Path(__file__).resolve().parents[1]
 V2_ROOT = Path(__file__).resolve().parent
 if str(V2_ROOT) not in sys.path:
@@ -28,13 +26,13 @@ from config import API_HASH, API_ID, BOT_TOKEN, OWNER_ID, DOWNLOAD_DIR, THUMB_PA
 from crawler import crawl_blog_episodes
 from utils import sanitize_filename
 from app.pipeline import Pipeline
+from app.downloader.method_store import get_method, set_method, next_method, method_label
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("bot_vnext")
-
 PAGE_SIZE = 8
 
 
@@ -135,6 +133,7 @@ class V2Bot:
             return
 
         series = self._series_name(items)
+        saved_method = await get_method(items[0].get("url") or text)
         session = {
             "items": items,
             "page": 0,
@@ -142,6 +141,7 @@ class V2Bot:
             "series": series,
             "source_url": text,
             "message_id": wait.id,
+            "method": saved_method,
         }
         self.sessions[message.from_user.id] = session
         await self.render_selection(wait, session)
@@ -196,6 +196,12 @@ class V2Bot:
             InlineKeyboardButton("☑️ Select All", callback_data="v2:all"),
             InlineKeyboardButton("❌ Clear", callback_data="v2:clear"),
         ])
+        buttons.append([
+            InlineKeyboardButton(
+                f"⚙️ Method: {method_label(session.get('method', 'auto'))}",
+                callback_data="v2:method",
+            )
+        ])
         buttons.append([InlineKeyboardButton("🚀 Download Selected", callback_data="v2:download")])
         buttons.append([InlineKeyboardButton("❌ Cancel Selection", callback_data="v2:close")])
 
@@ -216,6 +222,11 @@ class V2Bot:
             return
         if not session:
             await query.answer("Selection expired. Send the URL again.", show_alert=True)
+            return
+        if data == "v2:method":
+            session["method"] = next_method(session.get("method", "auto"))
+            await query.answer(f"Method: {method_label(session['method'])}")
+            await self.render_selection(query.message, session)
             return
         if data.startswith("v2:t:"):
             index = int(data.rsplit(":", 1)[1])
@@ -262,9 +273,11 @@ class V2Bot:
             await message.edit_text("❌ V2 pipeline is offline.")
             return
         user_id = message.chat.id
+        selected_method = session.get("method", "auto")
         status_lines = [
             f"🚀 **Queued {len(selected)} task(s)**",
             f"🎬 {session['series']}",
+            f"⚙️ Method: {method_label(selected_method)}",
             "",
             "⬇️ Download limit: 2",
             "⬆️ Upload limit: 4",
@@ -281,11 +294,13 @@ class V2Bot:
             filename = sanitize_filename(item.get("title") or f"{task_id}.mp4")
             if not Path(filename).suffix:
                 filename += ".mp4"
+            await set_method(item.get("url") or "", selected_method)
             metadata = {
                 "source_url": item.get("source_url"),
                 "provider": item.get("source"),
                 "resolution": item.get("resolution"),
                 "cookiefile": str(COOKIES_PATH) if COOKIES_PATH.is_file() else None,
+                "download_method": selected_method,
             }
             metadata = {k: v for k, v in metadata.items() if v}
             payload = {
