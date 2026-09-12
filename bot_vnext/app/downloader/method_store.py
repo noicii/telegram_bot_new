@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 DB_PATH = Path(__file__).resolve().parents[3] / "bot_vnext.db"
-METHODS = ("auto", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct")
+METHODS = ("auto", "hls-multi", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct")
 DEFAULT_KEY = "__default__"
 
 
@@ -74,6 +74,7 @@ def next_method(method: str) -> str:
 def method_label(method: str) -> str:
     return {
         "auto": "🤖 Auto",
+        "hls-multi": "⚡ HLS Multi 4x",
         "yt-dlp": "🎯 yt-dlp",
         "browser": "🌐 Browser",
         "ffmpeg": "🎞️ FFmpeg",
