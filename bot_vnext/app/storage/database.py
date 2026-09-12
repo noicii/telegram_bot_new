@@ -88,14 +88,16 @@ class Database:
                     chat_id, message_id, preset, mode, source, provider, resolution,
                     batch_id, batch_total, priority, retry_count, max_retries, metadata,
                     created_at, updated_at
-                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
             """, (
                 task_id, task_type, data.get("url"), data.get("file_path"),
                 data.get("title"), data.get("caption"), data.get("thumbnail"),
                 data.get("chat_id"), data.get("message_id"), data.get("preset"),
                 data.get("mode"), data.get("source"), data.get("provider"),
                 data.get("resolution"), data.get("batch_id"), data.get("batch_total", 0),
-                data.get("priority", 0), data.get("max_retries", 3), metadata, now, now
+                data.get("priority", 0), 0, data.get("max_retries", 3), metadata, now, now
             ))
             conn.commit()
         finally:
