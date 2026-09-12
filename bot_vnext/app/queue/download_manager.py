@@ -50,15 +50,23 @@ class DownloadManager:
         return True
 
     async def _handle(self, item: QueueItem) -> None:
-        ctx = self.contexts[str(item.task_id)]
+        key = str(item.task_id)
+        ctx = self.contexts[key]
         payload = item.payload
+
+        async def report(*args):
+            if self.on_progress:
+                result = self.on_progress(item.task_id, *args)
+                if asyncio.iscoroutine(result):
+                    await result
+
         try:
             ctx.metadata.update(payload.get("metadata") or {})
             result = await self.engine.download(
                 payload["url"],
                 ctx,
                 payload["filename"],
-                progress=self.on_progress,
+                progress=report,
             )
             ctx.check_cancelled()
             if self.on_complete:
@@ -73,7 +81,7 @@ class DownloadManager:
                 await self.on_failed(item, exc)
         finally:
             await ctx.cleanup()
-            self.contexts.pop(str(item.task_id), None)
+            self.contexts.pop(key, None)
 
     async def stop(self) -> None:
         for ctx in list(self.contexts.values()):
