@@ -44,6 +44,7 @@ class V2Bot:
         self.pipeline: Pipeline | None = None
         self.sessions: dict[int, dict] = {}
         self.progress_cache: dict[str, tuple] = {}
+        self.dashboard_messages: dict[int, int] = {}
 
     async def start(self):
         self.pipeline = Pipeline(self.client, DOWNLOAD_DIR, on_progress=self.on_progress, on_complete=self.on_complete, on_failed=self.on_failed)
@@ -123,11 +124,12 @@ class V2Bot:
         if not owner_only(message): return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) != 2:
-            await message.reply_text("Usage: `/retry TASK_ID`"); return
+            await message.reply_text("Usage: `/retry TASK_ID`\n\nDownloads retry with the current `/method` selection and get a fresh 3-attempt limit."); return
         if not self.pipeline:
             await message.reply_text("❌ V2 pipeline is offline."); return
-        ok = await self.pipeline.retry(parts[1].strip())
-        await message.reply_text("🔁 Task re-queued successfully." if ok else "⚠️ Retry is available only for failed/cancelled tasks.")
+        selected = await get_default_method()
+        ok = await self.pipeline.retry(parts[1].strip(), method=selected)
+        await message.reply_text(f"🔁 Task re-queued with **{method_label(selected)}** (max 3 attempts)." if ok else "⚠️ Retry is available only for failed/cancelled tasks.")
 
     async def clear_cmd(self, client, message):
         if not owner_only(message): return
@@ -184,7 +186,7 @@ class V2Bot:
         if page > 0: nav.append(InlineKeyboardButton("◀️ Previous", callback_data="v2:p:-1"))
         if page + 1 < total_pages: nav.append(InlineKeyboardButton("Next ▶️", callback_data="v2:p:1"))
         if nav: buttons.append(nav)
-        buttons.append([InlineKeyboardButton("☑️ Select All", callback_data="v2:all"), InlineKeyboardButton("❌ Clear", callback_data="v2:clear")])
+        buttons.append([InlineKeyboardButton("☑️ Select All", callback_data="v2:all"), InlineKeyboardButton("❌ Clear", callback_data="v2:selclear")])
         buttons.append([InlineKeyboardButton(f"🎯 Change: {method_label(session.get('method', 'auto'))}", callback_data="v2:method")])
         buttons.append([InlineKeyboardButton("🚀 Download Selected", callback_data="v2:download")])
         buttons.append([InlineKeyboardButton("❌ Cancel Selection", callback_data="v2:close")])
@@ -229,7 +231,10 @@ class V2Bot:
         if data in {"v2:health", "v2:healthmenu"}: await query.answer(); await self.send_health(query.message); return
         if data == "v2:methodmenu" and not self.sessions.get(query.from_user.id): await query.answer(); await self.send_method_menu(query.message); return
         if data.startswith("v2:m:"):
-            method = data.rsplit(":", 1)[1]; await set_default_method(method); await query.answer(f"Default: {method_label(method)}"); await self.send_method_menu(query.message); return
+            method = data.rsplit(":", 1)[1]
+            if method not in METHODS:
+                await query.answer("Invalid method", show_alert=True); return
+            await set_default_method(method); await query.answer(f"Default: {method_label(method)}"); await self.send_method_menu(query.message); return
         if data == "v2:clear":
             if self.pipeline:
                 count = await self.pipeline.db.clear_finished(); await query.answer(f"Cleared {count} task(s)"); await self.send_queue(query.message)
@@ -245,7 +250,7 @@ class V2Bot:
         if data.startswith("v2:t:"):
             index = int(data.rsplit(":", 1)[1]); session["selected"].discard(index) if index in session["selected"] else session["selected"].add(index); await query.answer(); await self.render_selection(query.message, session); return
         if data == "v2:all": session["selected"] = set(range(len(session["items"]))); await query.answer("All selected"); await self.render_selection(query.message, session); return
-        if data == "v2:clear": session["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message, session); return
+        if data == "v2:selclear": session["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message, session); return
         if data.startswith("v2:p:"):
             delta = int(data.rsplit(":", 1)[1]); total_pages = max(1, (len(session["items"]) + PAGE_SIZE - 1) // PAGE_SIZE); session["page"] = max(0, min(total_pages - 1, session["page"] + delta)); await query.answer(); await self.render_selection(query.message, session); return
         if data == "v2:close": self.sessions.pop(query.from_user.id, None); await query.answer("Selection closed"); await query.message.edit_text("❌ Selection cancelled."); return
@@ -257,28 +262,71 @@ class V2Bot:
     async def enqueue_selected(self, message, session, selected):
         if not self.pipeline: await message.edit_text("❌ V2 pipeline is offline."); return
         selected_method = session.get("method", await get_default_method())
-        await message.edit_text(f"🚀 **Queued {len(selected)} task(s)**\n🎬 {session['series']}\n🎯 Method: {method_label(selected_method)}\n\n⬇️ Downloads: 2\n⬆️ Uploads: 4\n\nUse `/queue` or `/status` for live progress.")
+        dashboard = await message.edit_text(f"🚀 **Queued {len(selected)} task(s)**\n🎬 {session['series']}\n🎯 Method: {method_label(selected_method)}\n\n⬇️ Downloads: 2\n⬆️ Uploads: 4\n\n⏳ Starting download…")
+        self.dashboard_messages[message.chat.id] = dashboard.id
         for index in selected:
             item = session["items"][index]; task_id = uuid.uuid4().hex
             filename = sanitize_filename(item.get("title") or f"{task_id}.mp4")
             if not Path(filename).suffix: filename += ".mp4"
             await set_method(item.get("url") or "", selected_method)
-            metadata = {"source_url": item.get("source_url"), "provider": item.get("source"), "resolution": item.get("resolution"), "cookiefile": str(COOKIES_PATH) if COOKIES_PATH.is_file() else None, "download_method": selected_method}
+            metadata = {"source_url": item.get("source_url"), "provider": item.get("source"), "resolution": item.get("resolution"), "cookiefile": str(COOKIES_PATH) if COOKIES_PATH.is_file() else None, "download_method": selected_method, "headers": {"Referer": item.get("source_url")} if item.get("source_url") else {}}
             metadata = {k: v for k, v in metadata.items() if v}
             payload = {"task_type": "download", "url": item["url"], "filename": filename, "chat_id": message.chat.id, "caption": item.get("title") or session["series"], "thumbnail": str(THUMB_PATH) if THUMB_PATH.is_file() else None, "mode": "video", "title": item.get("title"), "provider": item.get("source"), "resolution": item.get("resolution"), "metadata": metadata}
             try: await self.pipeline.submit(task_id, payload)
             except Exception: logger.exception("queue submit failed for %s", task_id)
         self.sessions.pop(message.chat.id, None)
 
+    async def _render_live_dashboard(self, chat_id: int):
+        message_id = self.dashboard_messages.get(chat_id)
+        if not message_id or not self.pipeline: return
+        rows = await self.pipeline.db.get_tasks(statuses=("queued", "downloading", "uploading"), limit=25)
+        counts = await self.pipeline.db.counts()
+        d, u = counts.get("download", {}), counts.get("upload", {})
+        lines = ["📊 **LIVE DOWNLOAD / UPLOAD**", "", f"⬇️ Downloads: **{self.pipeline.download.active_workers()}/2 active** • {d.get('queued', 0)} queued", f"⬆️ Uploads: **{self.pipeline.upload.active_workers()}/4 active** • {u.get('queued', 0)} queued", ""]
+        if not rows:
+            lines += ["✅ No active tasks.", f"Completed: {d.get('completed',0) + u.get('completed',0)} • Failed: {d.get('failed',0) + u.get('failed',0)} • Cancelled: {d.get('cancelled',0) + u.get('cancelled',0)}"]
+        else:
+            for row in rows[:10]:
+                kind = "⬇️" if row.get("task_type") == "download" else "⬆️"
+                status = str(row.get("status") or "queued").upper()
+                pct = float(row.get("progress") or 0)
+                method = (row.get("metadata") or {}).get("download_method") or "auto"
+                title = str(row.get("title") or row.get("url") or row.get("id"))[:45]
+                lines.append(f"{kind} **{status}** • **{pct:.1f}%** • {method_label(method)}")
+                lines.append(f"🎬 {title}")
+                if row.get("speed"): lines.append(f"⚡ {float(row.get('speed') or 0)/1048576:.2f} MB/s")
+                lines.append("")
+        try:
+            msg = await self.client.get_messages(chat_id, message_id)
+            if msg and msg.text:
+                await msg.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="v2:status"), InlineKeyboardButton("📋 Queue", callback_data="v2:queue")]]))
+        except Exception:
+            pass
+
     async def on_progress(self, kind, task_id, percent=None, current=None, total=None, speed=None, eta=None):
         task_id = str(task_id); now = asyncio.get_running_loop().time(); last = self.progress_cache.get(task_id)
         if last and now - last[0] < 2.0 and (percent is None or last[1] == percent): return
         self.progress_cache[task_id] = (now, percent)
+        try:
+            row = await self.pipeline.db.get_task(task_id) if self.pipeline else None
+            if row and row.get("chat_id"):
+                await self._render_live_dashboard(int(row["chat_id"]))
+        except Exception:
+            logger.debug("live dashboard update failed", exc_info=True)
 
-    async def on_complete(self, task_id): self.progress_cache.pop(str(task_id), None)
+    async def on_complete(self, task_id):
+        self.progress_cache.pop(str(task_id), None)
+        try:
+            row = await self.pipeline.db.get_task(str(task_id)) if self.pipeline else None
+            if row and row.get("chat_id"): await self._render_live_dashboard(int(row["chat_id"]))
+        except Exception: pass
 
     async def on_failed(self, task_id, error):
         self.progress_cache.pop(str(task_id), None); logger.error("task %s failed: %s", task_id, error)
+        try:
+            row = await self.pipeline.db.get_task(str(task_id)) if self.pipeline else None
+            if row and row.get("chat_id"): await self._render_live_dashboard(int(row["chat_id"]))
+        except Exception: pass
 
 
 async def run():
