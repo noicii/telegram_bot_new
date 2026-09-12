@@ -1,0 +1,27 @@
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+main = ROOT / "bot_vnext" / "main.py"
+engine = ROOT / "bot_vnext" / "app" / "downloader" / "engine.py"
+
+s = main.read_text()
+old_start = s.index("    async def _render_live_dashboard(self, chat_id: int):")
+old_end = s.index("    async def on_progress", old_start)
+new_block = '''    @staticmethod\n    def _progress_bar(percent: float, width: int = 12) -> str:\n        pct = max(0.0, min(100.0, float(percent or 0.0)))\n        filled = int(round(width * pct / 100.0))\n        return "[" + "█" * filled + "░" * (width - filled) + "]"\n\n    async def _render_live_dashboard(self, chat_id: int):\n        message_id = self.dashboard_messages.get(chat_id)\n        if not message_id or not self.pipeline: return\n        rows = await self.pipeline.db.get_tasks(statuses=("queued", "downloading", "uploading"), limit=25)\n        counts = await self.pipeline.db.counts()\n        d, u = counts.get("download", {}), counts.get("upload", {})\n        lines = ["📊 **LIVE DOWNLOAD / UPLOAD**", "", f"⬇️ Downloads: **{self.pipeline.download.active_workers()}/2 active** • {d.get('queued', 0)} queued", f"⬆️ Uploads: **{self.pipeline.upload.active_workers()}/4 active** • {u.get('queued', 0)} queued", ""]\n        if not rows:\n            lines += ["✅ No active tasks.", f"Completed: {d.get('completed',0) + u.get('completed',0)} • Failed: {d.get('failed',0) + u.get('failed',0)} • Cancelled: {d.get('cancelled',0) + u.get('cancelled',0)}"]\n        else:\n            for row in rows[:10]:\n                kind = "⬇️" if row.get("task_type") == "download" else "⬆️"\n                status = str(row.get("status") or "queued").upper()\n                pct = float(row.get("progress") or 0)\n                method = (row.get("metadata") or {}).get("download_method") or "auto"\n                title = str(row.get("title") or row.get("url") or row.get("id"))[:45]\n                lines.append(f"{kind} **{status}** • **{pct:.1f}%** • {method_label(method)}")\n                lines.append(f"{self._progress_bar(pct)} **{pct:.1f}%**")\n                if row.get("task_type") == "download":\n                    live = self.progress_cache.get(str(row.get("id")))\n                    if live and len(live) >= 6:\n                        _, _, current, total, speed, eta = live\n                        if total and total > 0 and total <= 100000:\n                            lines.append(f"📦 Segments: **{int(current)}/{int(total)}**")\n                        if speed:\n                            lines.append(f"⚡ **{float(speed)/1048576:.2f} MB/s**")\n                        if eta and eta > 0:\n                            lines.append(f"⏱ ETA: **{int(eta)}s**")\n                    elif row.get("speed"):\n                        lines.append(f"⚡ **{float(row.get('speed') or 0)/1048576:.2f} MB/s**")\n                elif row.get("speed"):\n                    lines.append(f"⚡ **{float(row.get('speed') or 0)/1048576:.2f} MB/s**")\n                lines.append("")\n        try:\n            msg = await self.client.get_messages(chat_id, message_id)\n            if msg and msg.text:\n                await msg.edit_text("\\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="v2:status"), InlineKeyboardButton("📋 Queue", callback_data="v2:queue")]]))\n        except Exception:\n            pass\n\n'''
+s = s[:old_start] + new_block + s[old_end:]
+old_progress = '''    async def on_progress(self, kind, task_id, percent=None, current=None, total=None, speed=None, eta=None):\n        task_id = str(task_id); now = asyncio.get_running_loop().time(); last = self.progress_cache.get(task_id)\n        if last and now - last[0] < 2.0 and (percent is None or last[1] == percent): return\n        self.progress_cache[task_id] = (now, percent)\n        try:\n            row = await self.pipeline.db.get_task(task_id) if self.pipeline else None\n            if row and row.get("chat_id"):\n                await self._render_live_dashboard(int(row["chat_id"]))\n        except Exception:\n            logger.debug("live dashboard update failed", exc_info=True)\n'''
+new_progress = '''    async def on_progress(self, kind, task_id, percent=None, current=None, total=None, speed=None, eta=None):\n        task_id = str(task_id); now = asyncio.get_running_loop().time(); last = self.progress_cache.get(task_id)\n        # Refresh the live dashboard about every 0.8s instead of 2s.\n        if last and now - last[0] < 0.8: return\n        self.progress_cache[task_id] = (now, percent, current, total, speed, eta)\n        try:\n            row = await self.pipeline.db.get_task(task_id) if self.pipeline else None\n            if row and row.get("chat_id"):\n                await self._render_live_dashboard(int(row["chat_id"]))\n        except Exception:\n            logger.debug("live dashboard update failed", exc_info=True)\n'''
+if old_progress not in s:
+    raise SystemExit("main.py progress block not found")
+s = s.replace(old_progress, new_progress, 1)
+main.write_text(s)
+
+e = engine.read_text()
+old_report = 'await self._report(progress, completed * 100 / len(segments), total_bytes, None, total_bytes / elapsed)'
+new_report = 'await self._report(progress, completed * 100 / len(segments), completed, len(segments), total_bytes / elapsed)'
+if old_report not in e:
+    raise SystemExit("engine HLS progress report not found")
+e = e.replace(old_report, new_report, 1)
+engine.write_text(e)
+
+print("LIVE PROGRESS UI UPGRADE APPLIED")
