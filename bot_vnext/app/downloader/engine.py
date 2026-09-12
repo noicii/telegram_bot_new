@@ -1,9 +1,4 @@
-"""V2 hybrid downloader engine.
-
-The engine is intentionally provider-agnostic. It executes multiple download
-strategies with isolated process ownership so cancellation can stop the exact
-operation without touching other queue workers.
-"""
+"""V2 hybrid downloader engine with explicit or automatic method selection."""
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +14,7 @@ from app.core.task import TaskCancelled, TaskContext
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float | None, int | None, int | None, float | None], Awaitable[None] | None]
+METHODS = {"auto", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct"}
 
 
 class DownloadError(Exception):
@@ -26,7 +22,7 @@ class DownloadError(Exception):
 
 
 class HybridDownloader:
-    """Try the most appropriate available engine, then fall back safely."""
+    """Run one explicitly selected engine, or the automatic fallback chain."""
 
     def __init__(self, output_dir: str | Path, retries: int = 2):
         self.output_dir = Path(output_dir)
@@ -48,7 +44,12 @@ class HybridDownloader:
         if scheme not in {"http", "https"}:
             raise DownloadError("Unsupported URL scheme")
 
-        plan = self._build_plan(url)
+        requested = str(task.metadata.get("download_method") or "auto").lower()
+        if requested not in METHODS:
+            requested = "auto"
+        plan = self._build_plan(url, requested)
+        logger.info("task=%s download_method=%s plan=%s", task.task_id, requested, plan)
+
         errors: list[str] = []
         for engine in plan:
             task.check_cancelled()
@@ -82,12 +83,16 @@ class HybridDownloader:
                 except Exception as exc:
                     errors.append(f"{engine}: {exc}")
                     logger.warning("task=%s %s failed: %s", task.task_id, engine, exc)
+                    if requested != "auto":
+                        raise DownloadError(f"Selected method '{engine}' failed: {exc}") from exc
                     await asyncio.sleep(min(2.0 * (attempt + 1), 5.0))
 
         raise DownloadError("All download methods failed: " + " | ".join(errors[-8:]))
 
     @staticmethod
-    def _build_plan(url: str) -> list[str]:
+    def _build_plan(url: str, requested: str = "auto") -> list[str]:
+        if requested != "auto":
+            return [requested]
         lower = url.lower()
         if ".m3u8" in lower or ".mpd" in lower:
             return ["ffmpeg", "browser", "yt-dlp", "direct"]
@@ -173,16 +178,10 @@ class HybridDownloader:
 
     async def _ytdlp(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         binary = shutil.which("yt-dlp") or sys.executable
-        if binary == sys.executable:
-            command = [binary, "-m", "yt_dlp"]
-        else:
-            command = [binary]
+        command = [binary, "-m", "yt_dlp"] if binary == sys.executable else [binary]
         if task.metadata.get("cookiefile"):
             command += ["--cookies", str(task.metadata["cookiefile"])]
-        command += [
-            "--newline", "--no-part", "-f", "bv*+ba/b",
-            "--merge-output-format", "mp4", "-o", str(output), url,
-        ]
+        command += ["--newline", "--no-part", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(output), url]
         proc = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
