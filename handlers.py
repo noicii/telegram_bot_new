@@ -1,4 +1,5 @@
 # handlers.py
+from pathlib import Path
 import os
 import re
 import asyncio
@@ -15,6 +16,31 @@ from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
 logger = logging.getLogger(__name__)
+
+MAX_CONCURRENT_UPLOADS = 2
+UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+UPLOAD_TASKS = {}
+
+def register_upload_task(task_id, task):
+    UPLOAD_TASKS[int(task_id)] = task
+
+def get_upload_task(task_id):
+    task = UPLOAD_TASKS.get(int(task_id))
+    return task if task and not task.done() else None
+
+def cancel_upload_task(task_id):
+    task = get_upload_task(task_id)
+    if task:
+        task.cancel()
+        return True
+    return False
+
+def cancel_all_upload_tasks():
+    tasks = list(UPLOAD_TASKS.values())
+    for task in tasks:
+        if task and not task.done():
+            task.cancel()
+    return len(tasks)
 
 
 def build_batch_summary_text(batch_id):
@@ -62,10 +88,9 @@ def build_crawl_keyboard(items):
         title = item.get("title") or "Unknown video"
         source = item.get("source") or "Unknown"
 
-        label = f"{icon} {title} • 🌐 {source}"
-
-        if len(label) > 64:
-            label = label[:61] + "..."
+        label = f"{icon} {title}"
+        if len(label) > 60:
+            label = label[:57] + "..."
 
         buttons.append([
             InlineKeyboardButton(
@@ -73,18 +98,17 @@ def build_crawl_keyboard(items):
                 callback_data=f"crawl_toggle_{item['id']}",
             )
         ])
+        buttons.append([
+            InlineKeyboardButton(
+                f"🌐 {source}",
+                callback_data=f"crawl_source_{item['id']}",
+            )
+        ])
 
     buttons.append([
-        InlineKeyboardButton(
-            "☑️ Select All",
-            callback_data="crawl_select_all",
-        ),
-        InlineKeyboardButton(
-            "❌ Clear",
-            callback_data="crawl_clear_all",
-        ),
+        InlineKeyboardButton("☑️ Select All", callback_data="crawl_select_all"),
+        InlineKeyboardButton("❌ Clear", callback_data="crawl_clear_all"),
     ])
-
     buttons.append([
         InlineKeyboardButton(
             "🚀 Download Selected",
@@ -154,12 +178,6 @@ async def enqueue_items(items, status_message, client, is_audio=False, audio_bit
 
     return task_ids
 
-
-DISK_CLEAN_VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
-    ".ts", ".m2ts", ".flv", ".wmv", ".mpeg", ".mpg",
-}
-DISK_CLEAN_TEMP_EXTENSIONS = {".part", ".ytdl", ".tmp"}
 
 def get_disk_cleanup_files():
     """Return downloadable media/temp files inside downloads/."""
@@ -1187,7 +1205,8 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
 
             for upload_attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    await client.send_video(**v_kwargs)
+                    async with UPLOAD_SEMAPHORE:
+                        await client.send_video(**v_kwargs)
                     upload_ok = True
                     break
                 except FloodWait as fw:
@@ -1239,6 +1258,7 @@ async def finalize_queue_file(client, status_message, file_path, title, chat_id,
 
     return True
 
+
 async def update_batch_summary_message(client, task):
     batch_id = task.get("batch_id")
     if not batch_id:
@@ -1283,27 +1303,30 @@ async def update_batch_summary_message(client, task):
             batch_id,
         )
 
-
 async def process_queue_task(client, task, status_message):
     task_id = task["id"]
-
     item = {
         "url": task.get("url", ""),
         "chat_id": task.get("chat_id", DEFAULT_CHANNEL_ID),
         "custom_name": task.get("custom_name") or "",
         "preset": task.get("preset") or "custom",
     }
-
     file_path = None
+
     try:
         if status_message is None:
             status_message = await client.send_message(
-                task.get("status_chat_id") or task.get("chat_id") or DEFAULT_CHANNEL_ID,
+                task.get("status_chat_id")
+                or task.get("chat_id")
+                or DEFAULT_CHANNEL_ID,
                 f"📥 **Task #{task_id} starting...**\n\n"
                 f"🎬 `{_display_task_name(task)[:60]}`\n"
                 "⏳ Preparing download...",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🛑 Cancel this video", callback_data=f"cancel_task_{task_id}")
+                    InlineKeyboardButton(
+                        "🛑 Cancel this video",
+                        callback_data=f"cancel_task_{task_id}",
+                    )
                 ]]),
             )
             update_task_status_message_db(
@@ -1312,7 +1335,15 @@ async def process_queue_task(client, task, status_message):
                 status_message.id,
             )
 
-        set_live_task(task_id, title=_display_task_name(task), percent=0, current_mb=0, speed_mb=0, eta="—", operation="Preparing download")
+        set_live_task(
+            task_id,
+            title=_display_task_name(task),
+            percent=0,
+            current_mb=0,
+            speed_mb=0,
+            eta="—",
+            operation="Preparing download",
+        )
 
         result = await process_single_url_safe(
             client,
@@ -1325,6 +1356,7 @@ async def process_queue_task(client, task, status_message):
         )
 
         file_path, title, result_chat_id, size_mb, ok = result
+
         if not ok or not file_path or not os.path.exists(file_path):
             current_task = get_task_db(task_id)
             if not current_task or current_task.get("status") != "cancelled":
@@ -1332,6 +1364,103 @@ async def process_queue_task(client, task, status_message):
             clear_live_task(task_id)
             await update_batch_summary_message(client, task)
             return None, None, result_chat_id, 0, False
+
+        # Download is complete. Count download statistics now.
+        STATS["total_downloaded_items"] += 1
+        STATS["total_downloaded_mb"] += size_mb
+        save_stats()
+
+        # Upload runs independently from the download worker.
+        # The upload pipeline owns the final task status.
+        upload_task = asyncio.create_task(
+            _run_upload_pipeline(
+                client,
+                task,
+                status_message,
+                file_path,
+                title,
+                result_chat_id,
+                size_mb,
+                task_id,
+            )
+        )
+        register_upload_task(task_id, upload_task)
+
+        # Ownership of the file is transferred to the upload task.
+        file_path = None
+
+        return None, title, result_chat_id, size_mb, True
+
+    except asyncio.CancelledError:
+        clear_live_task(task_id)
+
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Queue task %s processing error",
+            task_id,
+        )
+
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+        current_task = get_task_db(task_id)
+        if not current_task or current_task.get("status") != "cancelled":
+            update_task_status_db(task_id, "failed")
+
+        clear_live_task(task_id)
+        await update_batch_summary_message(client, task)
+
+        return None, None, item["chat_id"], 0, False
+
+
+async def _run_upload_pipeline(
+    client,
+    task,
+    status_message,
+    file_path,
+    title,
+    result_chat_id,
+    size_mb,
+    task_id,
+):
+    try:
+        set_live_task(
+            task_id,
+            title=title,
+            percent=0,
+            current_mb=0,
+            speed_mb=0,
+            eta="—",
+            operation="Uploading to Channel",
+        )
+
+        try:
+            await status_message.edit_text(
+                f"✅ **DOWNLOAD COMPLETE**\n\n"
+                f"🎬 `{title}`\n"
+                f"💾 `{size_mb:.2f} MB`\n"
+                "📤 Uploading to Channel...\n"
+                "⏳ Starting upload...",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Cancel Upload",
+                        callback_data=f"cancel_task_{task_id}",
+                    )
+                ]]),
+            )
+        except Exception:
+            pass
 
         await finalize_queue_file(
             client,
@@ -1341,11 +1470,6 @@ async def process_queue_task(client, task, status_message):
             result_chat_id,
             task_id,
         )
-        file_path = None  # finalize_queue_file has already deleted it.
-
-        STATS["total_downloaded_items"] += 1
-        STATS["total_downloaded_mb"] += size_mb
-        save_stats()
 
         update_task_status_db(task_id, "completed")
         clear_live_task(task_id)
@@ -1353,44 +1477,85 @@ async def process_queue_task(client, task, status_message):
 
         try:
             await status_message.edit_text(
-                f"✅ **Task #{task_id} completed successfully.**\n\n"
+                f"✅ **UPLOAD COMPLETE**\n\n"
                 f"🎬 `{title}`\n"
-                f"💾 `{size_mb:.2f} MB`"
+                f"💾 `{size_mb:.2f} MB`\n"
+                "📢 Sent to Channel",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🔄 Download Again",
+                        callback_data=f"retry_task_{task_id}",
+                    )
+                ]]),
             )
-        except Exception as status_exc:
-            print(
-                f"⚠️ Could not update completion status for task {task_id}: {status_exc}",
-                flush=True,
-            )
-
-        return None, title, result_chat_id, size_mb, True
+        except Exception:
+            pass
 
     except asyncio.CancelledError:
+        current_task = get_task_db(task_id)
+
+        if current_task and current_task.get("status") == "processing":
+            update_task_status_db(task_id, "pending")
+
         clear_live_task(task_id)
-        if file_path and os.path.exists(file_path):
+
+        # Clean only this task's original file, split parts, and generated thumbnails.
+        if file_path:
             try:
-                os.remove(file_path)
+                original = Path(file_path)
+                if original.exists():
+                    original.unlink()
+                for part in original.parent.glob(f"{original.stem}.part*{original.suffix}"):
+                    if part.is_file():
+                        part.unlink()
             except OSError:
                 pass
+        try:
+            for thumb in Path(DOWNLOAD_DIR).glob(f"t_{task_id}_*.jpg"):
+                if thumb.is_file():
+                    thumb.unlink()
+        except OSError:
+            pass
+
         raise
 
-    except Exception as exc:
-        print(
-            f"⚠️ Queue task {task_id} processing error: {exc}",
-            flush=True,
+    except Exception:
+        logger.exception(
+            "Upload pipeline failed for task %s",
+            task_id,
         )
+
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except OSError:
                 pass
+
         current_task = get_task_db(task_id)
+
         if not current_task or current_task.get("status") != "cancelled":
             update_task_status_db(task_id, "failed")
+
         clear_live_task(task_id)
         await update_batch_summary_message(client, task)
-        return None, None, item["chat_id"], 0, False
 
+        try:
+            await status_message.edit_text(
+                f"❌ **UPLOAD FAILED**\n\n"
+                f"🎬 `{title}`\n"
+                "⚠️ Upload failed after retries.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🔄 Retry",
+                        callback_data=f"retry_task_{task_id}",
+                    )
+                ]]),
+            )
+        except Exception:
+            pass
+
+    finally:
+        UPLOAD_TASKS.pop(int(task_id), None)
 
 async def process_single_url_safe(client, message, item, total_count, idx, user_settings, is_audio=False, audio_bitrate="192", task_id=None):
     from config import MAX_RETRIES, TASK_TIMEOUT

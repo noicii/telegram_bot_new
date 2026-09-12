@@ -146,6 +146,14 @@ async def queue_worker(client):
 
             _worker_tasks.clear()
 
+        try:
+            from handlers import cancel_all_upload_tasks
+            n = cancel_all_upload_tasks()
+            if n:
+                logger.info("Stopping %s upload task(s)", n)
+        except Exception:
+            logger.exception("Could not stop upload tasks")
+
         logger.info("Queue worker stopped")
 
 
@@ -155,7 +163,13 @@ def cancel_running_task(task_id):
     if task and not task.done():
         task.cancel()
         return True
-    return False
+
+    try:
+        from handlers import cancel_upload_task
+        return bool(cancel_upload_task(task_id))
+    except Exception:
+        logger.exception("Could not cancel upload task %s", task_id)
+        return False
 
 def start_queue_worker(client):
     global _queue_worker_task

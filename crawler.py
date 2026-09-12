@@ -395,22 +395,29 @@ def crawl_blog_episodes(raw_url):
         series_name = ""
 
     def make_title(episode, source, resolution, href, link_text):
-        # Filename/title must contain:
+        # Filename/title:
         # Series Name - Episode - Resolution
         # Source/provider stays separate in the "source" field.
         name = clean_text(series_name)
 
-        # Remove page-level suffixes such as "Complete", "Full",
-        # "All Episodes", and website names.
+        # Remove generic page markers, but keep the actual series name.
         name = re.sub(
-            r"\s*[|–—-]\s*(?:complete|full|all\s+episodes?)\s*$",
+            r"\s*[-|–—:]?\s*(?:web\s+series|complete|full|all\s+episodes?|\[?reup\]?)\s*$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Remove any remaining generic suffixes.
+        name = re.sub(
+            r"\s*[-|–—:]\s*(?:complete|full|all\s+episodes?|reup)\s*$",
             "",
             name,
             flags=re.IGNORECASE,
         ).strip()
 
         name = re.sub(
-            r"\s+(?:complete|full|all\s+episodes?)\s*$",
+            r"\s+(?:complete|full|all\s+episodes?|reup)\s*$",
             "",
             name,
             flags=re.IGNORECASE,
