@@ -10,6 +10,7 @@ from app.queue.worker_pool import QueueItem
 from app.queue.download_manager import DownloadManager
 from app.queue.upload_manager import UploadManager
 from app.storage.database import Database
+from app.downloader.method_store import get_default_method
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +72,15 @@ class Pipeline:
         await self._dispatch_row(row)
 
     async def retry(self, task_id: int | str, method: str | None = None) -> bool:
-        """Retry a finished task once, optionally replacing its download method."""
+        """Retry a failed/cancelled task; downloads use the currently selected method."""
         task_id = str(task_id)
         task = await self.db.get_task(task_id)
         if not task or task.get("status") not in {"failed", "cancelled"}:
             return False
-        if method and task.get("task_type") == "download":
+        if task.get("task_type") == "download":
+            selected = method or await get_default_method()
             metadata = dict(task.get("metadata") or {})
-            metadata["download_method"] = str(method)
+            metadata["download_method"] = selected
             await self.db.update_task(task_id, metadata=metadata)
         if not await self.db.reset_for_retry(task_id):
             return False
@@ -135,9 +137,8 @@ class Pipeline:
 
     async def _download_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
-        # The downloader engine already performs its bounded 3 attempts for a
-        # selected method. Do not redispatch here: a failed method must become
-        # FAILED instead of silently looping back into the queue.
+        # The downloader engine already performs exactly 3 attempts for an
+        # explicitly selected method. Never redispatch a failed method here.
         await self.db.mark_failed(task_id, str(error))
         if self.on_failed:
             await self.on_failed(task_id, error)
