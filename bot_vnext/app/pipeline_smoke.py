@@ -6,9 +6,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Allow this file to be executed directly from the repository root:
-#   python bot_vnext/app/pipeline_smoke.py
+# Direct execution puts bot_vnext/app first on sys.path. That would make
+# app/queue shadow Python's standard-library queue module. Remove the script
+# directory and put bot_vnext itself first instead.
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path = [p for p in sys.path if Path(p or ".").resolve() != SCRIPT_DIR]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
