@@ -109,7 +109,7 @@ def build_crawl_keyboard(items, page=1):
     return InlineKeyboardMarkup(buttons)
 
 '''
-s = between(s, "def build_crawl_keyboard(items, page=1):", "async def enqueue_items", crawl_keyboard + "async def enqueue_items", "crawl keyboard")
+s = between(s, "def build_crawl_keyboard(items, page=1):", "async def enqueue_items", crawl_keyboard, "crawl keyboard")
 
 crawl_command = '''    @app.on_message(filters.command("crawl") & filters.private)
     async def _cmd_crawl(c, m):
@@ -146,7 +146,7 @@ crawl_command = '''    @app.on_message(filters.command("crawl") & filters.privat
         )
 
 '''
-s = between(s, '    @app.on_message(filters.command("crawl") & filters.private)', '    @app.on_callback_query(filters.regex(r"^crawl_.*"))', crawl_command + '    @app.on_callback_query(filters.regex(r"^crawl_.*"))', "crawl command")
+s = between(s, '    @app.on_message(filters.command("crawl") & filters.private)', '    @app.on_callback_query(filters.regex(r"^crawl_.*"))', crawl_command, "crawl command")
 
 crawl_callback = '''    @app.on_callback_query(filters.regex(r"^crawl_.*"))
     async def _handle_crawl_callback(client, callback_query):
@@ -239,7 +239,7 @@ crawl_callback = '''    @app.on_callback_query(filters.regex(r"^crawl_.*"))
             return
 
 '''
-s = between(s, '    @app.on_callback_query(filters.regex(r"^crawl_.*"))', '    @app.on_callback_query(\n        filters.regex(', crawl_callback + '    @app.on_callback_query(\n        filters.regex(', "crawl callback")
+s = between(s, '    @app.on_callback_query(filters.regex(r"^crawl_.*"))', '    @app.on_callback_query(\n        filters.regex(', crawl_callback, "crawl callback")
 
 # Remove the separate DOWNLOAD COMPLETE transition. The upload progress card replaces it immediately.
 old = '''        try:
@@ -327,7 +327,7 @@ tracker = '''class DashboardTracker:
             pass
 
 '''
-s = between(s, "class DashboardTracker:", "async def fetch_segment_with_backoff", tracker + "async def fetch_segment_with_backoff", "upload tracker")
+s = between(s, "class DashboardTracker:", "async def fetch_segment_with_backoff", tracker, "upload tracker")
 p.write_text(s, encoding="utf-8")
 
 print("UI rebuild v2 applied successfully.")

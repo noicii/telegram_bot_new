@@ -43,48 +43,8 @@ def cancel_all_upload_tasks():
     return len(tasks)
 
 
-def _dashboard_progress(pct):
-    try:
-        pct = max(0.0, min(100.0, float(pct or 0)))
-    except (TypeError, ValueError):
-        pct = 0.0
-    fill = int(pct // 10)
-    return f"{'█' * fill}{'░' * (10 - fill)} {pct:.0f}%"
-
-
-def _dashboard_task_line(task, live, upload=False):
-    title = live.get("title") or _display_task_name(task)
-    title = str(title).strip()
-
-    resolution = (
-        task.get("resolution")
-        or live.get("resolution")
-        or SETTINGS.get("target_resolution", "original")
-    )
-
-    if resolution and str(resolution).lower() not in ("original", "auto", "none"):
-        media_line = f"{title[:48]} • {resolution}p"
-    else:
-        media_line = title[:60]
-
-    pct = live.get("percent") or 0
-    speed = live.get("speed_mb")
-    speed_text = f"{float(speed):.1f} MB/s" if speed is not None else "—"
-    eta = live.get("eta") or "—"
-
-    heading = "⬆️ **UPLOADING**" if upload else "⬇️ **DOWNLOADING**"
-
-    return (
-        f"{heading}\n"
-        f"🎬 {media_line}\n"
-        f"{_dashboard_progress(pct)}\n"
-        f"⚡ {speed_text} • ETA {eta}"
-    )
-
-
 def build_batch_summary_text(batch_id):
     tasks = get_batch_tasks_db(batch_id) or []
-
     downloading = 0
     uploading = 0
     pending = 0
@@ -93,7 +53,6 @@ def build_batch_summary_text(batch_id):
 
     for task in tasks:
         status = str(task.get("status") or "").lower()
-
         if status == "pending":
             pending += 1
         elif status == "completed":
@@ -101,11 +60,8 @@ def build_batch_summary_text(batch_id):
         elif status == "failed":
             failed += 1
         elif status == "processing":
-            task_id = str(task.get("id"))
-            live = LIVE_TASKS.get(task_id, {})
-            operation = str(live.get("operation") or "").lower()
-
-            if "upload" in operation:
+            live = LIVE_TASKS.get(str(task.get("id")), {})
+            if "upload" in str(live.get("operation") or "").lower():
                 uploading += 1
             else:
                 downloading += 1
@@ -122,38 +78,51 @@ def build_batch_summary_text(batch_id):
     ])
 
 
-def build_crawl_keyboard(items, page=1):
-    total_pages=max(1,(len(items)+CRAWL_PAGE_SIZE-1)//CRAWL_PAGE_SIZE)
-    page=max(1,min(page,total_pages))
-    start=(page-1)*CRAWL_PAGE_SIZE
-    buttons=[]
-    for item in items[start:start+CRAWL_PAGE_SIZE]:
-        icon="✅" if item.get("selected") else "⬜"
-        title=item.get("title") or "Unknown video"
-        episode=item.get("episode")
-        source=item.get("source") or "Unknown"
-        resolution=item.get("resolution")
+def _crawl_series_name(items):
+    for item in items:
+        raw = str(item.get("title") or "").strip()
+        if raw:
+            parts = raw.split(" - ")
+            if len(parts) > 1:
+                return parts[0].strip()
+            return raw
+    return "Crawled Series"
 
-        res=str(resolution).strip() if resolution else ""
-        if res.lower() in ("unknown","original","none","auto"):
-            res=""
-        elif not res.lower().endswith("p"):
-            res+="p"
-        ep=str(episode or "").replace("Episode","Ep").strip()
-        text=f"{ep} • {res} • {source}" if res else f"{ep} • {source}"
-        buttons.append([InlineKeyboardButton(f"{icon} {text}",callback_data=f"crawl_toggle_{item['id']}_{page}")])
-    nav=[]
-    if page>1:
-        nav.append(InlineKeyboardButton("◀️",callback_data=f"crawl_page_{page-1}"))
-    nav.append(InlineKeyboardButton(f"Page {page}/{total_pages}",callback_data="crawl_noop"))
-    if page<total_pages:
-        nav.append(InlineKeyboardButton("▶️",callback_data=f"crawl_page_{page+1}"))
+
+def build_crawl_keyboard(items, page=1):
+    total_pages = max(1, (len(items) + CRAWL_PAGE_SIZE - 1) // CRAWL_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * CRAWL_PAGE_SIZE
+    buttons = []
+
+    for item in items[start:start + CRAWL_PAGE_SIZE]:
+        icon = "✅" if item.get("selected") else "⬜"
+        episode = str(item.get("episode") or "Episode ?").strip()
+        source = str(item.get("source") or "Unknown").strip()
+        resolution = str(item.get("resolution") or "").strip()
+        if resolution and resolution.lower() not in ("unknown", "original", "none", "auto"):
+            if not resolution.lower().endswith("p"):
+                resolution += "p"
+            label = f"{episode} • {resolution} • {source}"
+        else:
+            label = f"{episode} • {source}"
+        buttons.append([InlineKeyboardButton(
+            f"{icon} {label}",
+            callback_data=f"crawl_toggle_{item['id']}_{page}",
+        )])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"crawl_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"Page {page}/{total_pages}", callback_data="crawl_noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"crawl_page_{page + 1}"))
     buttons.append(nav)
     buttons.append([
-        InlineKeyboardButton("☑️ Select All",callback_data=f"crawl_select_all_{page}"),
-        InlineKeyboardButton("❌ Clear",callback_data=f"crawl_clear_all_{page}")
+        InlineKeyboardButton("☑️ Select All", callback_data=f"crawl_select_all_{page}"),
+        InlineKeyboardButton("❌ Clear", callback_data=f"crawl_clear_all_{page}"),
     ])
-    buttons.append([InlineKeyboardButton("🚀 Download Selected",callback_data="crawl_download_selected")])
+    buttons.append([InlineKeyboardButton("🚀 Download Selected", callback_data="crawl_download_selected")])
     return InlineKeyboardMarkup(buttons)
 
 async def enqueue_items(items, status_message, client, is_audio=False, audio_bitrate="192", preset=None):
@@ -547,35 +516,19 @@ def register_handlers(app):
     async def _cmd_crawl(c, m):
         if not is_authorized(m.from_user.id, ADMIN_IDS):
             return
-
         urls_found = re.findall(r"https?://[^\s<>]+", m.text or "")
-
         if not urls_found and m.reply_to_message and m.reply_to_message.text:
-            urls_found = re.findall(
-                r"https?://[^\s<>]+",
-                m.reply_to_message.text,
-            )
-
+            urls_found = re.findall(r"https?://[^\s<>]+", m.reply_to_message.text)
         if not urls_found:
-            return await m.reply_text(
-                "⚠️ કૃપા કરીને `/crawl <બ્લોગ_લિંક>` આ રીતે લિંક મોકલો."
-            )
+            return await m.reply_text("⚠️ કૃપા કરીને `/crawl <બ્લોગ_લિંક>` આ રીતે લિંક મોકલો.")
 
-        blog_url = urls_found[0].strip("[]()<>\"\\x27")
-
-        status_msg = await m.reply_text(
-            f"🔍 બ્લોગ ક્રોલ થઈ રહ્યો છે: `{blog_url}`..."
-        )
-
+        blog_url = urls_found[0].strip("[]()<>\"\x27")
+        status_msg = await m.reply_text("🔍 Crawling page... ⏳")
         episodes = crawl_blog_episodes(blog_url)
-
         if not episodes:
-            return await status_msg.edit_text(
-                "❌ આ બ્લોગમાંથી કોઈ Episode/LuluStream લિંક મળી નથી."
-            )
+            return await status_msg.edit_text("❌ આ બ્લોગમાંથી કોઈ Episode option મળ્યો નથી.")
 
         clear_crawl_items_db(m.from_user.id)
-
         for episode in episodes:
             add_crawl_item_db(
                 m.from_user.id,
@@ -586,172 +539,101 @@ def register_handlers(app):
                 episode.get("resolution", "Unknown"),
                 episode.get("source_url", episode["url"]),
             )
-
         items = get_crawl_items_db(m.from_user.id)
-
         await status_msg.edit_text(
-            "🎬 **Crawl Complete**\n\n"
-            f"📦 Total options: **{len(items)}**\n\n"
-            "👇 Download માટે option select કરો:",
-            reply_markup=build_crawl_keyboard(items),
+            f"🎬 **{_crawl_series_name(items)}**\n"
+            f"📦 **{len(items)} Options**",
+            reply_markup=build_crawl_keyboard(items, 1),
         )
 
     @app.on_callback_query(filters.regex(r"^crawl_.*"))
     async def _handle_crawl_callback(client, callback_query):
         if not is_authorized(callback_query.from_user.id, ADMIN_IDS):
             return await callback_query.answer("❌ Unauthorized", show_alert=True)
-
         data = callback_query.data
         chat_id = callback_query.message.chat.id
+        items = get_crawl_items_db(chat_id)
+        if not items:
+            return await callback_query.answer("❌ Crawl options expired.", show_alert=True)
 
+        total_pages = max(1, (len(items) + CRAWL_PAGE_SIZE - 1) // CRAWL_PAGE_SIZE)
         if data == "crawl_noop":
-            return await callback_query.answer("📂 Episode options નીચે છે.", show_alert=False)
+            return await callback_query.answer("📂 Episode options નીચે છે.")
 
         if data.startswith("crawl_page_"):
             try:
-                page=int(data.rsplit("_",1)[1])
+                page = int(data.rsplit("_", 1)[1])
             except ValueError:
-                return await callback_query.answer("❌ Invalid page", show_alert=True)
-
-            items=get_crawl_items_db(chat_id)
-            total_pages=max(1,(len(items)+CRAWL_PAGE_SIZE-1)//CRAWL_PAGE_SIZE)
-            page=max(1,min(page,total_pages))
-
+                page = 1
+            page = max(1, min(page, total_pages))
             await callback_query.answer()
-            await callback_query.message.edit_reply_markup(
-                build_crawl_keyboard(items,page)
-            )
+            await callback_query.message.edit_reply_markup(build_crawl_keyboard(items, page))
             return
 
         if data.startswith("crawl_select_all_"):
             try:
-                page=int(data.rsplit("_",1)[1])
+                page = int(data.rsplit("_", 1)[1])
             except ValueError:
-                page=1
-
+                page = 1
+            page = max(1, min(page, total_pages))
             select_all_crawl_items_db(chat_id)
-            items=get_crawl_items_db(chat_id)
-
-            await callback_query.answer("☑️ બધા options select થયા.")
-            await callback_query.message.edit_reply_markup(
-                build_crawl_keyboard(items,page)
-            )
+            items = get_crawl_items_db(chat_id)
+            await callback_query.answer("☑️ All options selected.")
+            await callback_query.message.edit_reply_markup(build_crawl_keyboard(items, page))
             return
 
         if data.startswith("crawl_clear_all_"):
             try:
-                page=int(data.rsplit("_",1)[1])
+                page = int(data.rsplit("_", 1)[1])
             except ValueError:
-                page=1
-
-            clear_selected_crawl_items_db(chat_id)
-            items=get_crawl_items_db(chat_id)
-
-            await callback_query.answer("❌ Selection clear થઈ ગઈ.")
-            await callback_query.message.edit_reply_markup(
-                build_crawl_keyboard(items,page)
-            )
-            return
-
-        if data == "crawl_select_all":
-            select_all_crawl_items_db(chat_id)
-            items = get_crawl_items_db(chat_id)
-            await callback_query.answer("☑️ બધા options select થયા.", show_alert=False)
-            await callback_query.message.edit_reply_markup(
-                build_crawl_keyboard(items)
-            )
-            return
-
-        if data == "crawl_clear_all":
+                page = 1
+            page = max(1, min(page, total_pages))
             clear_selected_crawl_items_db(chat_id)
             items = get_crawl_items_db(chat_id)
-            await callback_query.answer("❌ Selection clear થઈ ગઈ.", show_alert=False)
-            await callback_query.message.edit_reply_markup(
-                build_crawl_keyboard(items)
-            )
+            await callback_query.answer("❌ Selection cleared.")
+            await callback_query.message.edit_reply_markup(build_crawl_keyboard(items, page))
             return
 
         if data == "crawl_download_selected":
             selected_items = get_selected_crawl_items_db(chat_id)
-
             if not selected_items:
-                return await callback_query.answer(
-                    "⚠️ પહેલા ઓછામાં ઓછું એક option select કરો.",
-                    show_alert=True,
-                )
-
-            await callback_query.answer(
-                f"🚀 {len(selected_items)} options queueમાં ઉમેરાઈ રહ્યા છે...",
-                show_alert=False,
-            )
-
-            await callback_query.message.edit_text(
-                f"🚀 **{len(selected_items)} options selected.**\n\n"
-                "⏳ Queue માં ઉમેરાઈ રહ્યા છે..."
-            )
-
-            queue_items = [
-                {
-                    "url": item["url"],
-                    "chat_id": chat_id,
-                    "custom_name": item["title"],
-                    "source": item.get("source", "Unknown"),
-                    "resolution": item.get("resolution", "Unknown"),
-                    "source_url": item.get("source_url", item["url"]),
-                }
-                for item in selected_items
-            ]
-
+                return await callback_query.answer("⚠️ પહેલા ઓછામાં ઓછું એક option select કરો.", show_alert=True)
+            await callback_query.answer(f"🚀 {len(selected_items)} options queue થઈ રહ્યા છે...")
             status_msg = callback_query.message
-            task_ids = await enqueue_items(queue_items, status_msg, client)
-
-            await status_msg.edit_text(
-                f"📥 **{len(task_ids)} crawl options Queue માં ઉમેરાયા.**\n\n"
-                "⏳ FIFO Queue મુજબ processing શરૂ થશે..."
-            )
+            queue_items = [{
+                "url": item["url"],
+                "chat_id": chat_id,
+                "custom_name": item["title"],
+                "source": item.get("source", "Unknown"),
+                "resolution": item.get("resolution", "Unknown"),
+                "source_url": item.get("source_url", item["url"]),
+            } for item in selected_items]
+            try:
+                await status_msg.edit_text(f"🚀 **{len(selected_items)} options selected**\n\n⏳ Adding to queue...")
+                task_ids = await enqueue_items(queue_items, status_msg, client)
+                await status_msg.edit_text(f"📥 **{len(task_ids)} tasks added to queue**\n\n⏳ Processing will start automatically.")
+            except Exception:
+                logger.exception("Failed to queue crawl selections")
+                await status_msg.edit_text("❌ **Could not add selected options to queue.**")
             return
 
         if data.startswith("crawl_toggle_"):
-            parts=data.split("_")
-            item_id=int(parts[2])
-            page=int(parts[3]) if len(parts)>3 else 1
-            item=get_crawl_item_db(item_id, chat_id)
+            parts = data.split("_")
+            try:
+                item_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 1
+            except (ValueError, IndexError):
+                return await callback_query.answer("❌ Invalid option.", show_alert=True)
+            item = get_crawl_item_db(item_id, chat_id)
             if not item:
-                return await callback_query.answer("❌ Item not found", show_alert=True)
+                return await callback_query.answer("❌ Option not found.", show_alert=True)
             toggle_crawl_item_db(item_id, chat_id)
-            items=get_crawl_items_db(chat_id)
-            selected=sum(1 for x in items if x.get("selected"))
-            await callback_query.answer(f"Selection: {selected}/{len(items)}")
-            total_pages=max(1,(len(items)+CRAWL_PAGE_SIZE-1)//CRAWL_PAGE_SIZE)
-            page=max(1,min(page,total_pages))
-            await callback_query.message.edit_text(
-                f"🎬 **Crawl Complete**\n\n📦 Total: **{len(items)}**\n"
-                f"✅ Selected: **{selected}**\n📄 Page: **{page}/{total_pages}**\n\n"
-                "👇 Option select કરો:",
-                reply_markup=build_crawl_keyboard(items,page),
-            )
-            return await callback_query.answer(
-                    "❌ Item not found",
-                    show_alert=True,
-                )
-
-            toggle_crawl_item_db(item_id, chat_id)
-
             items = get_crawl_items_db(chat_id)
-            selected_count = sum(1 for current_item in items if current_item["selected"])
-
-            await callback_query.answer(
-                f"Selection: {selected_count}/{len(items)}",
-                show_alert=False,
-            )
-
-            await callback_query.message.edit_text(
-                "🎬 **Crawl Complete**\n\n"
-                f"📦 Total options: **{len(items)}**\n"
-                f"✅ Selected: **{selected_count}**\n\n"
-                "👇 દરેક Episodeમાંથી Source/Resolution પસંદ કરો.",
-                reply_markup=build_crawl_keyboard(items),
-            )
+            total_pages = max(1, (len(items) + CRAWL_PAGE_SIZE - 1) // CRAWL_PAGE_SIZE)
+            page = max(1, min(page, total_pages))
+            selected = sum(1 for current_item in items if current_item.get("selected"))
+            await callback_query.answer(f"Selected: {selected}/{len(items)}")
+            await callback_query.message.edit_reply_markup(build_crawl_keyboard(items, page))
             return
 
     @app.on_callback_query(
@@ -1534,23 +1416,6 @@ async def _run_upload_pipeline(
             operation="Uploading to Channel",
         )
 
-        try:
-            await status_message.edit_text(
-                f"✅ **DOWNLOAD COMPLETE**\n\n"
-                f"🎬 `{title}`\n"
-                f"💾 `{size_mb:.2f} MB`\n"
-                "📤 Uploading to Channel...\n"
-                "⏳ Starting upload...",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "❌ Cancel Upload",
-                        callback_data=f"cancel_task_{task_id}",
-                    )
-                ]]),
-            )
-        except Exception:
-            pass
-
         await finalize_queue_file(
             client,
             status_message,
@@ -1567,8 +1432,8 @@ async def _run_upload_pipeline(
         try:
             await status_message.edit_text(
                 f"✅ **UPLOAD COMPLETE**\n\n"
-                f"🎬 `{title}`\n"
-                f"💾 `{size_mb:.2f} MB`\n"
+                f"🎬 **{title[:55]}**\n\n"
+                "✅ **UPLOAD COMPLETE**\n"
                 "📢 Sent to Channel",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(

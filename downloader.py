@@ -52,34 +52,37 @@ class DashboardTracker:
         if now - self.last_update < 3 and cur != tot:
             return
         self.last_update = now
-        pct = min(100.0, (cur * 100 / tot))
-        fill = int(pct // 10)
-        b = "▰" * fill + "▱" * (10 - fill)
-        c_mb, t_mb = cur / 1048576, tot / 1048576
-        spd = (c_mb / (now - self.upload_start)) if (now - self.upload_start) > 0 else 0
-        elapsed = now - self.batch_start
-        items_done = self.cur_idx - 1 + (cur / tot)
-        eta_sec = int((elapsed / items_done) * (self.total - items_done)) if items_done > 0 else 0
-        eta_str = time.strftime("%M:%S", time.gmtime(eta_sec))
+        pct = min(100.0, (cur * 100 / tot)) if tot else 0.0
+        fill = max(0, min(10, int(pct // 10)))
+        bar = "█" * fill + "░" * (10 - fill)
+        current_mb = cur / 1048576
+        total_mb = tot / 1048576 if tot else 0.0
+        elapsed = max(0.001, now - self.upload_start)
+        speed = current_mb / elapsed
+        eta_sec = int((total_mb - current_mb) / speed) if speed > 0 else 0
+        eta = time.strftime("%M:%S", time.gmtime(max(0, eta_sec)))
         set_live_task(
             self.task_id,
             title=self.name,
             percent=pct,
-            current_mb=c_mb,
-            total_mb=t_mb,
-            speed_mb=spd,
-            eta=eta_str,
+            current_mb=current_mb,
+            total_mb=total_mb,
+            speed_mb=speed,
+            eta=eta,
             operation="Telegram upload",
         )
         text = (
-            f"🎬 **{self.name[:55]}**\\n\\n"
-            f"⬆️ **UPLOADING**\\n"
-            f"`{b}` **{pct:.1f}%**\\n"
-            f"⚡ {spd:.2f} MB/s • ⏳ ETA {eta_str}"
+            f"🎬 **{self.name[:55]}**\n\n"
+            f"⬆️ **UPLOADING**\n"
+            f"`{bar}` **{pct:.0f}%**\n\n"
+            f"💾 Data: {current_mb:.0f}/{total_mb:.0f} MB\n"
+            f"⚡ {speed:.1f} MB/s • ETA {eta}"
         )
-        mk = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 ટાસ્ક કેન્સલ કરો", callback_data=f"cancel_task_{self.task_id}")]])
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel_task_{self.task_id}")
+        ]])
         try:
-            await self.msg.edit_text(text, reply_markup=mk)
+            await self.msg.edit_text(text, reply_markup=markup)
         except Exception:
             pass
 
@@ -177,10 +180,6 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
     title = custom_name.strip() if custom_name else ""
     
     if "playmogo" in url.lower():
-        try:
-            await s_msg.edit_text(f"📥 **[{idx}] Playmogo લિંક પ્રોસેસ થઈ રહી છે...**")
-        except Exception:
-            pass
             
         try:
             resp = cffi_requests.get(url, impersonate="chrome", timeout=20)
