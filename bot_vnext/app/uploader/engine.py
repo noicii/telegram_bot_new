@@ -1,6 +1,6 @@
 """Telegram upload engine for Bot V2.
 
-Uploads are deliberately independent from downloads.  The caller owns the
+Uploads are deliberately independent from downloads. The caller owns the
 asyncio task, so cancelling one upload does not affect the other upload
 workers.
 """
@@ -16,8 +16,6 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 from app.core.task import TaskCancelled, TaskContext
-
-logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, int, int, float, int], Awaitable[None] | None]
 
@@ -56,6 +54,7 @@ class UploadEngine:
         total = path.stat().st_size
         progress_state = {"last": 0.0, "started": time.monotonic()}
         progress_tasks: set[asyncio.Task] = set()
+        loop = asyncio.get_running_loop()
 
         async def report(current: int, force: bool = False):
             now = time.monotonic()
@@ -73,13 +72,18 @@ class UploadEngine:
                     await result
 
         def pyrogram_progress(current: int, total_bytes: int, *_args):
-            if task.is_cancelled():
+            if task.is_cancelled() or loop.is_closed():
                 return
             current_total = total_bytes or total
-            coro = report(current, force=current >= current_total)
-            pending = asyncio.create_task(coro)
-            progress_tasks.add(pending)
-            pending.add_done_callback(progress_tasks.discard)
+
+            def schedule():
+                if task.is_cancelled() or loop.is_closed():
+                    return
+                pending = loop.create_task(report(current, force=current >= current_total))
+                progress_tasks.add(pending)
+                pending.add_done_callback(progress_tasks.discard)
+
+            loop.call_soon_threadsafe(schedule)
 
         try:
             for attempt in range(self.retries + 1):
@@ -152,20 +156,14 @@ class UploadEngine:
 
         normalized = (mode or "video").lower()
         if normalized in {"document", "file", "doc"}:
-            return await self.client.send_document(
-                document=str(path),
-                **common,
-            )
+            return await self.client.send_document(document=str(path), **common)
 
         if normalized in {"audio", "music"}:
             if title:
                 common["title"] = title
             if duration:
                 common["duration"] = duration
-            return await self.client.send_audio(
-                audio=str(path),
-                **common,
-            )
+            return await self.client.send_audio(audio=str(path), **common)
 
         if duration:
             common["duration"] = duration
@@ -175,7 +173,4 @@ class UploadEngine:
             common["height"] = height
         common["supports_streaming"] = bool(supports_streaming)
 
-        return await self.client.send_video(
-            video=str(path),
-            **common,
-        )
+        return await self.client.send_video(video=str(path), **common)
