@@ -15,6 +15,8 @@ from database import get_pending_tasks_db, get_pending_only_tasks_db, clear_pend
 from utils import is_authorized, get_main_keyboard, extract_subtitles_from_video, split_large_file, generate_screenshots_collage, generate_sample_clip, generate_auto_thumbnail, async_get_video_metadata
 from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
+
+CRAWL_PAGE_SIZE = 8
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_UPLOADS = 4
