@@ -15,7 +15,7 @@ from utils import (
     trim_video_file, compress_video, apply_watermark, filter_audio_tracks, apply_resolution_downscale
 )
 
-segment_semaphore = asyncio.Semaphore(8)
+segment_semaphore = asyncio.Semaphore(16)
 CANCELLED_TASKS = set()
 LIVE_TASKS = {}
 
@@ -228,8 +228,8 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
             }
 
             connector = aiohttp.TCPConnector(
-                limit=150,
-                limit_per_host=40,
+                limit=200,
+                limit_per_host=60,
                 ttl_dns_cache=300,
                 enable_cleanup_closed=True
             )
@@ -293,8 +293,7 @@ async def download_single_item(url, idx, s_msg, custom_name="", trim_info="", is
                 else:
                     ffmpeg_cmd = [
                         "ffmpeg", "-y", "-f", "mpegts", "-i", "pipe:0",
-                        "-c", "copy", "-map_metadata", "-1", "-metadata", f"title={safe_title}",
-                        "-movflags", "+faststart", final_out
+                        "-c", "copy", "-map_metadata", "-1", "-movflags", "+faststart", final_out
                     ]
 
                 proc = await asyncio.create_subprocess_exec(
