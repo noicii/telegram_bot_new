@@ -3,11 +3,10 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "bot_vnext" / "app" / "downloader" / "engine.py"
-
 s = ENGINE.read_text()
 
 anchor = '        requested = str(task.metadata.get("download_method") or "auto").lower()\n'
-insert = '''        # Normalize known file-host viewer links before engine planning.\n        url = self._normalize_source_url(url, task)\n\n'''
+insert = '        url = self._normalize_source_url(url, task)\n\n'
 if insert not in s:
     if anchor not in s:
         raise SystemExit("anchor: requested method not found")
@@ -112,7 +111,7 @@ s = s.replace(old, new, 1)
 
 s = re.sub(r'asyncio\.Semaphore\(\d+\)', 'asyncio.Semaphore(16)', s, count=1)
 needle = '            # Encrypted HLS must be handled by FFmpeg because the key metadata is part of the playlist.\n'
-extra = '''            # fMP4/byterange/discontinuity playlists are safest through native FFmpeg.\n            if "#EXT-X-MAP:" in playlist or "#EXT-X-BYTERANGE:" in playlist or "#EXT-X-DISCONTINUITY" in playlist:\n                logger.info("task=%s advanced HLS playlist detected; using native FFmpeg", task.task_id)\n                await self._ffmpeg(stream_url, output, task, progress, headers=headers)\n                return\n\n'''
+extra = '''            # Advanced HLS playlists are safest through native FFmpeg.\n            if "#EXT-X-MAP:" in playlist or "#EXT-X-BYTERANGE:" in playlist or "#EXT-X-DISCONTINUITY" in playlist:\n                logger.info("task=%s advanced HLS playlist detected; using native FFmpeg", task.task_id)\n                await self._ffmpeg(stream_url, output, task, progress, headers=headers)\n                return\n\n'''
 if extra not in s:
     if needle not in s:
         raise SystemExit("HLS encryption anchor not found")
@@ -124,11 +123,25 @@ s = s.replace('timeout=30000', 'timeout=45000', 1)
 s = s.replace('for tick in range(25):', 'for tick in range(35):', 1)
 s = s.replace('if ".m3u8" in low and not any', 'if (".m3u8" in low or ".mpd" in low) and not any', 1)
 
-old = '        command += ["--newline", "--no-part", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(output), url]\n'
-new = '''        command += [\n            "--newline", "--no-part",\n            "--retries", "10", "--fragment-retries", "10", "--extractor-retries", "5",\n            "--socket-timeout", "30", "--concurrent-fragments", "16",\n            "--force-overwrites",\n            "-f", "bv*+ba/b", "--merge-output-format", "mp4",\n            "-o", str(output), url,\n        ]\n        headers = task.metadata.get("headers") or {}\n        if headers.get("User-Agent"):\n            command[1:1] = ["--user-agent", str(headers["User-Agent"])]\n        if headers.get("Referer"):\n            command[1:1] = ["--referer", str(headers["Referer"])]\n'''
-if old not in s:
-    raise SystemExit("yt-dlp command block not found")
-s = s.replace(old, new, 1)
+# Patch yt-dlp command regardless of previous local tuning.
+pattern = r'        command \+= \["--newline",.*?str\(output\), url\]\n'
+replacement = '''        command += [
+            "--newline", "--no-part",
+            "--retries", "10", "--fragment-retries", "10", "--extractor-retries", "5",
+            "--socket-timeout", "30", "--concurrent-fragments", "16",
+            "--force-overwrites", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+            "-o", str(output), url,
+        ]
+        headers = task.metadata.get("headers") or {}
+        if headers.get("User-Agent"):
+            command[1:1] = ["--user-agent", str(headers["User-Agent"])]
+        if headers.get("Referer"):
+            command[1:1] = ["--referer", str(headers["Referer"])]
+'''
+s2, n = re.subn(pattern, replacement, s, count=1, flags=re.S)
+if n != 1:
+    raise SystemExit("yt-dlp command block not found; no changes written")
+s = s2
 
 ENGINE.write_text(s)
 print("HOST-AWARE ROBUST DOWNLOADER UPGRADE APPLIED")
