@@ -21,11 +21,13 @@ class DownloadManager:
         output_dir: str | Path,
         workers: int = 2,
         retries: int = 2,
+        database=None,
         on_progress: Callable[..., Awaitable[None] | None] | None = None,
         on_complete: Callable[[QueueItem, Path], Awaitable[None]] | None = None,
         on_failed: Callable[[QueueItem, Exception], Awaitable[None]] | None = None,
     ):
         self.engine = HybridDownloader(output_dir, retries=retries)
+        self.database = database
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_failed = on_failed
@@ -77,6 +79,9 @@ class DownloadManager:
                 raise TaskCancelled(f"Download task {item.task_id} cancelled before start")
 
             ctx.metadata.update(payload.get("metadata") or {})
+            if self.database:
+                await self.database.update_task(key, status="downloading")
+
             result = await self.engine.download(
                 payload["url"],
                 ctx,
@@ -88,8 +93,12 @@ class DownloadManager:
                 await self.on_complete(item, result)
         except TaskCancelled:
             logger.info("download task %s cancelled", item.task_id)
+            if self.database:
+                await self.database.mark_cancelled(key)
         except asyncio.CancelledError:
             logger.info("download task %s asyncio-cancelled", item.task_id)
+            if self.database and key in self._cancelled:
+                await self.database.mark_cancelled(key)
             raise
         except Exception as exc:
             logger.exception("download task %s failed", item.task_id)
