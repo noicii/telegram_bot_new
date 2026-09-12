@@ -431,6 +431,71 @@ def crawl_blog_episodes(raw_url):
 
         return sanitize_filename(" - ".join(parts)).strip()
 
+    def lookup_page_resolution(url):
+        try:
+            page = requests.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+                timeout=12,
+                allow_redirects=True,
+            )
+            if page.status_code != 200:
+                return "Unknown"
+
+            body_lower = page.text.lower()
+            error_markers = (
+                "just a moment...",
+                "__cf_chl_",
+                "cf-chl-",
+                "bad gateway",
+                "access denied",
+                "forbidden",
+            )
+            if any(marker in body_lower for marker in error_markers):
+                return "Unknown"
+
+            page_soup = BeautifulSoup(page.text, "lxml")
+            page_title = (
+                page_soup.title.get_text(" ", strip=True)
+                if page_soup.title
+                else ""
+            )
+
+            for value in (
+                page_title,
+                page_soup.get_text(" ", strip=True),
+            ):
+                resolution = detect_resolution(value)
+                if resolution != "Unknown":
+                    return resolution
+
+                match = re.search(
+                    r"\b(\d{3,4})\s*[x×]\s*(\d{3,4})\b",
+                    value,
+                    re.IGNORECASE,
+                )
+                if match:
+                    width = int(match.group(1))
+                    height = int(match.group(2))
+
+                    if width >= 3840 or height >= 2160:
+                        return "2160p"
+                    if width >= 1920 or height >= 1080:
+                        return "1080p"
+                    if width >= 1280 or height >= 720:
+                        return "720p"
+                    if width >= 854 or height >= 480:
+                        return "480p"
+
+            return "Unknown"
+        except requests.RequestException:
+            return "Unknown"
+        except Exception:
+            return "Unknown"
+
     def add_result(episode, href, link_text):
         href = clean_text(href)
 
@@ -456,6 +521,8 @@ def crawl_blog_episodes(raw_url):
         resolution = detect_resolution(
             f"{href} {link_text}"
         )
+        if resolution == "Unknown" and source != "Unknown":
+            resolution = lookup_page_resolution(href)
 
         if not (media_like or protected_like or source != "Unknown"):
             return
