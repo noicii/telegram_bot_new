@@ -17,7 +17,7 @@ from crawler import resolve_blog_links, crawl_blog_episodes, parse_input_lines
 from downloader import download_single_item, DashboardTracker, CANCELLED_TASKS, LIVE_TASKS, set_live_task, clear_live_task
 logger = logging.getLogger(__name__)
 
-MAX_CONCURRENT_UPLOADS = 2
+MAX_CONCURRENT_UPLOADS = 4
 UPLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 UPLOAD_TASKS = {}
 
