@@ -395,46 +395,40 @@ def crawl_blog_episodes(raw_url):
         series_name = ""
 
     def make_title(episode, source, resolution, href, link_text):
-        # Filename/title:
-        # Series Name - Episode - Resolution
-        # Source/provider stays separate in the "source" field.
         name = clean_text(series_name)
 
-        # Remove generic page markers, but keep the actual series name.
-        name = re.sub(
-            r"\s*[-|–—:]?\s*(?:web\s+series|complete|full|all\s+episodes?|\[?reup\]?)\s*$",
-            "",
-            name,
-            flags=re.IGNORECASE,
-        ).strip()
+        # Remove generic page words from the actual series name.
+        for marker in (
+            "Web Series",
+            "WEB SERIES",
+            "web series",
+            "Complete",
+            "complete",
+            "FULL",
+            "Full",
+            "full",
+            "All Episodes",
+            "ALL EPISODES",
+            "all episodes",
+            "[REUP]",
+            "[Reup]",
+            "[reup]",
+            "REUP",
+            "Reup",
+            "reup",
+        ):
+            name = name.replace(marker, " ")
 
-        # Remove any remaining generic suffixes.
-        name = re.sub(
-            r"\s*[-|–—:]\s*(?:complete|full|all\s+episodes?|reup)\s*$",
-            "",
-            name,
-            flags=re.IGNORECASE,
-        ).strip()
-
-        name = re.sub(
-            r"\s+(?:complete|full|all\s+episodes?|reup)\s*$",
-            "",
-            name,
-            flags=re.IGNORECASE,
-        ).strip()
+        name = re.sub(r"\\s+", " ", name).strip(" -|–—:")
 
         parts = []
-
         if name:
             parts.append(name)
-
         if episode:
             parts.append(episode)
-
         if resolution and resolution != "Unknown":
             parts.append(resolution)
 
-        # Never append source/provider here.
         return sanitize_filename(" - ".join(parts)).strip()
 
     def add_result(episode, href, link_text):
