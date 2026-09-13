@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 from app.core.task import TaskCancelled, TaskContext
 
 logger = logging.getLogger(__name__)
-ProgressCallback = Callable[[float | None, int | None, int | None, float | None], Awaitable[None] | None]
+ProgressCallback = Callable[..., Awaitable[None] | None]
 METHODS = {"auto", "hls-multi", "yt-dlp", "browser", "ffmpeg", "aria2c", "direct"}
 
 
@@ -100,15 +100,11 @@ class HybridDownloader:
         m = re.search(r"(?:luluvdo|luluvid|luluvdoo|luluvideo|lulustream)\.com/(?:d|e)/([A-Za-z0-9]+)", url, re.I)
         if m:
             video_id = m.group(1)
-            candidates.extend([
-                f"https://luluvdo.com/e/{video_id}",
-                f"https://lulustream.com/e/{video_id}",
-                f"https://luluvdoo.com/e/{video_id}",
-            ])
+            candidates.extend([f"https://luluvdo.com/e/{video_id}", f"https://lulustream.com/e/{video_id}", f"https://luluvdoo.com/e/{video_id}"])
         return list(dict.fromkeys(candidates))
 
     async def _hls_multi(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
-        """Legacy-compatible HLS flow: browser extracts signed HLS, 4 segments download concurrently, FFmpeg muxes."""
+        """HLS flow: browser extracts signed HLS, 16 segments download concurrently, FFmpeg muxes."""
         import aiohttp
         if not shutil.which("ffmpeg"):
             raise DownloadError("ffmpeg is not installed")
@@ -129,7 +125,6 @@ class HybridDownloader:
                 stream_url = self._best_variant(stream_url, playlist)
                 playlist = await self._fetch_text(session, stream_url)
 
-            # Encrypted HLS must be handled by FFmpeg because the key metadata is part of the playlist.
             if "#EXT-X-KEY:" in playlist:
                 logger.info("task=%s encrypted HLS detected; using FFmpeg within HLS Multi method", task.task_id)
                 await self._ffmpeg(stream_url, output, task, progress, headers=headers)
@@ -138,14 +133,17 @@ class HybridDownloader:
             segments = [urljoin(stream_url, line.strip()) for line in playlist.splitlines() if line.strip() and not line.strip().startswith("#")]
             if not segments: raise DownloadError("No HLS segments found")
 
-            sem = asyncio.Semaphore(4)
+            sem = asyncio.Semaphore(16)
             results: list[bytes | None] = [None] * len(segments)
             started = time.monotonic()
             completed = 0
             total_bytes = 0
+            retry_count = 0
+
+            await self._report(progress, 0.0, 0, None, 0.0, {"hls_completed": 0, "hls_total": len(segments), "hls_retries": 0})
 
             async def fetch(index: int, segment_url: str):
-                nonlocal completed, total_bytes
+                nonlocal completed, total_bytes, retry_count
                 async with sem:
                     last_exc = None
                     for attempt in range(3):
@@ -158,12 +156,22 @@ class HybridDownloader:
                                 completed += 1
                                 total_bytes += len(data)
                                 elapsed = max(time.monotonic() - started, 0.001)
-                                await self._report(progress, completed * 100 / len(segments), total_bytes, None, total_bytes / elapsed)
+                                await self._report(
+                                    progress,
+                                    completed * 100 / len(segments),
+                                    total_bytes,
+                                    None,
+                                    total_bytes / elapsed,
+                                    {"hls_completed": completed, "hls_total": len(segments), "hls_retries": retry_count},
+                                )
                                 return
-                        except TaskCancelled: raise
+                        except TaskCancelled:
+                            raise
                         except Exception as exc:
                             last_exc = exc
-                            if attempt < 2: await asyncio.sleep(2 ** attempt)
+                            if attempt < 2:
+                                retry_count += 1
+                                await asyncio.sleep(2 ** attempt)
                     raise DownloadError(f"HLS segment {index + 1} failed: {last_exc}")
 
             workers = [asyncio.create_task(fetch(i, segment)) for i, segment in enumerate(segments)]
@@ -196,7 +204,6 @@ class HybridDownloader:
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise DownloadError("Playwright is not installed") from exc
-
         captured: list[str] = []
         candidates = self._browser_candidates(url)
         async with async_playwright() as pw:
@@ -204,20 +211,13 @@ class HybridDownloader:
             task.metadata["browser"] = browser
             try:
                 for candidate in candidates:
-                    task.check_cancelled()
-                    captured.clear()
-                    context = await browser.new_context(
-                        user_agent=headers.get("User-Agent"),
-                        extra_http_headers={k: v for k, v in headers.items() if k.lower() != "user-agent"},
-                    )
-                    page = await context.new_page()
-                    task.metadata["browser_page"] = page
-
+                    task.check_cancelled(); captured.clear()
+                    context = await browser.new_context(user_agent=headers.get("User-Agent"), extra_http_headers={k: v for k, v in headers.items() if k.lower() != "user-agent"})
+                    page = await context.new_page(); task.metadata["browser_page"] = page
                     async def on_response(response):
                         low = response.url.lower()
                         if ".m3u8" in low and not any(x in low for x in ("google", "analytics", "preview", "thumb")):
                             if response.url not in captured: captured.append(response.url)
-
                     page.on("response", on_response)
                     try:
                         await page.goto(candidate, wait_until="domcontentloaded", timeout=30000)
@@ -227,64 +227,39 @@ class HybridDownloader:
                             if captured: break
                             await asyncio.sleep(1)
                             if tick % 5 == 0: await self._report(progress, 1.0, 0, None, 0.0)
-
-                        # Old downloader also inspected the actual player config/frames, not only network traffic.
                         for frame in page.frames:
                             try:
                                 found = await frame.evaluate("""() => {
                                     const out = [];
-                                    try {
-                                      if (typeof jwplayer === 'function') {
-                                        const p = jwplayer(); const c = p && p.getConfig ? p.getConfig() : null;
-                                        const s = c && c.sources ? c.sources : [];
-                                        for (const x of s) if (x && x.file) out.push(x.file);
-                                      }
-                                    } catch(e) {}
-                                    try {
-                                      for (const v of document.querySelectorAll('video, source')) if (v.src) out.push(v.src);
-                                    } catch(e) {}
-                                    try {
-                                      const html = document.documentElement.innerHTML || '';
-                                      const re = /https?:[^\\\"'\\s]+\\.m3u8(?:\\?[^\\\"'\\s<]*)?/gi;
-                                      const m = html.match(re) || []; out.push(...m);
-                                    } catch(e) {}
+                                    try { if (typeof jwplayer === 'function') { const p = jwplayer(); const c = p && p.getConfig ? p.getConfig() : null; const s = c && c.sources ? c.sources : []; for (const x of s) if (x && x.file) out.push(x.file); } } catch(e) {}
+                                    try { for (const v of document.querySelectorAll('video, source')) if (v.src) out.push(v.src); } catch(e) {}
+                                    try { const html = document.documentElement.innerHTML || ''; const re = /https?:[^\\\"'\\s]+\\.m3u8(?:\\?[^\\\"'\\s<]*)?/gi; const m = html.match(re) || []; out.push(...m); } catch(e) {}
                                     return out;
                                 }""")
                                 for item in found or []:
                                     if isinstance(item, str) and ".m3u8" in item and item not in captured: captured.append(item)
-                            except Exception:
-                                pass
-
+                            except Exception: pass
                         raw_cookies = await context.cookies()
-                        if raw_cookies:
-                            task.metadata["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
+                        if raw_cookies: task.metadata["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
                     finally:
-                        await context.close()
-                        task.metadata.pop("browser_page", None)
-
-                    if captured:
-                        return captured[0]
+                        await context.close(); task.metadata.pop("browser_page", None)
+                    if captured: return captured[0]
                 return None
             finally:
-                task.metadata.pop("browser_page", None)
-                task.metadata.pop("browser", None)
-                await browser.close()
+                task.metadata.pop("browser_page", None); task.metadata.pop("browser", None); await browser.close()
 
     @staticmethod
     async def _fetch_text(session, url: str) -> str:
         async with session.get(url) as response:
-            response.raise_for_status()
-            return await response.text()
+            response.raise_for_status(); return await response.text()
 
     @staticmethod
     def _best_variant(base_url: str, playlist: str) -> str:
         lines = [line.strip() for line in playlist.splitlines()]
-        variants: list[tuple[int, str]] = []
-        pending = 0
+        variants: list[tuple[int, str]] = []; pending = 0
         for line in lines:
             if line.startswith("#EXT-X-STREAM-INF:"):
-                match = re.search(r"(?:RESOLUTION|BANDWIDTH)=(?:\d+x)?(\d+)", line)
-                pending = int(match.group(1)) if match else 0
+                match = re.search(r"(?:RESOLUTION|BANDWIDTH)=(?:\d+x)?(\d+)", line); pending = int(match.group(1)) if match else 0
             elif pending and line and not line.startswith("#"):
                 variants.append((pending, urljoin(base_url, line))); pending = 0
         return max(variants, key=lambda x: x[0])[1] if variants else base_url
@@ -295,9 +270,7 @@ class HybridDownloader:
         headers = task.metadata.get("headers") or {}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=60), headers=headers) as session:
             async with session.get(url, allow_redirects=True) as response:
-                response.raise_for_status()
-                content_type = (response.headers.get("Content-Type") or "").lower()
-                final_url = str(response.url).lower()
+                response.raise_for_status(); content_type = (response.headers.get("Content-Type") or "").lower(); final_url = str(response.url).lower()
                 if content_type.startswith(("text/html", "text/plain", "application/json")): raise DownloadError(f"Direct response is not media ({content_type or 'unknown'})")
                 if not any(x in final_url for x in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".m3u8", ".mpd")) and not content_type.startswith(("video/", "audio/", "application/octet-stream")): raise DownloadError(f"Direct response is not recognized media ({content_type or 'unknown'})")
                 total = int(response.headers.get("Content-Length") or 0) or None; done = 0
@@ -326,11 +299,9 @@ class HybridDownloader:
         if not binary: raise DownloadError("ffmpeg is not installed")
         command = [binary, "-hide_banner", "-loglevel", "error", "-y"]
         if headers:
-            header_text = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-            command += ["-headers", header_text]
+            header_text = "".join(f"{k}: {v}\r\n" for k, v in headers.items()); command += ["-headers", header_text]
         command += ["-i", url, "-c", "copy", str(output)]
-        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        task.register_process(proc)
+        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE); task.register_process(proc)
         try:
             while proc.returncode is None:
                 task.check_cancelled()
@@ -346,8 +317,7 @@ class HybridDownloader:
         command = [binary, "-m", "yt_dlp"] if binary == sys.executable else [binary]
         if task.metadata.get("cookiefile"): command += ["--cookies", str(task.metadata["cookiefile"])]
         command += ["--newline", "--no-part", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(output), url]
-        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        task.register_process(proc)
+        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT); task.register_process(proc)
         try:
             while True:
                 task.check_cancelled(); line = await proc.stdout.readline()
@@ -363,7 +333,7 @@ class HybridDownloader:
         await self._ffmpeg(stream, output, task, progress)
 
     @staticmethod
-    async def _report(callback, percent, current, total, speed):
+    async def _report(callback, percent, current, total, speed, details=None):
         if callback:
-            result = callback(percent, current, total, speed)
+            result = callback(percent, current, total, speed, details)
             if asyncio.iscoroutine(result): await result
