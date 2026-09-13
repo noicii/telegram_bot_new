@@ -41,7 +41,6 @@ class Pipeline:
         for path in await self.db.get_cleanup_paths():
             await remove_artifact_async(path)
         await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
-
         await self.upload.start()
         await self.download.start()
         self._started = True
@@ -147,13 +146,14 @@ class Pipeline:
         current = args[2] if len(args) > 2 else 0
         total = args[3] if len(args) > 3 else 0
         speed = args[4] if len(args) > 4 else 0
-        eta = args[5] if len(args) > 5 else 0
+        eta = args[5] if len(args) > 5 and not isinstance(args[5], dict) else 0
+        details = args[6] if len(args) > 6 and isinstance(args[6], dict) else (args[5] if len(args) > 5 and isinstance(args[5], dict) else None)
         try:
             await self.db.update_progress(task_id, progress=percent or 0, speed=speed or 0, eta=eta or 0)
         except Exception:
             logger.debug("progress persistence failed for %s", task_id, exc_info=True)
         if self.on_progress:
-            result = self.on_progress(kind, task_id, percent, current, total, speed, eta)
+            result = self.on_progress(kind, task_id, percent, current, total, speed, eta, details)
             if asyncio.iscoroutine(result):
                 await result
 
