@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Awaitable, Callable, Any
 
 from pyrogram import Client
-from pyrogram.errors import FloodWait
 
 from app.core.task import TaskCancelled, TaskContext
+from app.core.telegram_gate import TelegramFloodGate
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[..., Awaitable[None] | None]
@@ -32,9 +32,10 @@ class UploadError(Exception):
 
 
 class UploadEngine:
-    def __init__(self, client: Client, *, retries: int = 3):
+    def __init__(self, client: Client, *, retries: int = 3, telegram_gate: TelegramFloodGate | None = None):
         self.client = client
         self.retries = max(0, int(retries))
+        self.telegram_gate = telegram_gate or TelegramFloodGate(upload_max=1)
 
     async def upload(self, task: TaskContext, file_path: str | Path, *, chat_id: int | str,
                      caption: str | None = None, thumbnail: str | Path | None = None,
@@ -188,10 +189,23 @@ class UploadEngine:
             for attempt in range(self.retries + 1):
                 task.check_cancelled()
                 try:
-                    result = await self._send(task, path, chat_id=chat_id, caption=caption, thumbnail=thumbnail,
-                        mode=mode, title=title, duration=duration, width=width, height=height,
-                        supports_streaming=supports_streaming, progress=pyrogram_progress,
-                        reply_to_message_id=reply_to_message_id)
+                    result = await self.telegram_gate.run_upload(
+                        lambda: self._send(
+                            task,
+                            path,
+                            chat_id=chat_id,
+                            caption=caption,
+                            thumbnail=thumbnail,
+                            mode=mode,
+                            title=title,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            supports_streaming=supports_streaming,
+                            progress=pyrogram_progress,
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                    )
                     task.check_cancelled()
                     await report(total, force=True)
                     return result
@@ -199,10 +213,6 @@ class UploadEngine:
                     raise
                 except asyncio.CancelledError:
                     raise
-                except FloodWait as exc:
-                    if attempt >= self.retries:
-                        raise UploadError(f"Telegram FloodWait: {exc.value}s") from exc
-                    await asyncio.sleep(exc.value)
                 except Exception as exc:
                     if attempt >= self.retries:
                         raise UploadError(str(exc)) from exc
