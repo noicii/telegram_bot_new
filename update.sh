@@ -89,9 +89,11 @@ sudo systemctl is-active "$SERVICE" >/dev/null || {
 }
 sudo systemctl --no-pager --full status "$SERVICE" || true
 
-log "Verifying exactly one V2 process"
-mapfile -t RUNNING < <(pgrep -u "$(id -u)" -f "python.*$ROOT/bot_vnext/main.py" || true)
-[ "${#RUNNING[@]}" -eq 1 ] || fail "Expected exactly 1 V2 main.py process, found ${#RUNNING[@]}"
+log "Verifying exactly one V2 Python process"
+# systemd's flock wrapper command line also contains the Python command.
+# Count only the real interpreter whose executable path starts the command.
+mapfile -t RUNNING < <(pgrep -u "$(id -u)" -x -f "$PYTHON_BIN[[:space:]]+$ROOT/bot_vnext/main.py([[:space:]]|$)" || true)
+[ "${#RUNNING[@]}" -eq 1 ] || fail "Expected exactly 1 V2 Python process, found ${#RUNNING[@]}"
 
 log "Clean deployment completed successfully"
 echo "Branch: $BRANCH"
