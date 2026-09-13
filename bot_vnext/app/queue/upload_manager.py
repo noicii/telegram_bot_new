@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from app.core.task import TaskCancelled, TaskContext
+from app.core.telegram_gate import TelegramFloodGate
 from app.queue.worker_pool import QueueItem, WorkerPool
 from app.storage.database import Database
 from app.uploader.engine import UploadEngine
@@ -29,8 +30,10 @@ class UploadManager:
         on_complete: Callable[[QueueItem], Awaitable[None]] | None = None,
         on_failed: Callable[[QueueItem, Exception], Awaitable[None]] | None = None,
         delete_after_upload: bool = True,
+        telegram_gate: TelegramFloodGate | None = None,
     ):
-        self.engine = UploadEngine(client, retries=retries)
+        self.telegram_gate = telegram_gate or TelegramFloodGate(upload_max=workers)
+        self.engine = UploadEngine(client, retries=retries, telegram_gate=self.telegram_gate)
         self.database = database
         self.on_progress = on_progress
         self.on_complete = on_complete
@@ -96,12 +99,13 @@ class UploadManager:
                 await self.database.mark_uploading(item.task_id)
 
             logger.info(
-                "upload START task=%s file=%s size=%.1fMiB destination=%s mode=%s",
+                "upload START task=%s file=%s size=%.1fMiB destination=%s mode=%s gate_limit=%s",
                 item.task_id,
                 file_path,
                 file_path.stat().st_size / 1024 / 1024 if file_path.is_file() else 0,
                 destination,
                 payload.get("mode", "video"),
+                self.telegram_gate.upload_limit,
             )
 
             result = await self.engine.upload(
@@ -123,11 +127,12 @@ class UploadManager:
 
             message_id = getattr(result, "id", None)
             logger.info(
-                "upload SUCCESS task=%s destination=%s message_id=%s file=%s",
+                "upload SUCCESS task=%s destination=%s message_id=%s file=%s gate_limit=%s",
                 item.task_id,
                 destination,
                 message_id,
                 file_path,
+                self.telegram_gate.upload_limit,
             )
 
             if self.database:
