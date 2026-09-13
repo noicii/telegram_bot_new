@@ -164,11 +164,21 @@ class Pipeline:
         await self._forward_progress("upload", args)
 
     async def _download_complete(self, item: QueueItem, path: Path):
-        await self.db.update_task(str(item.task_id), status="uploading", file_path=str(path), progress=0)
+        task_id = str(item.task_id)
+        destination = item.payload.get("chat_id")
+        logger.info(
+            "download COMPLETE task=%s file=%s size=%.1fMiB; handing off to upload destination=%s",
+            task_id,
+            path,
+            path.stat().st_size / 1024 / 1024 if path.is_file() else 0,
+            destination,
+        )
+        await self.db.update_task(task_id, status="uploading", file_path=str(path), progress=0)
         payload = dict(item.payload)
         payload["file_path"] = str(path)
         payload["task_type"] = "upload"
         await self.upload.submit(item.task_id, payload)
+        logger.info("upload QUEUED task=%s file=%s", task_id, path)
 
     async def _download_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
