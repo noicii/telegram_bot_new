@@ -109,8 +109,8 @@ Do not copy an old `venv`, database, downloads folder, logs, or temporary split 
 
 ## Security
 
-The bot is designed around owner-only command/callback checks. Keep `OWNER_ID`, `BOT_TOKEN`, `API_HASH`, and other secrets private. GitHub's repository security features such as secret scanning and push protection are useful safeguards for repositories containing application code. citeturn0search1
+The bot is designed around owner-only command/callback checks. Keep `OWNER_ID`, `BOT_TOKEN`, `API_HASH`, and other secrets private. Use GitHub's secret scanning/push protection and related repository security features where available.
 
 ## Documentation rule
 
-When changing production behavior, update the relevant documentation and add a dated `CHANGELOG.md` entry. Keep this README short and use the linked documents for detailed operational information; this follows the general GitHub README guidance that a README should orient users and link to deeper documentation. citeturn0search0
+When changing production behavior, update the relevant documentation and add a dated `CHANGELOG.md` entry. Keep this README as the navigation/overview page and put detailed operational procedures in the linked documents.
