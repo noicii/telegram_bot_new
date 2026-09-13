@@ -16,16 +16,10 @@ logger = logging.getLogger(__name__)
 class DownloadManager:
     """Own exactly N download workers and isolate every task's cancellation."""
 
-    def __init__(
-        self,
-        output_dir: str | Path,
-        workers: int = 2,
-        retries: int = 2,
-        database=None,
-        on_progress: Callable[..., Awaitable[None] | None] | None = None,
-        on_complete: Callable[[QueueItem, Path], Awaitable[None]] | None = None,
-        on_failed: Callable[[QueueItem, Exception], Awaitable[None]] | None = None,
-    ):
+    def __init__(self, output_dir: str | Path, workers: int = 2, retries: int = 2, database=None,
+                 on_progress: Callable[..., Awaitable[None] | None] | None = None,
+                 on_complete: Callable[[QueueItem, Path], Awaitable[None]] | None = None,
+                 on_failed: Callable[[QueueItem, Exception], Awaitable[None]] | None = None):
         self.engine = HybridDownloader(output_dir, retries=retries)
         self.database = database
         self.on_progress = on_progress
@@ -74,20 +68,16 @@ class DownloadManager:
                 if asyncio.iscoroutine(result):
                     await result
 
+        expected_path = self.engine.output_dir / payload["filename"]
         try:
             if key in self._cancelled:
                 raise TaskCancelled(f"Download task {item.task_id} cancelled before start")
 
             ctx.metadata.update(payload.get("metadata") or {})
             if self.database:
-                await self.database.update_task(key, status="downloading")
+                await self.database.update_task(key, status="downloading", file_path=str(expected_path))
 
-            result = await self.engine.download(
-                payload["url"],
-                ctx,
-                payload["filename"],
-                progress=report,
-            )
+            result = await self.engine.download(payload["url"], ctx, payload["filename"], progress=report)
             ctx.check_cancelled()
             if self.on_complete:
                 await self.on_complete(item, result)
@@ -114,7 +104,6 @@ class DownloadManager:
         return self.pool.qsize()
 
     def active_workers(self) -> int:
-        """Return the number of currently processing download tasks."""
         return len(self.running_tasks)
 
     async def stop(self) -> None:
