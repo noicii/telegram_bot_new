@@ -24,7 +24,7 @@ bot_vnext/main.py
       |   Downloader Engine
       |       |
       |       +--> direct download
-      |       +--> HLS Multi (16 segments/video)
+      |       +--> HLS Multi (16 segments/video target)
       |       +--> FFmpeg mux/remux
       |
       +--> UploadManager (4 workers)
@@ -42,13 +42,13 @@ bot_vnext/main.py
 |---|---:|
 | Download workers | 2 |
 | Upload workers | 4 |
-| HLS segment concurrency per video | **16** |
+| HLS segment concurrency per video | **16 target** |
 | HTTP connector total limit | 150 |
 | HTTP connector per-host limit | 40 |
 | HLS segment retries | 3 attempts |
 | Retry delays | 1s, 2s |
 
-The HLS implementation uses a semaphore for per-video segment concurrency and creates one async fetch task per segment. The active V2 value is 16.
+The HLS implementation is intended to use a semaphore for per-video segment concurrency. Verify the active source before treating a concurrency change as deployed.
 
 ## Queue / status
 
@@ -57,12 +57,38 @@ The HLS implementation uses a semaphore for per-video segment concurrency and cr
 - Upload progress is persisted and forwarded to the live dashboard.
 - Cancellation is propagated through the task context and upload manager.
 - The local SQLite database is disposable for deployments; a fresh update intentionally removes the old DB/queue state.
+- Interrupted `downloading`/`uploading` tasks are marked failed on restart and are not automatically resumed.
+
+## Media / storage lifecycle
+
+- `downloads/` is temporary staging storage, not permanent media storage.
+- Active download paths are recorded in the database so automatic cleanup can protect them.
+- Failed downloads delete their local artifacts immediately.
+- Cancelled downloads/uploads delete their local artifacts immediately.
+- Successful uploads delete the source media immediately.
+- Large-upload FFmpeg split parts are temporary and are removed after success or failure.
+- Old interrupted artifacts are removed at startup rather than resumed.
+- Stale `.part`, `.tmp`, `.ytdl`, and abandoned split directories are automatically cleaned.
+
+### Automatic disk cleanup
+
+`bot_vnext/app/storage/cleanup.py` enforces the following policy:
+
+- **80% disk usage:** pressure cleanup starts.
+- **90% disk usage:** treated as critical pressure.
+- **70% target:** cleanup removes the oldest non-active media until usage is back around this level.
+- Cleanup runs at startup, every 30 seconds, after task completion/failure/cancellation, and during shutdown.
+- Cleanup never removes an active task path.
+- Startup cleanup runs before SQLite initialization so a full disk can be relieved before SQLite needs to write.
+
+See `bot_vnext/STORAGE_CLEANUP.md` for the complete lifecycle and operational rules.
 
 ## Upload
 
 - Upload manager has 4 workers.
 - Upload engine reports final progress after the Telegram send operation returns.
-- Completed files may be deleted according to the upload manager configuration.
+- Files larger than 2000 MiB are automatically split into upload-safe parts targeting about 1900 MiB.
+- Completed/failed upload artifacts are deleted automatically.
 
 ## Dashboard / commands
 
@@ -89,7 +115,7 @@ Do **not** manually mix old local Python files with GitHub code. Use `./update.s
 
 ## Important maintenance rule
 
-If a future change affects download concurrency, queue state, upload behavior, metadata handling, startup, or deployment, update this document and `CHANGELOG.md` in the same change.
+If a future change affects download concurrency, queue state, upload behavior, metadata handling, storage cleanup, startup, or deployment, update this document and `CHANGELOG.md` in the same change.
 
 ## Known architecture warning
 
