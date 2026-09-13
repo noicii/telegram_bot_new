@@ -232,7 +232,7 @@ class V2Bot:
         except Exception: pass
 async def run():
     if not BOT_TOKEN or not API_ID or not API_HASH or not OWNER_ID: raise RuntimeError("API_ID, API_HASH, BOT_TOKEN and OWNER_ID must be configured")
-    app=Client("telegram_bot_v2",api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,workdir=str(ROOT/"data")); bot=V2Bot(app)
+    app=Client("telegram_bot_v2",api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,max_concurrent_transmissions=4,workdir=str(ROOT/"data")); bot=V2Bot(app)
     app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
     async with app:
         await bot.start()
