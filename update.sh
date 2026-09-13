@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Canonical production updater: systemd is the only supported bot launcher.
-# .env and the virtualenv survive; disposable runtime state is reset.
+# Canonical production updater.
+# There is exactly ONE supported deployment path:
+#   git fetch/reset -> install tracked systemd unit -> install deps/checks -> start systemd
+# .env and the virtualenv are preserved. Disposable runtime state is reset.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 BRANCH="bot-vnext"
 REMOTE="origin"
 PYTHON_BIN="$ROOT/venv/bin/python"
 PIP_BIN="$ROOT/venv/bin/pip"
-SERVICE="${BOT_SERVICE:-telegram-bot.service}"
+SERVICE="telegram-bot.service"
 
 log(){ printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 
 [ -d .git ] || fail "Run this from ~/telegram_bot_new (Git repository root)."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required for production."
-systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$SERVICE" || fail "$SERVICE not installed. Install the tracked service file first. No fallback launcher is used."
+command -v git >/dev/null 2>&1 || fail "git is required."
 
-log "Stopping canonical service"
-sudo systemctl stop "$SERVICE" || true
+log "Stopping canonical service (if installed)"
+sudo systemctl stop "$SERVICE" >/dev/null 2>&1 || true
 
 log "Stopping any leftover V2 main.py process"
 mapfile -t PIDS < <(pgrep -u "$(id -u)" -f "$ROOT/bot_vnext/main.py" || true)
@@ -43,13 +45,20 @@ git reset --hard "$REMOTE/$BRANCH"
 
 log "Removing stale local files"
 git clean -fdx -e .env -e venv/ -e .venv/
-rm -f bot_vnext.db
+rm -f bot_vnext.db bot_vnext/app/storage/bot_vnext.db
 rm -rf backup_upload_rebuild_* 2>/dev/null || true
 find . -type d -name __pycache__ -prune -exec rm -rf {} +
 
+SERVICE_FILE="$ROOT/telegram-bot.service"
+[ -f "$SERVICE_FILE" ] || fail "Tracked service file missing after Git reset: $SERVICE_FILE"
+
+log "Installing canonical systemd service"
+sudo install -m 0644 "$SERVICE_FILE" "/etc/systemd/system/$SERVICE"
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE" >/dev/null
+
 ACTIVE_HLS="$ROOT/bot_vnext/app/downloader/engine.py"
 [ -f "$ACTIVE_HLS" ] || fail "Active V2 downloader not found: $ACTIVE_HLS"
-sed -i 's/asyncio\.Semaphore(4)/asyncio.Semaphore(16)/g; s/4 segments download concurrently/16 segments download concurrently/g' "$ACTIVE_HLS"
 
 log "Preparing Python environment"
 if [ ! -x "$PYTHON_BIN" ]; then python3 -m venv "$ROOT/venv"; fi
@@ -67,14 +76,17 @@ log "Running syntax checks"
 log "Verifying active HLS concurrency"
 grep -nE 'Semaphore\(16\)|16 segments download concurrently' "$ACTIVE_HLS" || fail "HLS concurrency is not 16"
 
-log "Installing/updating canonical systemd service"
-sudo install -m 0644 "$ROOT/telegram-bot.service" "/etc/systemd/system/$SERVICE"
-sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE" >/dev/null
+log "Verifying canonical systemd unit"
+sudo systemctl cat "$SERVICE" >/dev/null || fail "Canonical systemd unit is not available after installation."
+sudo systemctl is-enabled "$SERVICE" >/dev/null || fail "Canonical systemd service is not enabled."
 
 log "Starting canonical service"
 sudo systemctl start "$SERVICE"
 sleep 3
+sudo systemctl is-active "$SERVICE" >/dev/null || {
+  sudo systemctl --no-pager --full status "$SERVICE" || true
+  fail "Canonical service failed to start."
+}
 sudo systemctl --no-pager --full status "$SERVICE" || true
 
 log "Verifying exactly one V2 process"
