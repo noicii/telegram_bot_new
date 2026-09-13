@@ -12,10 +12,10 @@ from app.queue.upload_manager import UploadManager
 from app.storage.database import Database
 from app.storage.cleanup import cleanup_download_artifacts_async, remove_artifact_async
 from app.downloader.method_store import get_default_method
+from app.core.telegram_gate import TelegramFloodGate
 
 logger = logging.getLogger(__name__)
 CLEANUP_INTERVAL_SECONDS = 30
-PROGRESS_FORWARD_INTERVAL_SECONDS = 3.0
 
 
 class Pipeline:
@@ -28,11 +28,19 @@ class Pipeline:
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_failed = on_failed
-        self.upload = UploadManager(client, workers=4, database=self.db, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
+        self.telegram_gate = TelegramFloodGate(upload_max=4)
+        # Pyrogram defaults to automatically sleeping for short FloodWaits.
+        # Disable that hidden retry so the shared gate sees Telegram's exact
+        # wait signal and can coordinate the queue instead of letting several
+        # workers independently sleep/retry.
+        try:
+            client.sleep_threshold = 0
+        except Exception:
+            logger.debug("could not set Pyrogram sleep_threshold=0", exc_info=True)
+        self.upload = UploadManager(client, workers=4, database=self.db, telegram_gate=self.telegram_gate, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
         self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
         self._cleanup_task: asyncio.Task | None = None
-        self._last_progress_forward: dict[str, float] = {}
 
     async def start(self) -> None:
         if self._started:
@@ -150,19 +158,19 @@ class Pipeline:
         speed = args[4] if len(args) > 4 else 0
         eta = args[5] if len(args) > 5 and not isinstance(args[5], dict) else 0
         details = args[6] if len(args) > 6 and isinstance(args[6], dict) else (args[5] if len(args) > 5 and isinstance(args[5], dict) else None)
-        now = asyncio.get_running_loop().time()
-        is_final = float(percent or 0) >= 100.0
-        if not is_final and now - self._last_progress_forward.get(task_id, 0.0) < PROGRESS_FORWARD_INTERVAL_SECONDS:
-            return
-        self._last_progress_forward[task_id] = now
         try:
             await self.db.update_progress(task_id, progress=percent or 0, speed=speed or 0, eta=eta or 0)
         except Exception:
             logger.debug("progress persistence failed for %s", task_id, exc_info=True)
         if self.on_progress:
-            result = self.on_progress(kind, task_id, percent, current, total, speed, eta, details)
-            if asyncio.iscoroutine(result):
-                await result
+            async def render_latest() -> None:
+                result = self.on_progress(kind, task_id, percent, current, total, speed, eta, details)
+                if asyncio.iscoroutine(result):
+                    await result
+            row = await self.db.get_task(task_id)
+            chat_id = int(row["chat_id"]) if row and row.get("chat_id") else None
+            if chat_id is not None:
+                await self.telegram_gate.publish_dashboard(str(chat_id), render_latest)
 
     async def _download_progress(self, *args):
         await self._forward_progress("download", args)
@@ -203,7 +211,11 @@ class Pipeline:
         await self.db.mark_completed(task_id)
         await self._cleanup_now()
         if self.on_complete:
-            await self.on_complete(task_id)
+            async def render_complete() -> None:
+                await self.on_complete(task_id)
+            chat_id = int(task.get("chat_id")) if task and task.get("chat_id") else None
+            if chat_id is not None:
+                await self.telegram_gate.publish_dashboard(str(chat_id), render_complete)
 
     async def _upload_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
@@ -212,7 +224,11 @@ class Pipeline:
             await remove_artifact_async(item.payload["file_path"])
         await self._cleanup_now()
         if self.on_failed:
-            await self.on_failed(task_id, error)
+            async def render_failed() -> None:
+                await self.on_failed(task_id, error)
+            chat_id = int(item.payload.get("chat_id")) if item.payload.get("chat_id") else None
+            if chat_id is not None:
+                await self.telegram_gate.publish_dashboard(str(chat_id), render_failed)
 
     async def stop(self) -> None:
         if not self._started:
@@ -224,4 +240,5 @@ class Pipeline:
         self._cleanup_task = None
         await self.download.stop()
         await self.upload.stop()
+        await self.telegram_gate.close()
         await self._cleanup_now()
