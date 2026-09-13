@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Video Downloader Bot V2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=benoicii
+WorkingDirectory=/home/benoicii/telegram_bot_new/bot_vnext
+ExecStart=/home/benoicii/telegram_bot_new/venv/bin/python /home/benoicii/telegram_bot_new/bot_vnext/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
