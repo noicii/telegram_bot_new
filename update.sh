@@ -24,13 +24,13 @@ log "Stopping canonical service (if installed)"
 sudo systemctl stop "$SERVICE" >/dev/null 2>&1 || true
 
 log "Stopping any leftover V2 main.py process"
-mapfile -t PIDS < <(pgrep -u "$(id -u)" -f "$ROOT/bot_vnext/main.py" || true)
+mapfile -t PIDS < <(pgrep -u "$(id -u)" -f "python.*$ROOT/bot_vnext/main.py" || true)
 for pid in "${PIDS[@]}"; do
   [ "$pid" = "$$" ] && continue
   kill "$pid" 2>/dev/null || true
 done
 if [ "${#PIDS[@]}" -gt 0 ]; then sleep 2; fi
-mapfile -t PIDS2 < <(pgrep -u "$(id -u)" -f "$ROOT/bot_vnext/main.py" || true)
+mapfile -t PIDS2 < <(pgrep -u "$(id -u)" -f "python.*$ROOT/bot_vnext/main.py" || true)
 for pid in "${PIDS2[@]}"; do
   [ "$pid" = "$$" ] && continue
   kill -9 "$pid" 2>/dev/null || true
@@ -90,7 +90,7 @@ sudo systemctl is-active "$SERVICE" >/dev/null || {
 sudo systemctl --no-pager --full status "$SERVICE" || true
 
 log "Verifying exactly one V2 process"
-mapfile -t RUNNING < <(pgrep -u "$(id -u)" -f "$ROOT/bot_vnext/main.py" || true)
+mapfile -t RUNNING < <(pgrep -u "$(id -u)" -f "python.*$ROOT/bot_vnext/main.py" || true)
 [ "${#RUNNING[@]}" -eq 1 ] || fail "Expected exactly 1 V2 main.py process, found ${#RUNNING[@]}"
 
 log "Clean deployment completed successfully"
