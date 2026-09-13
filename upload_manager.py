@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from config import MAX_CONCURRENT_UPLOADS
+from config import MAX_CONCURRENT_UPLOADS, MAX_CONCURRENT_DOWNLOADS
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +10,45 @@ _workers = []
 _pipeline = None
 _running = False
 _jobs = {}
+
+
+def _compact_status_text():
+    from database import get_queue_counts_db, get_queue_tasks_db
+    from downloader import LIVE_TASKS
+
+    counts = get_queue_counts_db()
+    downloading = 0
+    uploading = 0
+
+    for task in get_queue_tasks_db():
+        if task.get("status") != "processing":
+            continue
+        live = LIVE_TASKS.get(str(task.get("id")), {})
+        operation = str(live.get("operation") or "").lower()
+        if "upload" in operation:
+            uploading += 1
+        else:
+            downloading += 1
+
+    return "\n".join([
+        "📊 **QUEUE STATUS**",
+        "",
+        f"⬇️ Downloads: {downloading}/{MAX_CONCURRENT_DOWNLOADS}",
+        f"⬆️ Uploads: {uploading}/{MAX_CONCURRENT_UPLOADS}",
+        "",
+        f"⏳ Queue: {int(counts.get('pending', 0))}",
+        f"✅ Done: {int(counts.get('completed', 0))}",
+        f"❌ Failed: {int(counts.get('failed', 0))}",
+    ])
+
+
+# Handlers still contains the previous verbose status builder. Install the
+# compact dashboard centrally so /status and the status button cannot regress.
+try:
+    import handlers as _handlers
+    _handlers.build_status_text = _compact_status_text
+except Exception:
+    logger.exception("Could not install compact status dashboard")
 
 
 async def start(pipeline):
