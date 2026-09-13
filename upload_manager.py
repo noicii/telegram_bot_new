@@ -8,17 +8,15 @@ logger = logging.getLogger(__name__)
 _queue = None
 _workers = []
 _pipeline = None
-_client = None
 _running = False
 _jobs = {}
 
 
-async def start(pipeline, client):
-    global _queue, _pipeline, _client, _running, _workers
+async def start(pipeline):
+    global _queue, _pipeline, _running, _workers
     if _running:
         return
     _pipeline = pipeline
-    _client = client
     _queue = asyncio.Queue()
     _running = True
     _workers = [asyncio.create_task(_worker(i + 1)) for i in range(MAX_CONCURRENT_UPLOADS)]
@@ -34,6 +32,7 @@ async def _worker(worker_id):
 
         task_id = job["task_id"]
         future = job["future"]
+        client = job["args"][0]
         try:
             if future.cancelled():
                 continue
@@ -55,7 +54,7 @@ async def _worker(worker_id):
                         speed_mb=0,
                         eta="—",
                     )
-                    await update_batch_summary_message(_client, task)
+                    await update_batch_summary_message(client, task)
             except Exception:
                 logger.exception("Could not refresh upload dashboard for task %s", task_id)
 
@@ -90,7 +89,7 @@ async def enqueue(task_id, args):
 
 
 async def stop():
-    global _running, _queue, _workers, _pipeline, _client
+    global _running, _queue, _workers, _pipeline
     _running = False
     workers = list(_workers)
     for worker in workers:
@@ -101,7 +100,6 @@ async def stop():
     _jobs.clear()
     _queue = None
     _pipeline = None
-    _client = None
     logger.info("Upload pool stopped")
 
 
