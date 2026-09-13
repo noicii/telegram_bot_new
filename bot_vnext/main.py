@@ -83,7 +83,22 @@ class V2Bot:
         method_line = f"🎯 **Selected method:** {method_label(default_method)}"
         if method_counts:
             method_line += "\n📌 **Active task methods:** " + " • ".join(f"{method_label(k)} ×{v}" for k, v in method_counts.items())
-        text = ("📊 **V2 QUEUE STATUS**\n\n" + method_line + "\n\n" + f"⬇️ Downloads: **{active_d}/2** active • {queued_d} queued\n" + f"⬆️ Uploads: **{active_u}/4** active • {queued_u} queued\n\n" + f"⏳ Download pending: {queued_d}\n⏳ Upload pending: {queued_u}\n✅ Done: {done}\n❌ Failed: {failed}\n🛑 Cancelled: {cancelled}")
+
+        disk = shutil.disk_usage(DOWNLOAD_DIR)
+        disk_used = disk.total - disk.free
+        disk_pct = (disk_used / disk.total * 100) if disk.total else 0
+        disk_icon = "🔴" if disk_pct >= 90 else "🟠" if disk_pct >= 80 else "🟢"
+        disk_used_gb = disk_used / (1024 ** 3)
+        disk_total_gb = disk.total / (1024 ** 3)
+        disk_free_gb = disk.free / (1024 ** 3)
+
+        text = ("📊 **V2 QUEUE STATUS**\n\n" + method_line + "\n\n" +
+                f"{disk_icon} **Disk:** {disk_used_gb:.1f}/{disk_total_gb:.1f} GB used • "
+                f"{disk_free_gb:.1f} GB free ({disk_pct:.0f}%)\n\n" +
+                f"⬇️ Downloads: **{active_d}/2** active • {queued_d} queued\n" +
+                f"⬆️ Uploads: **{active_u}/4** active • {queued_u} queued\n\n" +
+                f"⏳ Download pending: {queued_d}\n⏳ Upload pending: {queued_u}\n"
+                f"✅ Done: {done}\n❌ Failed: {failed}\n🛑 Cancelled: {cancelled}")
         await message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="v2:status")], [InlineKeyboardButton("🎯 Change Method", callback_data="v2:methodmenu"), InlineKeyboardButton("📋 Queue", callback_data="v2:queue")], [InlineKeyboardButton("⚙️ Settings", callback_data="v2:settings")]]))
 
     async def queue_cmd(self, client, message):
