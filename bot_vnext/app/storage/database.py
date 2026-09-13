@@ -114,10 +114,21 @@ class Database:
             conn.close()
 
     async def get_recoverable_tasks(self):
-        return await asyncio.to_thread(self._get_status_sync, ("queued", "downloading", "uploading"))
+        return await self._get_statuses(("queued",))
 
     async def get_queued_tasks(self):
-        return await asyncio.to_thread(self._get_status_sync, ("queued",))
+        return await self._get_statuses(("queued",))
+
+    async def get_cleanup_paths(self):
+        rows = await self._get_statuses(("failed", "cancelled", "completed"))
+        return [str(row["file_path"]) for row in rows if row.get("file_path")]
+
+    async def get_active_paths(self):
+        rows = await self._get_statuses(("queued", "downloading", "uploading"))
+        return {str(row["file_path"]) for row in rows if row.get("file_path")}
+
+    async def _get_statuses(self, statuses):
+        return await asyncio.to_thread(self._get_status_sync, statuses)
 
     def _get_status_sync(self, statuses):
         marks = ",".join("?" for _ in statuses)
@@ -162,7 +173,9 @@ class Database:
         now = time.time()
         conn = self._connect()
         try:
-            conn.execute("UPDATE tasks SET status = 'queued', error = NULL, updated_at = ? WHERE status IN ('downloading', 'uploading')", (now,))
+            # Never resume an interrupted download/upload automatically.
+            # Its local artifact is disposable and will be cleaned on startup.
+            conn.execute("UPDATE tasks SET status = 'failed', error = 'Interrupted by bot restart', updated_at = ? WHERE status IN ('downloading', 'uploading')", (now,))
             conn.commit()
         finally:
             conn.close()
