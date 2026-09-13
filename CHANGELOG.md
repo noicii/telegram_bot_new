@@ -1,5 +1,16 @@
 # Changelog — Telegram Bot V2
 
+## 2026-09-14 — Adaptive Telegram FloodGate
+
+- Removed the fixed 3-second pipeline progress throttle.
+- Added a dedicated adaptive `TelegramFloodGate` for Telegram-facing upload and dashboard operations.
+- Upload FloodWaits now pause new Telegram send attempts and resume after Telegram's exact wait instead of cancelling the upload task.
+- Upload concurrency adapts between 1 and 4 based on observed FloodWait pressure and sustained successful sends.
+- Dashboard updates are coalesced to latest state; stale progress edits are not replayed after a FloodWait.
+- Dashboard messages are locally cached so routine progress refreshes no longer require an extra `get_messages` API request before every edit.
+- Pyrogram short FloodWait auto-sleep is disabled so the shared gate receives Telegram's exact FloodWait signal and coordinates retries centrally.
+- Existing 2 download workers, 4 upload workers, HLS 16-segment concurrency, destination routing, large-file splitting, thumbnail handling, and storage cleanup remain unchanged.
+
 ## 2026-09-13 — Canonical self-bootstrapping deployment
 
 - Reworked `update.sh` into the single canonical production deployment path.
