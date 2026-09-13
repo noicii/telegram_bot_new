@@ -14,6 +14,7 @@ from app.storage.cleanup import cleanup_download_artifacts_async, remove_artifac
 from app.downloader.method_store import get_default_method
 
 logger = logging.getLogger(__name__)
+CLEANUP_INTERVAL_SECONDS = 30
 
 
 class Pipeline:
@@ -29,19 +30,14 @@ class Pipeline:
         self.upload = UploadManager(client, workers=4, database=self.db, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
         self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
+        self._cleanup_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         if self._started:
             return
-        # Run filesystem cleanup before SQLite initialization. This is
-        # important when an old large download has filled the disk and SQLite
-        # cannot safely create/update its WAL files.
         await cleanup_download_artifacts_async(self.output_dir, force=True)
         await self.db.init()
         await self.db.recover_after_crash()
-
-        # Interrupted/failed/cancelled artifacts are never resumed and are
-        # removed before the new queue starts. Only queued work remains active.
         for path in await self.db.get_cleanup_paths():
             await remove_artifact_async(path)
         await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
@@ -49,7 +45,27 @@ class Pipeline:
         await self.upload.start()
         await self.download.start()
         self._started = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="disk-cleanup")
         await self._recover_queue()
+
+    async def _cleanup_loop(self) -> None:
+        while self._started:
+            try:
+                await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+                if not self._started:
+                    break
+                active = await self.db.get_active_paths()
+                await cleanup_download_artifacts_async(self.output_dir, active_paths=active)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("periodic disk cleanup failed")
+
+    async def _cleanup_now(self) -> None:
+        try:
+            await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+        except Exception:
+            logger.exception("disk cleanup failed")
 
     async def _recover_queue(self) -> None:
         for row in await self.db.get_queued_tasks():
@@ -85,7 +101,6 @@ class Pipeline:
         await self._dispatch_row(row)
 
     async def retry(self, task_id: int | str, method: str | None = None) -> bool:
-        """Retry a failed/cancelled task; downloads use the currently selected method."""
         task_id = str(task_id)
         task = await self.db.get_task(task_id)
         if not task or task.get("status") not in {"failed", "cancelled"}:
@@ -110,7 +125,7 @@ class Pipeline:
             task = await self.db.get_task(str(task_id))
             if task and task.get("file_path"):
                 await remove_artifact_async(task["file_path"])
-            await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+            await self._cleanup_now()
         return cancelled
 
     async def cancel_upload(self, task_id: int | str) -> bool:
@@ -120,7 +135,7 @@ class Pipeline:
             task = await self.db.get_task(str(task_id))
             if task and task.get("file_path"):
                 await remove_artifact_async(task["file_path"])
-            await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+            await self._cleanup_now()
         return cancelled
 
     async def cancel(self, task_id: int | str) -> bool:
@@ -159,19 +174,17 @@ class Pipeline:
         task_id = str(item.task_id)
         await self.db.mark_failed(task_id, str(error))
         await remove_artifact_async(item.payload.get("file_path") or (self.output_dir / item.payload.get("filename", f"{task_id}.mp4")))
-        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+        await self._cleanup_now()
         if self.on_failed:
             await self.on_failed(task_id, error)
 
     async def _upload_complete(self, item: QueueItem):
         task_id = str(item.task_id)
-        # UploadManager already removes the source immediately after a
-        # successful upload. This second cleanup is intentionally idempotent.
         task = await self.db.get_task(task_id)
         if task and task.get("file_path"):
             await remove_artifact_async(task["file_path"])
         await self.db.mark_completed(task_id)
-        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+        await self._cleanup_now()
         if self.on_complete:
             await self.on_complete(task_id)
 
@@ -180,13 +193,18 @@ class Pipeline:
         await self.db.mark_failed(task_id, str(error))
         if item.payload.get("file_path"):
             await remove_artifact_async(item.payload["file_path"])
-        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+        await self._cleanup_now()
         if self.on_failed:
             await self.on_failed(task_id, error)
 
     async def stop(self) -> None:
         if not self._started:
             return
+        self._started = False
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            await asyncio.gather(self._cleanup_task, return_exceptions=True)
+        self._cleanup_task = None
         await self.download.stop()
         await self.upload.stop()
-        self._started = False
+        await self._cleanup_now()
