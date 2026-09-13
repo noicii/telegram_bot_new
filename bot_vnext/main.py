@@ -184,7 +184,7 @@ class V2Bot:
             payload={"task_type":"download","url":item["url"],"filename":filename,"chat_id":message.chat.id,"caption":item.get("title") or s["series"],"thumbnail":str(THUMB_PATH) if THUMB_PATH.is_file() else None,"mode":"video","title":item.get("title"),"provider":item.get("source"),"resolution":item.get("resolution"),"metadata":md}
             try: await self.pipeline.submit(tid,payload)
             except Exception: logger.exception("queue submit failed for %s",tid)
-        self.sessions.pop(message.from_user.id,None); await self.render_dashboard(message.chat.id,dash.id,True)
+        await self.render_dashboard(message.chat.id,dash.id,True)
     async def render_dashboard(self,chat_id,message_id,force=False):
         if not self.pipeline or not message_id: return False
         async with self.lock(chat_id):
@@ -192,7 +192,7 @@ class V2Bot:
             if not force and now-self.dashboard_last_edit.get(chat_id,0)<1.2: return True
             rows=await self.pipeline.db.get_tasks(statuses=("queued","downloading","uploading"),limit=25); counts=await self.pipeline.db.counts(); d,u=counts.get("download",{}),counts.get("upload",{}); ad,au=self.pipeline.download.active_workers(),self.pipeline.upload.active_workers(); qd,qu=d.get("queued",0),u.get("queued",0)
             lines=["📊 **LIVE DOWNLOAD / UPLOAD**","",f"⬇️ Downloads: **{ad}/2 active** • {qd} queued",f"⬆️ Uploads: **{au}/4 active** • {qu} queued",""]
-            downs=[r for r in rows if r.get("status") in {"queued","downloading"}]; ups=[r for r in rows if r.get("status")=="uploading"}
+            downs=[r for r in rows if r.get("status") in {"queued","downloading"}]; ups=[r for r in rows if r.get("status")=="uploading"]
             if downs:
                 lines.append("📥 **DOWNLOADING**")
                 for n,r in enumerate(downs[:8],1):
