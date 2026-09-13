@@ -10,6 +10,7 @@ from app.core.task import TaskCancelled, TaskContext
 from app.queue.worker_pool import QueueItem, WorkerPool
 from app.storage.database import Database
 from app.uploader.engine import UploadEngine
+from config import DESTINATION_CHAT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class UploadManager:
                     await result
 
         file_path = Path(payload["file_path"])
+        destination = DESTINATION_CHAT_ID
         try:
             if key in self._cancelled:
                 raise TaskCancelled(f"Upload task {item.task_id} cancelled before start")
@@ -93,10 +95,19 @@ class UploadManager:
             if self.database:
                 await self.database.mark_uploading(item.task_id)
 
-            await self.engine.upload(
+            logger.info(
+                "upload START task=%s file=%s size=%.1fMiB destination=%s mode=%s",
+                item.task_id,
+                file_path,
+                file_path.stat().st_size / 1024 / 1024 if file_path.is_file() else 0,
+                destination,
+                payload.get("mode", "video"),
+            )
+
+            result = await self.engine.upload(
                 ctx,
                 file_path,
-                chat_id=payload["chat_id"],
+                chat_id=destination,
                 caption=payload.get("caption"),
                 thumbnail=payload.get("thumbnail"),
                 mode=payload.get("mode", "video"),
@@ -110,6 +121,15 @@ class UploadManager:
             )
             ctx.check_cancelled()
 
+            message_id = getattr(result, "id", None)
+            logger.info(
+                "upload SUCCESS task=%s destination=%s message_id=%s file=%s",
+                item.task_id,
+                destination,
+                message_id,
+                file_path,
+            )
+
             if self.database:
                 await self.database.mark_completed(item.task_id)
 
@@ -120,14 +140,20 @@ class UploadManager:
                 await self.on_complete(item)
 
         except TaskCancelled:
-            logger.info("upload task %s cancelled", item.task_id)
+            logger.info("upload CANCELLED task=%s destination=%s", item.task_id, destination)
             self._delete_file(file_path)
         except asyncio.CancelledError:
-            logger.info("upload task %s asyncio-cancelled", item.task_id)
+            logger.info("upload asyncio-CANCELLED task=%s destination=%s", item.task_id, destination)
             self._delete_file(file_path)
             raise
         except Exception as exc:
-            logger.exception("upload task %s failed", item.task_id)
+            logger.exception(
+                "upload FAILED task=%s destination=%s file=%s error=%s",
+                item.task_id,
+                destination,
+                file_path,
+                exc,
+            )
             if self.database:
                 await self.database.mark_failed(item.task_id, str(exc))
             if self.on_failed:
