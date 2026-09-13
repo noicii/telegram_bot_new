@@ -49,6 +49,10 @@ Do **not**:
 
 `update.sh` owns the complete deployment procedure and always installs the tracked `telegram-bot.service` from GitHub before starting the bot.
 
+## Service execution hardening
+
+The tracked systemd unit invokes the runner explicitly with `/usr/bin/bash`. Therefore the production service does not depend on the executable permission bit of `bot_vnext/run_service.sh`. The runner itself still owns the exclusive `flock` singleton lock before starting `bot_vnext/main.py`.
+
 ## Why the updater does not require the service to exist first
 
 The updater is intentionally **self-bootstrapping**. It does not fail merely because `telegram-bot.service` is missing or stale.
@@ -108,7 +112,7 @@ Production startup is exclusively:
 ```text
 systemd telegram-bot.service
         ↓
-bot_vnext/run_service.sh
+/usr/bin/bash run_service.sh
         ↓
 exclusive flock lock
         ↓
