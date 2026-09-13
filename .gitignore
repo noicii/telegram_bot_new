@@ -9,6 +9,8 @@ downloads/
 logs/
 data/
 
+test_results/
+
 assets/
 
 # Local development backups
