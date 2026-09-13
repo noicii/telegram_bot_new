@@ -2,6 +2,17 @@
 
 All important bot changes are recorded here so a new chat or deployment can quickly understand what changed and why.
 
+## 2026-09-13 — Automatic storage cleanup and restart safety
+
+- Added `bot_vnext/app/storage/cleanup.py` for automatic disk-pressure cleanup.
+- Cleanup triggers at 80% disk usage and removes oldest non-active media until usage is back to 70%; 90% is treated as critical pressure.
+- Cleanup runs at startup, every 30 seconds, and after download/upload completion, failure, cancellation, and shutdown.
+- Failed/cancelled media and generated split artifacts are deleted instead of accumulating on the VM.
+- Successful uploads delete the local source immediately.
+- Interrupted downloading/uploading tasks are no longer automatically resumed after a restart; their local artifacts are disposable and removed during startup cleanup.
+- Active download paths are recorded in the database so automatic cleanup cannot delete an in-progress file.
+- Added `bot_vnext/STORAGE_CLEANUP.md` documenting the complete media lifecycle, thresholds, restart behavior, and operational policy.
+
 ## 2026-09-13 — Automatic large-video upload splitting
 
 - Fixed V2 uploads failing when a downloaded video exceeded Telegram's 2000 MiB upload boundary.
