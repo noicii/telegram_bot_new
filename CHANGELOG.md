@@ -1,5 +1,15 @@
 # Changelog — Telegram Bot V2
 
+## 2026-09-13 — Canonical self-bootstrapping deployment
+
+- Reworked `update.sh` into the single canonical production deployment path.
+- Removed the fragile preflight that required `telegram-bot.service` to already exist before the updater could install/update it.
+- The updater now stops the service if present, fetches/resets `bot-vnext`, installs the tracked `telegram-bot.service`, reloads/enables systemd, validates the active V2 code, starts the service, and verifies exactly one V2 process.
+- Fixed the production service name to `telegram-bot.service` so different update paths cannot silently target different supervisors.
+- Removed the updater's runtime HLS `sed` mutation; HLS concurrency is now validated from tracked source instead of being changed during deployment.
+- Strengthened deployment documentation so future developers/AI agents have one update method and one failure/recovery procedure.
+- `.env` and the Python virtualenv remain preserved; disposable queue/database/runtime state remains intentionally reset.
+
 ## 2026-09-13 — Single-instance production service
 
 - Made `telegram-bot.service` the only supported production launcher.
