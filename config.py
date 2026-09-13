@@ -18,6 +18,7 @@ ADMIN_IDS = [OWNER_ID] if OWNER_ID else []
 
 
 DEFAULT_CHANNEL_ID = -1002067488300
+DESTINATION_CHAT_ID = int(os.getenv("DESTINATION_CHAT_ID", str(DEFAULT_CHANNEL_ID)))
 
 
 BASE_DIR = Path(__file__).resolve().parent
