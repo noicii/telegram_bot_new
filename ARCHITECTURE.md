@@ -53,12 +53,38 @@ HTTP connection settings currently are `limit=150` and `limit_per_host=40`.
 - Upload progress is forwarded to the dashboard and persisted.
 - Upload success => task becomes `completed` and completion callbacks refresh the UI.
 - Cancellation is propagated to the relevant task context.
+- There is **no fixed 3-second progress throttle** anymore; Telegram-facing dashboard updates are controlled by `TelegramFloodGate`.
+
+## Telegram FloodGate
+
+`bot_vnext/app/core/telegram_gate.py` is the shared Telegram-facing control layer.
+
+### Upload gate
+
+- starts with the existing 4-worker ceiling;
+- allows up to the current adaptive upload limit;
+- on `FloodWait`, pauses new Telegram send attempts for Telegram's exact requested duration;
+- does **not** cancel the owning upload task or delete its file;
+- lowers upload concurrency after FloodWait pressure;
+- cautiously raises concurrency again after sustained successful uploads;
+- ordinary network errors remain under the uploader's existing retry policy.
+
+### Dashboard gate
+
+- coalesces progress into the newest dashboard state;
+- never replays stale progress updates after a cooldown;
+- uses an adaptive interval instead of a fixed 3-second timer;
+- respects `FloodWait` exactly;
+- locally caches the persistent dashboard message so normal refreshes do not call `get_messages` before every edit;
+- gates only the persistent live-dashboard message, leaving selection/UI edits independent.
+
+Pyrogram's automatic short FloodWait sleep is disabled so the shared gate receives the server's exact FloodWait signal and can coordinate it centrally.
 
 ## Upload
 
 `bot_vnext/app/queue/upload_manager.py` schedules uploads with 4 workers.
 
-`bot_vnext/app/uploader/engine.py` performs Telegram sends and reports progress, including a forced final progress update after a successful send.
+`bot_vnext/app/uploader/engine.py` performs Telegram sends and reports progress, including a forced final progress update after a successful send. Telegram sends are routed through the shared FloodGate; FloodWait pauses/retries instead of cancelling the task.
 
 ## Database / queue
 
