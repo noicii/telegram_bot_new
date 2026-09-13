@@ -157,40 +157,50 @@ def _patch_cancel_handler():
 
 
 def _patch_upload_completion():
-    """Guarantee the live dashboard reaches 100% before DB completion."""
+    """Mark the live task at 100% immediately after Telegram accepts the file."""
     import handlers
 
-    original = getattr(handlers, "_run_upload_pipeline", None)
+    original = getattr(handlers, "finalize_queue_file", None)
     if original is None or getattr(original, "_hardened", False):
         return
 
-    async def hardened_upload(*args, **kwargs):
-        # task_id is the last positional argument in the existing function.
+    async def hardened_finalize(*args, **kwargs):
+        result = await original(*args, **kwargs)
         task_id = kwargs.get("task_id")
-        if task_id is None and len(args) >= 8:
-            task_id = args[7]
-        try:
-            result = await original(*args, **kwargs)
-            # The original pipeline marks the task completed and clears LIVE_TASKS.
-            # This hook intentionally does not rewrite that state after success.
-            return result
-        except asyncio.CancelledError:
-            raise
+        if task_id is None and len(args) >= 6:
+            task_id = args[5]
+        if task_id is not None:
+            try:
+                handlers.set_live_task(
+                    task_id,
+                    percent=100.0,
+                    current_mb=0.0,
+                    total_mb=0.0,
+                    speed_mb=0.0,
+                    eta="00:00",
+                    operation="Upload complete",
+                )
+            except Exception:
+                pass
+        return result
 
-    hardened_upload._hardened = True
-    handlers._run_upload_pipeline = hardened_upload
+    hardened_finalize._hardened = True
+    handlers.finalize_queue_file = hardened_finalize
 
 
 def apply():
     import downloader
     import queue_worker
 
+    # Requested target: 16 simultaneous HLS segment requests per video.
     downloader.PER_TASK_SEGMENT_CONCURRENCY = 16
     downloader.fetch_segment_with_backoff = _fetch_segment_with_backoff
     downloader.clean_full_video_title = _clean_full_video_title
 
+    # Queue claim is serialized at the SQLite transaction level.
     queue_worker.get_next_queued_task_db = _claim_next_queued_task_db
 
+    # Strip source/global metadata after all downloader transforms complete.
     original_download = downloader.download_single_item
     if not getattr(original_download, "_hardened", False):
         async def hardened_download(*args, **kwargs):
@@ -205,8 +215,7 @@ def apply():
         downloader.download_single_item = hardened_download
 
     # handlers is imported by bot.py after the first apply().
-    # If already imported, patch it immediately; bot.py calls apply() again
-    # after importing handlers as well.
+    # bot.py calls apply() again after handlers are loaded.
     try:
         _patch_cancel_handler()
         _patch_upload_completion()
