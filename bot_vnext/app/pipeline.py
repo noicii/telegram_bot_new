@@ -15,6 +15,7 @@ from app.downloader.method_store import get_default_method
 
 logger = logging.getLogger(__name__)
 CLEANUP_INTERVAL_SECONDS = 30
+PROGRESS_FORWARD_INTERVAL_SECONDS = 3.0
 
 
 class Pipeline:
@@ -31,6 +32,7 @@ class Pipeline:
         self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
         self._cleanup_task: asyncio.Task | None = None
+        self._last_progress_forward: dict[str, float] = {}
 
     async def start(self) -> None:
         if self._started:
@@ -148,6 +150,11 @@ class Pipeline:
         speed = args[4] if len(args) > 4 else 0
         eta = args[5] if len(args) > 5 and not isinstance(args[5], dict) else 0
         details = args[6] if len(args) > 6 and isinstance(args[6], dict) else (args[5] if len(args) > 5 and isinstance(args[5], dict) else None)
+        now = asyncio.get_running_loop().time()
+        is_final = float(percent or 0) >= 100.0
+        if not is_final and now - self._last_progress_forward.get(task_id, 0.0) < PROGRESS_FORWARD_INTERVAL_SECONDS:
+            return
+        self._last_progress_forward[task_id] = now
         try:
             await self.db.update_progress(task_id, progress=percent or 0, speed=speed or 0, eta=eta or 0)
         except Exception:
