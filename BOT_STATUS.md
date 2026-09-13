@@ -9,6 +9,30 @@
 - Active V2 entrypoint: `bot_vnext/main.py`
 - Legacy root files are not the active V2 pipeline unless explicitly stated.
 - Production update model: fresh code from `origin/bot-vnext`; old queue/database/settings are disposable.
+- **Production launcher: `telegram-bot.service` only.**
+- **Expected V2 process count: exactly 1.**
+
+## Single-instance runtime architecture
+
+```text
+systemd: telegram-bot.service
+             |
+             v
+bot_vnext/run_service.sh
+             |
+       exclusive flock
+             |
+             v
+      bot_vnext/main.py
+             |
+          Pipeline
+        /           \
+       v             v
+DownloadManager   UploadManager
+  2 workers        4 workers
+```
+
+The service runner takes an exclusive filesystem lock before launching the V2 entrypoint. The updater stops the service, removes leftover V2 processes, reloads/enables the service, starts it, and verifies exactly one V2 process.
 
 ## Architecture
 
@@ -47,8 +71,7 @@ bot_vnext/main.py
 | HTTP connector per-host limit | 40 |
 | HLS segment retries | 3 attempts |
 | Retry delays | 1s, 2s |
-
-The HLS implementation is intended to use a semaphore for per-video segment concurrency. Verify the active source before treating a concurrency change as deployed.
+| Production bot processes | **1** |
 
 ## Queue / status
 
@@ -100,22 +123,11 @@ Dependencies are defined in `requirements.txt`. Current project requirements inc
 
 ## Deployment rule
 
-Do **not** manually mix old local Python files with GitHub code. Use `./update.sh` from the repository root. The updater:
-
-1. stops the bot service when a systemd service is detected;
-2. fetches `origin/bot-vnext`;
-3. hard-resets tracked code to the remote branch;
-4. removes untracked/stale runtime files;
-5. deletes the old SQLite queue/database;
-6. preserves only runtime secrets such as `.env` and the local virtualenv;
-7. installs dependencies;
-8. installs the Playwright Chromium runtime;
-9. runs syntax checks;
-10. restarts the bot and prints its status/log tail.
+Do **not** manually mix old local Python files with GitHub code. Use `./update.sh` from the repository root. The updater requires systemd and the canonical `telegram-bot.service`; it never falls back to `nohup`. It stops the service, cleans leftover V2 processes, fetches and hard-resets the branch, installs dependencies, reloads/enables the service, starts it, and verifies one V2 process.
 
 ## Important maintenance rule
 
-If a future change affects download concurrency, queue state, upload behavior, metadata handling, storage cleanup, startup, or deployment, update this document and `CHANGELOG.md` in the same change.
+If a future change affects download concurrency, queue state, upload behavior, metadata handling, storage cleanup, startup, single-instance protection, or deployment, update this document and `CHANGELOG.md` in the same change.
 
 ## Known architecture warning
 

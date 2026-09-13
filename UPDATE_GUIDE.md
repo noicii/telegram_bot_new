@@ -1,6 +1,14 @@
 # Update Guide — Bot V2
 
-This file is the **update-only** runbook. It is intentionally separate from the full deployment and migration documents.
+This is the canonical update-only runbook for production.
+
+## Production rule: one bot process only
+
+The Telegram bot must run through **`telegram-bot.service` only**. Never launch `bot_vnext/main.py` manually with `python`, `nohup`, screen, tmux, cron, or another supervisor.
+
+The service starts the tracked `bot_vnext/run_service.sh`, which uses an exclusive `flock` lock before starting `main.py`. This prevents a second service-runner instance from starting the bot at the same time.
+
+`update.sh` is also systemd-only: it refuses to use a direct `nohup` fallback, stops the canonical service, terminates leftover V2 `main.py` processes, installs/reloads the tracked service, enables it for boot, starts it, and verifies that exactly one V2 process is running.
 
 ## Canonical update command
 
@@ -15,20 +23,21 @@ Do not manually copy individual Python files from an older checkout into product
 
 ## What `update.sh` does
 
-The canonical updater:
-
-1. Stops the running bot/service.
-2. Fetches `origin/bot-vnext`.
-3. Resets tracked files to the remote `bot-vnext` branch.
-4. Removes stale/untracked disposable files while preserving `.env` and the virtualenv.
-5. Removes the disposable SQLite queue/database.
-6. Removes stale Python caches and old rebuild/backup runtime directories.
-7. Installs `requirements.txt`.
-8. Ensures Playwright Chromium.
-9. Runs Python syntax checks.
-10. Verifies the V2 HLS downloader is configured for 16 concurrent segments.
-11. Starts the bot through systemd when the known service is present; otherwise uses the fallback launcher.
-12. Prints deployment status.
+1. Requires `telegram-bot.service` and systemd; there is no fallback launcher.
+2. Stops the canonical service.
+3. Removes any leftover V2 `bot_vnext/main.py` process before deployment.
+4. Fetches `origin/bot-vnext`.
+5. Resets tracked files to the remote branch.
+6. Removes stale/untracked disposable files while preserving `.env` and the virtualenv.
+7. Removes the disposable SQLite queue/database.
+8. Removes stale Python caches and old rebuild/backup runtime directories.
+9. Installs requirements and Playwright Chromium.
+10. Runs syntax checks.
+11. Verifies HLS concurrency is 16 segments per video.
+12. Installs the tracked systemd service and reloads systemd.
+13. Enables the service for automatic boot/restart.
+14. Starts the service.
+15. Verifies **exactly one** V2 `main.py` process is running.
 
 ## What survives an update
 
@@ -42,81 +51,55 @@ The canonical updater:
 - Old SQLite queue/database state.
 - Old untracked runtime files.
 - Python caches.
-- Stale downloads/logs generated in disposable local directories.
+- Stale disposable downloads/logs.
 - Old backup/rebuild directories.
 
-If a future feature creates state that must survive updates, document it and modify `update.sh` before relying on it.
+## Service operations
 
-## Before updating
+Use systemd for production operations:
 
-For a normal update, no manual backup is required for queue/download state because that state is intentionally disposable.
+```bash
+sudo systemctl status telegram-bot.service --no-pager
+sudo systemctl restart telegram-bot.service
+sudo journalctl -u telegram-bot.service -n 100 --no-pager
+```
 
-If you have an important new asset or secret, make sure it is documented and preserved before updating.
+Never use `python bot_vnext/main.py` as a production start command.
 
 ## After updating
 
-Check the final lines from `update.sh` for:
+Confirm the updater reports:
 
 ```text
 Clean deployment completed successfully
-Branch: bot-vnext
+Service: telegram-bot.service (systemd only)
+V2 processes: 1
 HLS concurrency: 16 segments/video
 Secrets: .env preserved
 ```
 
-Then check:
-
-```bash
-systemctl status telegram-bot.service --no-pager
-```
-
-And in Telegram:
-
-```text
-/status
-/health
-```
+Then check `/status` and `/health` in Telegram.
 
 ## If update fails
 
-### Git fetch fails with `No space left on device`
+Do not manually start another bot process. Fix the service/update error first.
 
-First inspect:
-
-```bash
-df -hT /
-sudo du -xhd1 / 2>/dev/null | sort -h
-```
-
-Do not immediately delete random system directories. Find the largest disposable runtime data first.
-
-### Bot does not start
-
-Check:
+For service diagnostics:
 
 ```bash
+sudo systemctl status telegram-bot.service --no-pager
 sudo journalctl -u telegram-bot.service -n 100 --no-pager
 ```
 
-Then check syntax manually:
+For duplicate-process diagnostics:
 
 ```bash
-python -m py_compile bot_vnext/main.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py
+pgrep -af 'bot_vnext/main.py'
 ```
 
-### HLS concurrency is wrong
-
-Check:
-
-```bash
-grep -nE 'Semaphore\(16\)|16 segments download concurrently' bot_vnext/app/downloader/engine.py
-```
-
-The current target is 16 segments per video.
+If more than one process appears, stop the service before investigating; the next canonical `bash update.sh` will clean leftover V2 processes before starting one instance.
 
 ## Code-change workflow
-
-When changing production behavior:
 
 1. Diagnose from the actual V2 call path.
 2. Change the smallest correct V2 component.
@@ -130,4 +113,4 @@ When changing production behavior:
 
 ## Important architectural rule
 
-Never treat a root legacy file as production merely because it contains similar code. The production entrypoint is `bot_vnext/main.py`; follow its imports into the V2 application before editing.
+The production entrypoint is `bot_vnext/main.py`. Root legacy files are not production. Production startup is exclusively managed by `telegram-bot.service` -> `bot_vnext/run_service.sh` -> `bot_vnext/main.py`.
