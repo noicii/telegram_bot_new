@@ -10,6 +10,7 @@ from app.queue.worker_pool import QueueItem
 from app.queue.download_manager import DownloadManager
 from app.queue.upload_manager import UploadManager
 from app.storage.database import Database
+from app.storage.cleanup import cleanup_download_artifacts_async, remove_artifact_async
 from app.downloader.method_store import get_default_method
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class Pipeline:
                  on_complete: Callable[[str], Awaitable[None]] | None = None,
                  on_failed: Callable[[str, Exception], Awaitable[None]] | None = None) -> None:
         self.db = database or Database()
+        self.output_dir = Path(output_dir)
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_failed = on_failed
@@ -31,8 +33,19 @@ class Pipeline:
     async def start(self) -> None:
         if self._started:
             return
+        # Run filesystem cleanup before SQLite initialization. This is
+        # important when an old large download has filled the disk and SQLite
+        # cannot safely create/update its WAL files.
+        await cleanup_download_artifacts_async(self.output_dir, force=True)
         await self.db.init()
         await self.db.recover_after_crash()
+
+        # Interrupted/failed/cancelled artifacts are never resumed and are
+        # removed before the new queue starts. Only queued work remains active.
+        for path in await self.db.get_cleanup_paths():
+            await remove_artifact_async(path)
+        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
+
         await self.upload.start()
         await self.download.start()
         self._started = True
@@ -81,7 +94,7 @@ class Pipeline:
             selected = method or await get_default_method()
             metadata = dict(task.get("metadata") or {})
             metadata["download_method"] = selected
-            await self.db.update_task(task_id, metadata=metadata)
+            await self.db.update_task(task_id, metadata=metadata, file_path=None)
         if not await self.db.reset_for_retry(task_id):
             return False
         row = await self.db.get_task(task_id)
@@ -94,12 +107,20 @@ class Pipeline:
         cancelled = await self.download.cancel(task_id)
         if cancelled:
             await self.db.mark_cancelled(str(task_id))
+            task = await self.db.get_task(str(task_id))
+            if task and task.get("file_path"):
+                await remove_artifact_async(task["file_path"])
+            await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
         return cancelled
 
     async def cancel_upload(self, task_id: int | str) -> bool:
         cancelled = await self.upload.cancel(task_id)
         if cancelled:
             await self.db.mark_cancelled(str(task_id))
+            task = await self.db.get_task(str(task_id))
+            if task and task.get("file_path"):
+                await remove_artifact_async(task["file_path"])
+            await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
         return cancelled
 
     async def cancel(self, task_id: int | str) -> bool:
@@ -128,30 +149,38 @@ class Pipeline:
         await self._forward_progress("upload", args)
 
     async def _download_complete(self, item: QueueItem, path: Path):
-        task_id = str(item.task_id)
-        await self.db.update_task(task_id, status="uploading", file_path=str(path), progress=0)
+        await self.db.update_task(str(item.task_id), status="uploading", file_path=str(path), progress=0)
         payload = dict(item.payload)
         payload["file_path"] = str(path)
         payload["task_type"] = "upload"
-        await self.upload.submit(task_id, payload)
+        await self.upload.submit(item.task_id, payload)
 
     async def _download_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
-        # The downloader engine already performs exactly 3 attempts for an
-        # explicitly selected method. Never redispatch a failed method here.
         await self.db.mark_failed(task_id, str(error))
+        await remove_artifact_async(item.payload.get("file_path") or (self.output_dir / item.payload.get("filename", f"{task_id}.mp4")))
+        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
         if self.on_failed:
             await self.on_failed(task_id, error)
 
     async def _upload_complete(self, item: QueueItem):
         task_id = str(item.task_id)
+        # UploadManager already removes the source immediately after a
+        # successful upload. This second cleanup is intentionally idempotent.
+        task = await self.db.get_task(task_id)
+        if task and task.get("file_path"):
+            await remove_artifact_async(task["file_path"])
         await self.db.mark_completed(task_id)
+        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
         if self.on_complete:
             await self.on_complete(task_id)
 
     async def _upload_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
         await self.db.mark_failed(task_id, str(error))
+        if item.payload.get("file_path"):
+            await remove_artifact_async(item.payload["file_path"])
+        await cleanup_download_artifacts_async(self.output_dir, active_paths=await self.db.get_active_paths())
         if self.on_failed:
             await self.on_failed(task_id, error)
 
