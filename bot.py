@@ -11,12 +11,15 @@ from config import (
 )
 from database import init_db
 
-# Apply runtime hardening before handlers are imported.
+# Apply downloader/queue hardening before handlers are imported.
 from runtime_hardening import apply as apply_runtime_hardening
 apply_runtime_hardening()
 
 from handlers import register_handlers
 from queue_worker import start_queue_worker, stop_queue_worker
+
+# Apply handler-side hardening after handlers are loaded.
+apply_runtime_hardening()
 
 
 logging.basicConfig(
@@ -41,6 +44,8 @@ init_db()
 logger.info("Bot configuration loaded")
 logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
 logger.info("HLS segment concurrency: 16 per video")
+logger.info("Queue download workers: %s", 2)
+logger.info("Upload concurrency: %s", 4)
 
 app = Client(
     "telegram_bot_session",
