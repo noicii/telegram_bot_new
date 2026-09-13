@@ -6,104 +6,192 @@ This repository contains a live Telegram video downloader bot. **No AI agent may
 
 If you cannot explain the current production flow and identify the correct production files, **STOP. Do not make changes.**
 
-## Mandatory reading order
+## 1. Mandatory reading gate
 
 Before any code change, read these documents in this order:
 
-1. `PROJECT_HANDOFF.md`
-2. `ARCHITECTURE.md`
-3. `BOT_STATUS.md`
-4. `BOT_FEATURES.md`
-5. `OPERATIONS.md`
-6. `DEPLOYMENT.md`
-7. `UPDATE_GUIDE.md`
-8. `CHANGELOG.md`
-9. `bot_vnext/PRODUCTION_ENTRYPOINT.md`
-10. `bot_vnext/STORAGE_CLEANUP.md`
+1. `AI_RULES.md`
+2. `AGENTS.md`
+3. `PROJECT_HANDOFF.md`
+4. `ARCHITECTURE.md`
+5. `BOT_STATUS.md`
+6. `BOT_FEATURES.md`
+7. `OPERATIONS.md`
+8. `DEPLOYMENT.md`
+9. `UPDATE_GUIDE.md`
+10. `CHANGELOG.md`
+11. `bot_vnext/PRODUCTION_ENTRYPOINT.md`
+12. `bot_vnext/STORAGE_CLEANUP.md`
 
 Then inspect the relevant production source files under `bot_vnext/` before editing them.
 
-## Production source of truth
+**Reading documentation is a prerequisite, not an optional recommendation.**
+
+## 2. Production source of truth
 
 The production bot starts at:
 
 `bot_vnext/main.py`
 
-The production pipeline is under:
+The production application code is under:
 
 `bot_vnext/app/`
 
-Root-level files such as `bot.py`, `handlers.py`, `downloader.py`, `queue_worker.py`, and `database.py` are **legacy architecture** unless the current documentation explicitly says otherwise.
+Root-level files such as `bot.py`, `handlers.py`, `downloader.py`, `queue_worker.py`, and `database.py` are **legacy architecture** unless current documentation and the actual call path explicitly prove otherwise.
 
 **Never edit legacy root code as a shortcut for a V2 problem.**
 
-## Mandatory understanding checklist
+## 3. Mandatory architecture understanding
 
-Before editing, the AI must be able to answer these questions from the repository itself:
+Before editing, the AI must establish from the repository itself:
 
-- What is the production entrypoint?
-- How does Telegram input reach the pipeline?
-- How many download workers and upload workers are configured?
-- What is the current HLS segment concurrency?
-- How does download completion hand off to upload?
-- What Telegram destination does the uploader use?
-- How are large files split and uploaded?
-- How are thumbnails handled?
-- How does progress reach the dashboard?
-- How does disk cleanup protect active files?
-- What happens to incomplete work after restart?
-- How is the single systemd instance enforced?
-- What does `update.sh` delete, and what does it preserve?
-- Which secrets must never be committed?
+- production entrypoint and launcher
+- Telegram → handler → pipeline → download → upload flow
+- download/upload worker counts
+- current HLS segment concurrency
+- downloader methods and fallback behavior
+- download → upload handoff
+- configured Telegram upload destination
+- large-file splitting behavior
+- thumbnail behavior
+- dashboard/progress flow and refresh policy
+- disk cleanup and active-file protection
+- restart/interrupted-task behavior
+- systemd and singleton enforcement
+- clean deployment/update behavior
+- secret/configuration boundaries
 
-If any answer is unknown, **do not guess and do not edit. Inspect the repository first.**
+If any item is unknown, ambiguous, or contradictory: **STOP → inspect more code/docs → resolve it. Do not guess.**
 
-## Change-scope rules
+## 4. Change-scope gate
 
-- Change only what the user explicitly requests or what is strictly required to implement that request.
-- Do not silently change download speed, upload speed, worker counts, concurrency, queue behavior, Telegram destination, cleanup policy, restart behavior, or deployment behavior.
-- Do not replace working architecture with a new implementation without explicit approval.
-- Do not modify `.env` or expose secrets.
-- Do not commit tokens, API keys, session files, private credentials, or runtime secrets.
-- Do not delete production code merely because it looks unused; verify its role first.
-- Do not create a second production entrypoint.
-- Do not start the bot manually with `nohup`, `screen`, `tmux`, or another competing process when systemd is the canonical service.
+For every requested change, first determine:
 
-## Before writing code
-
-The AI must first state internally/briefly in its work notes:
-
-1. What the user wants changed.
+1. Exactly what the user requested.
 2. Which production component owns that behavior.
-3. Which exact files need changing.
-4. What behavior must remain unchanged.
-5. What validation will prove the change works.
+3. Exact files that need changing.
+4. Existing behavior that must remain unchanged.
+5. Possible side effects/regressions.
+6. How the change will be validated.
 
-Then make the smallest safe change.
+Make the **smallest safe change**.
 
-## After writing code
+Do not silently change:
 
-Required before declaring success:
+- download speed
+- upload speed
+- worker counts
+- concurrency
+- queue semantics
+- Telegram destination
+- retry policy
+- cleanup thresholds
+- restart behavior
+- systemd behavior
+- deployment behavior
+- public bot behavior
 
-1. Run syntax/static validation appropriate to the changed files.
-2. Verify the relevant production path.
-3. Check that no duplicate bot process is running.
-4. Confirm the canonical systemd service remains the production launcher.
-5. Update the relevant documentation when behavior changes.
-6. Add a dated entry to `CHANGELOG.md` for meaningful production changes.
+unless explicitly requested or strictly required by the requested fix.
 
-## Deployment rule
+## 5. High-risk change gate
 
-Production deployment must follow the documented clean update process. The canonical update command is:
+Treat these as high-risk:
+
+- `bot_vnext/main.py`
+- `bot_vnext/app/pipeline.py`
+- `bot_vnext/app/downloader/engine.py`
+- `bot_vnext/app/queue/upload_manager.py`
+- `bot_vnext/app/uploader/engine.py`
+- `update.sh`
+- `telegram-bot.service`
+- authentication/authorization code
+- storage cleanup code
+- dependency changes
+
+For high-risk changes, trace the call path before editing and perform targeted regression validation afterward.
+
+**Architecture refactors require explicit user approval.** A perceived “better design” is not permission to replace working architecture.
+
+## 6. Secrets and privacy
+
+Never:
+
+- commit `.env`
+- print or expose `BOT_TOKEN`, `API_HASH`, API credentials, session credentials, or private keys
+- copy secrets into documentation
+- include secrets in logs, commits, issues, or generated files
+- commit Telegram session/runtime credential files
+
+If secret exposure is discovered, stop the change and tell the user.
+
+## 7. Destructive-operation gate
+
+Do not perform destructive operations merely to make a change easier.
+
+Examples include deleting production code, wiping databases, deleting media, killing production processes, replacing systemd units, or changing permissions.
+
+Use documented procedures when they are explicitly part of the normal deployment workflow. Otherwise, require explicit user approval before destructive operations.
+
+## 8. No competing runtime
+
+The canonical production launcher is systemd. Do not start competing bot instances using `nohup`, `screen`, `tmux`, ad-hoc background processes, or a second service.
+
+Do not create another production entrypoint.
+
+## 9. Evidence over assumptions
+
+Documentation can become stale. Code can also contradict documentation. Therefore:
+
+**Do not blindly trust either one. Trace the actual production call path and reconcile discrepancies before changing behavior.**
+
+Never invent configuration values, file locations, worker counts, or runtime behavior.
+
+## 10. Validation gate
+
+After every meaningful production change:
+
+1. Run syntax/static checks appropriate to changed files.
+2. Run targeted tests/checks for the affected path.
+3. Verify the canonical production entrypoint remains intact.
+4. Verify exactly one production V2 bot process is active after deployment.
+5. Verify the canonical systemd service is the launcher.
+6. Check relevant logs for errors.
+7. Update affected documentation.
+8. Add a dated `CHANGELOG.md` entry for meaningful behavior changes.
+
+Never declare success based only on “code looks correct.”
+
+## 11. Deployment gate
+
+Production deployment must use the documented clean deployment process:
 
 ```bash
 cd ~/telegram_bot_new && bash update.sh
 ```
 
-Do not invent an alternate deployment procedure unless the documented updater is itself the subject of the requested change.
+The updater intentionally refreshes tracked code while preserving `.env` and the local virtual environment and removing disposable runtime state. Do not invent an alternate production update procedure unless `update.sh` itself is the requested change.
 
-## Important: documentation is a safety gate
+## 12. User approval boundary
 
-The documentation files are not optional background reading. They exist specifically so a future developer or AI cannot safely make a random change without first understanding the system.
+The AI may implement a clearly requested, well-understood change.
 
-**When in doubt: STOP → READ → TRACE → VERIFY → THEN EDIT.**
+The AI must **stop and ask the user** before:
+
+- changing architecture
+- changing core worker/concurrency strategy
+- changing authentication/authorization rules
+- changing Telegram destination/security boundaries
+- changing persistence/state policy
+- changing deployment model
+- introducing a new external service
+- making a broad refactor unrelated to the requested fix
+
+## 13. Final rule
+
+When in doubt:
+
+**STOP → READ → TRACE → UNDERSTAND → PLAN → EDIT → VALIDATE → DOCUMENT.**
+
+Never:
+
+**GUESS → EDIT → HOPE.**
