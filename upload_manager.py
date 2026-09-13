@@ -29,12 +29,35 @@ async def _worker(worker_id):
             job = await _queue.get()
         except asyncio.CancelledError:
             break
+
         task_id = job["task_id"]
         future = job["future"]
         try:
             if future.cancelled():
                 continue
+
             _jobs[task_id] = asyncio.current_task()
+
+            try:
+                from handlers import update_batch_summary_message
+                from database import get_task_db
+                from downloader import set_live_task
+
+                task = get_task_db(task_id)
+                if task and task.get("status") == "processing":
+                    set_live_task(
+                        task_id,
+                        operation="Telegram upload",
+                        percent=0,
+                        current_mb=0,
+                        speed_mb=0,
+                        eta="—",
+                    )
+                    # The function only needs the task's batch identifiers.
+                    await update_batch_summary_message(None, task)
+            except Exception:
+                logger.exception("Could not refresh upload dashboard for task %s", task_id)
+
             await _pipeline(*job["args"])
             if not future.done():
                 future.set_result(True)
