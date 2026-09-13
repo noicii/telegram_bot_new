@@ -1,6 +1,23 @@
 # Changelog
 
-All important bot changes are recorded here so a new chat or deployment can quickly understand what changed and why.
+All important bot changes are recorded here so a new chat, developer, or deployment can quickly understand what changed and why.
+
+## 2026-09-13 — Complete documentation and handoff system
+
+- Added `README.md` as the repository documentation index.
+- Added `BOT_FEATURES.md` as the complete feature/behavior reference.
+- Added `TRANSFER_GUIDE.md` with the required files, prerequisites, migration procedure and verification checklist for moving the bot to another system.
+- Added `UPDATE_GUIDE.md` as a dedicated update/release runbook.
+- Added `OPERATIONS.md` for day-to-day operation and troubleshooting.
+- Expanded `PROJECT_HANDOFF.md` so another developer or AI can understand the architecture, state policy, migration model and troubleshooting workflow without rediscovering project history.
+- Documented the rule that production changes must target the active V2 call path and update the relevant documentation/changelog.
+
+## 2026-09-13 — Realtime disk status
+
+- Added live filesystem usage to `/status`.
+- Status now reports used/total GB, free GB and usage percentage.
+- Added visual disk pressure indicators: green below 80%, orange at 80–89%, red at 90% or higher.
+- The Refresh button recalculates the filesystem values at request time.
 
 ## 2026-09-13 — Automatic storage cleanup and restart safety
 
