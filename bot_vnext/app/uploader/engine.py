@@ -23,9 +23,6 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, int, int, float, int], Awaitable[None] | None]
 
-# Telegram's current large-file boundary is 2000 MiB in the Pyrogram error
-# seen in production. Keep a safety margin so mux/container overhead and
-# variable bitrate do not push a generated part over the hard boundary.
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
 SPLIT_TARGET_BYTES = 1900 * 1024 * 1024
 
@@ -229,8 +226,60 @@ class UploadEngine:
             if progress_tasks:
                 await asyncio.gather(*progress_tasks, return_exceptions=True)
 
+    async def _send(
+        self,
+        task: TaskContext,
+        path: Path,
+        *,
+        chat_id,
+        caption,
+        thumbnail,
+        mode,
+        title,
+        duration,
+        width,
+        height,
+        supports_streaming,
+        progress,
+        reply_to_message_id,
+    ):
+        task.check_cancelled()
+        common = {
+            "chat_id": chat_id,
+            "caption": caption,
+            "progress": progress,
+        }
+        if reply_to_message_id is not None:
+            common["reply_to_message_id"] = reply_to_message_id
+
+        if thumbnail:
+            thumb = Path(thumbnail)
+            if thumb.is_file():
+                common["thumb"] = str(thumb)
+
+        normalized = (mode or "video").lower()
+        if normalized in {"document", "file", "doc"}:
+            return await self.client.send_document(document=str(path), **common)
+
+        if normalized in {"audio", "music"}:
+            if title:
+                common["title"] = title
+            if duration:
+                common["duration"] = duration
+            return await self.client.send_audio(audio=str(path), **common)
+
+        if duration:
+            common["duration"] = duration
+        if width:
+            common["width"] = width
+        if height:
+            common["height"] = height
+        common["supports_streaming"] = bool(supports_streaming)
+        return await self.client.send_video(video=str(path), **common)
+
     async def _split_large_video(self, task: TaskContext, source: Path, parts_dir: Path) -> list[Path]:
         """Split a large video into upload-safe MP4 parts using stream copy."""
+        task.check_cancelled()
         await asyncio.to_thread(self._check_ffmpeg)
         parts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -239,8 +288,6 @@ class UploadEngine:
             raise UploadError(f"Could not determine video duration for splitting: {source}")
 
         size = source.stat().st_size
-        # Average bitrate estimate with a safety factor. The extra margin is
-        # intentional because HLS/remux output can have variable bitrate.
         target_seconds = max(30.0, duration * SPLIT_TARGET_BYTES / size * 0.88)
         output_pattern = str(parts_dir / "part_%03d.mp4")
 
