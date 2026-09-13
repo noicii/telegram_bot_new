@@ -17,3 +17,8 @@
 - HLS progress no longer displays a misleading `Downloaded MB / 0 MB` total.
 - HLS dashboard now shows segment count, calculated percentage, downloaded bytes, speed, ETA when available, and retries.
 - Non-HLS downloads keep the existing byte-based `current / total` display.
+
+### Callback / selection controls
+- Restored individual episode checkbox handling for `v2:t:<index>` callbacks.
+- Restored the selection-page **Change method** callback and session method updates.
+- Restored queue **Cancel** button callback handling for `v2:cancel:<task_id>`.
