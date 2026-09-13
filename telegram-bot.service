@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=benoicii
 WorkingDirectory=/home/benoicii/telegram_bot_new/bot_vnext
-ExecStart=/home/benoicii/telegram_bot_new/bot_vnext/run_service.sh
+ExecStart=/usr/bin/bash /home/benoicii/telegram_bot_new/bot_vnext/run_service.sh
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
