@@ -19,6 +19,8 @@ from pyrogram.errors import FloodWait
 
 from app.core.task import TaskCancelled, TaskContext
 
+logger = logging.getLogger(__name__)
+
 ProgressCallback = Callable[[float, int, int, float, int], Awaitable[None] | None]
 
 # Telegram's current large-file boundary is 2000 MiB in the Pyrogram error
@@ -275,9 +277,6 @@ class UploadEngine:
         if not parts:
             raise UploadError(f"FFmpeg produced no upload parts for {source}")
 
-        # Segment muxing normally keeps the calculated margin. If an unusual
-        # VBR/keyframe pattern still creates an oversized part, fail clearly
-        # instead of sending a part that Telegram will reject.
         oversized = [p for p in parts if p.stat().st_size > MAX_UPLOAD_BYTES]
         if oversized:
             biggest = max(p.stat().st_size for p in oversized) / 1024 / 1024
@@ -318,55 +317,3 @@ class UploadEngine:
             parts_dir.rmdir()
         except OSError:
             pass
-
-    async def _send(
-        self,
-        task: TaskContext,
-        path: Path,
-        *,
-        chat_id,
-        caption,
-        thumbnail,
-        mode,
-        title,
-        duration,
-        width,
-        height,
-        supports_streaming,
-        progress,
-        reply_to_message_id,
-    ):
-        task.check_cancelled()
-        common = {
-            "chat_id": chat_id,
-            "caption": caption,
-            "progress": progress,
-        }
-        if reply_to_message_id is not None:
-            common["reply_to_message_id"] = reply_to_message_id
-
-        if thumbnail:
-            thumb = Path(thumbnail)
-            if thumb.is_file():
-                common["thumb"] = str(thumb)
-
-        normalized = (mode or "video").lower()
-        if normalized in {"document", "file", "doc"}:
-            return await self.client.send_document(document=str(path), **common)
-
-        if normalized in {"audio", "music"}:
-            if title:
-                common["title"] = title
-            if duration:
-                common["duration"] = duration
-            return await self.client.send_audio(audio=str(path), **common)
-
-        if duration:
-            common["duration"] = duration
-        if width:
-            common["width"] = width
-        if height:
-            common["height"] = height
-        common["supports_streaming"] = bool(supports_streaming)
-
-        return await self.client.send_video(video=str(path), **common)
