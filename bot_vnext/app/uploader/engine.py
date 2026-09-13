@@ -24,6 +24,7 @@ ProgressCallback = Callable[..., Awaitable[None] | None]
 
 MAX_UPLOAD_BYTES = 2000 * 1024 * 1024
 SPLIT_TARGET_BYTES = 1900 * 1024 * 1024
+MAX_THUMB_BYTES = 200 * 1024
 
 
 class UploadError(Exception):
@@ -46,58 +47,105 @@ class UploadEngine:
             raise UploadError(f"Upload file not found or empty: {path}")
         task.check_cancelled()
         original_size = path.stat().st_size
+        effective_thumbnail, generated_thumbnail = await self._ensure_thumbnail(task, path, thumbnail)
+        try:
+            if original_size > MAX_UPLOAD_BYTES:
+                normalized = (mode or "video").lower()
+                if normalized not in {"video", "document", "file", "doc"}:
+                    raise UploadError(f"File is larger than 2000 MiB and automatic splitting is only supported for video/document uploads: {path}")
+                parts_dir = path.parent / f".{path.stem}_parts"
+                parts = await self._split_large_video(task, path, parts_dir)
+                try:
+                    uploaded = None
+                    completed_bytes = 0
+                    total_bytes = sum(p.stat().st_size for p in parts)
+                    part_count = len(parts)
+                    for index, part in enumerate(parts, 1):
+                        task.check_cancelled()
+                        part_caption = caption
+                        if part_count > 1:
+                            suffix = f"\n\n📦 Part {index}/{part_count}"
+                            part_caption = f"{caption}{suffix}" if caption else suffix.lstrip()
+                        part_size = part.stat().st_size
+                        if part_size > MAX_UPLOAD_BYTES:
+                            raise UploadError(f"Generated part is still larger than 2000 MiB ({part_size / 1024 / 1024:.1f} MiB): {part}")
 
-        if original_size > MAX_UPLOAD_BYTES:
-            normalized = (mode or "video").lower()
-            if normalized not in {"video", "document", "file", "doc"}:
-                raise UploadError(f"File is larger than 2000 MiB and automatic splitting is only supported for video/document uploads: {path}")
-            parts_dir = path.parent / f".{path.stem}_parts"
-            parts = await self._split_large_video(task, path, parts_dir)
-            try:
-                uploaded = None
-                completed_bytes = 0
-                total_bytes = sum(p.stat().st_size for p in parts)
-                part_count = len(parts)
-                for index, part in enumerate(parts, 1):
-                    task.check_cancelled()
-                    part_caption = caption
-                    if part_count > 1:
-                        suffix = f"\n\n📦 Part {index}/{part_count}"
-                        part_caption = f"{caption}{suffix}" if caption else suffix.lstrip()
-                    part_size = part.stat().st_size
-                    if part_size > MAX_UPLOAD_BYTES:
-                        raise UploadError(f"Generated part is still larger than 2000 MiB ({part_size / 1024 / 1024:.1f} MiB): {part}")
+                        async def part_progress(percent, current, _total, speed, eta, *, base=completed_bytes, psize=part_size, part_no=index, parts_total=part_count):
+                            if progress:
+                                overall_current = base + min(current, psize)
+                                overall_percent = (overall_current * 100.0 / total_bytes) if total_bytes else percent
+                                details = {
+                                    "part": part_no,
+                                    "parts": parts_total,
+                                    "part_current": min(current, psize),
+                                    "part_total": psize,
+                                }
+                                result = progress(overall_percent, overall_current, total_bytes, speed, eta, details)
+                                if asyncio.iscoroutine(result):
+                                    await result
 
-                    async def part_progress(percent, current, _total, speed, eta, *, base=completed_bytes, psize=part_size, part_no=index, parts_total=part_count):
-                        if progress:
-                            overall_current = base + min(current, psize)
-                            overall_percent = (overall_current * 100.0 / total_bytes) if total_bytes else percent
-                            details = {
-                                "part": part_no,
-                                "parts": parts_total,
-                                "part_current": min(current, psize),
-                                "part_total": psize,
-                            }
-                            result = progress(overall_percent, overall_current, total_bytes, speed, eta, details)
-                            if asyncio.iscoroutine(result):
-                                await result
+                        uploaded = await self._upload_single(task, part, chat_id=chat_id, caption=part_caption,
+                            thumbnail=effective_thumbnail, mode=mode, title=title, duration=duration, width=width,
+                            height=height, supports_streaming=supports_streaming, progress=part_progress,
+                            reply_to_message_id=reply_to_message_id)
+                        completed_bytes += part_size
+                    if progress:
+                        result = progress(100.0, total_bytes, total_bytes, 0.0, 0, {"part": part_count, "parts": part_count, "part_current": total_bytes and parts[-1].stat().st_size, "part_total": parts[-1].stat().st_size})
+                        if asyncio.iscoroutine(result):
+                            await result
+                    return uploaded
+                finally:
+                    self._cleanup_parts(parts_dir, parts)
 
-                    uploaded = await self._upload_single(task, part, chat_id=chat_id, caption=part_caption,
-                        thumbnail=thumbnail, mode=mode, title=title, duration=duration, width=width,
-                        height=height, supports_streaming=supports_streaming, progress=part_progress,
-                        reply_to_message_id=reply_to_message_id)
-                    completed_bytes += part_size
-                if progress:
-                    result = progress(100.0, total_bytes, total_bytes, 0.0, 0, {"part": part_count, "parts": part_count, "part_current": total_bytes and parts[-1].stat().st_size, "part_total": parts[-1].stat().st_size})
-                    if asyncio.iscoroutine(result):
-                        await result
-                return uploaded
-            finally:
-                self._cleanup_parts(parts_dir, parts)
+            return await self._upload_single(task, path, chat_id=chat_id, caption=caption, thumbnail=effective_thumbnail,
+                mode=mode, title=title, duration=duration, width=width, height=height,
+                supports_streaming=supports_streaming, progress=progress, reply_to_message_id=reply_to_message_id)
+        finally:
+            if generated_thumbnail:
+                try:
+                    generated_thumbnail.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not delete generated thumbnail: %s", generated_thumbnail)
 
-        return await self._upload_single(task, path, chat_id=chat_id, caption=caption, thumbnail=thumbnail,
-            mode=mode, title=title, duration=duration, width=width, height=height,
-            supports_streaming=supports_streaming, progress=progress, reply_to_message_id=reply_to_message_id)
+    async def _ensure_thumbnail(self, task: TaskContext, source: Path, thumbnail: str | Path | None) -> tuple[Path | None, Path | None]:
+        """Return a valid thumbnail, generating one from the video when needed."""
+        if thumbnail:
+            thumb = Path(thumbnail)
+            if thumb.is_file() and thumb.stat().st_size > 0 and thumb.stat().st_size <= MAX_THUMB_BYTES:
+                return thumb, None
+            logger.warning("thumbnail unavailable/invalid (%s); generating one from video", thumb)
+
+        task.check_cancelled()
+        generated = source.with_name(f".{source.stem}.telegram_thumb.jpg")
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", "1", "-i", str(source),
+            "-frames:v", "1", "-vf", "scale='min(320,iw)':-2",
+            "-q:v", "8", str(generated),
+        ]
+        try:
+            await asyncio.to_thread(self._check_ffmpeg)
+            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _stdout, stderr = await process.communicate()
+            if process.returncode != 0 or not generated.is_file() or generated.stat().st_size <= 0:
+                message = stderr.decode("utf-8", errors="replace")[-1000:]
+                raise RuntimeError(message or "FFmpeg did not create a thumbnail")
+            if generated.stat().st_size > MAX_THUMB_BYTES:
+                generated.unlink(missing_ok=True)
+                command[command.index("-q:v") + 1] = "12"
+                process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                _stdout, stderr = await process.communicate()
+                if process.returncode != 0 or not generated.is_file() or generated.stat().st_size > MAX_THUMB_BYTES:
+                    generated.unlink(missing_ok=True)
+                    raise RuntimeError("generated thumbnail is larger than Telegram's thumbnail limit")
+            return generated, generated
+        except TaskCancelled:
+            generated.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            generated.unlink(missing_ok=True)
+            logger.warning("could not generate thumbnail for %s: %s", source, exc)
+            return None, None
 
     async def _upload_single(self, task: TaskContext, path: Path, *, chat_id: int | str,
                              caption: str | None, thumbnail: str | Path | None, mode: str,
@@ -171,7 +219,7 @@ class UploadEngine:
             common["reply_to_message_id"] = reply_to_message_id
         if thumbnail:
             thumb = Path(thumbnail)
-            if thumb.is_file():
+            if thumb.is_file() and thumb.stat().st_size <= MAX_THUMB_BYTES:
                 common["thumb"] = str(thumb)
         normalized = (mode or "video").lower()
         if normalized in {"document", "file", "doc"}:
