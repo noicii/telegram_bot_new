@@ -2,6 +2,13 @@
 
 ## 2026-09-13
 
+### Downloader diagnostic test harness
+- Added `tools/downloader_test.py` to run the production `HybridDownloader` directly on the server without Telegram.
+- Added bounded repeated testing with `--until-success` and `--max-runs` so intermittent CDN/HLS failures can be reproduced safely until a successful run is observed or the test limit is reached.
+- Added per-run JSONL diagnostics containing success/failure, duration, output size, exception type/message, detected HTTP status, traceback, last progress details, and discovered HLS stream URL with common signed/auth query values redacted.
+- Added `DOWNLOADER_TESTING.md` documenting the evidence-first troubleshooting process and interpretation of source/CDN versus downloader failures.
+- Added `test_results/` to `.gitignore` so downloaded diagnostic media and local result logs are not committed.
+
 ### Telegram FloodGate / dashboard resilience
 - Added adaptive Telegram FloodGate for upload attempts and live dashboard edits.
 - Upload FloodWaits now pause new send attempts for the exact Telegram cooldown and retry without cancelling the task.
