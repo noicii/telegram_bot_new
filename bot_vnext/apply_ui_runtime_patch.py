@@ -35,7 +35,7 @@ else:
     text=text.replace(old_rows,new_rows,1)
 
     old_markup='reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])'
-    new_markup='reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Retry {str(r.get(\"title\") or r.get(\"id\"))[:24]}",callback_data=f"v2:retry:{r.get(\"id\")}")] for r in failed_rows_for_retry]+[[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])'
+    new_markup="""reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f\"🔁 Retry {str(r.get('title') or r.get('id'))[:24]}\",callback_data=f\"v2:retry:{r.get('id')}\")] for r in failed_rows_for_retry]+[[InlineKeyboardButton(\"🔄 Refresh\",callback_data=\"v2:status\"),InlineKeyboardButton(\"📋 Queue\",callback_data=\"v2:queue\")]])"""
     if old_markup not in text:
         raise SystemExit("ERROR: dashboard keyboard was not found; refusing unsafe patch")
     text=text.replace(old_markup,new_markup,1)
