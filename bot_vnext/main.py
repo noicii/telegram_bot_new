@@ -156,16 +156,10 @@ class V2Bot:
             if m not in METHODS: await query.answer("Invalid method",show_alert=True); return
             await set_default_method(m); await query.answer(f"Default: {method_label(m)}"); await self.send_method_menu(query.message); return
         if data=="v2:clear":
-            if self.pipeline: await query.answer(f"Cleared {await self.pipeline.db.clear_finished()} task(s)"); await self.send_queue(query.message)
-            else: await query.answer("Pipeline offline",show_alert=True)
-            return
-        if data.startswith("v2:cancel:"):
-            tid=data.split(":",2)[2]; ok=bool(self.pipeline and await self.pipeline.cancel(tid)); await query.answer("Cancelled" if ok else "Not active",show_alert=not ok); return
+            if self.pipeline: await query.answer(f"Cleared {await self.pipeline.db.clear_finished()} task(s)"); await self.send_queue(query.message); return
+            await query.answer()
         s=self.sessions.get(query.from_user.id)
-        if not s: await query.answer("Selection expired. Send /crawl again.",show_alert=True); return
-        if data=="v2:method": s["method"]=next_method(s.get("method","auto")); await query.answer(f"Method: {method_label(s['method'])}"); await self.render_selection(query.message,s); return
-        if data.startswith("v2:t:"):
-            i=int(data.rsplit(":",1)[1]); s["selected"].discard(i) if i in s["selected"] else s["selected"].add(i); await query.answer(); await self.render_selection(query.message,s); return
+        if not s: await query.answer("Selection expired",show_alert=True); return
         if data=="v2:all": s["selected"]=set(range(len(s["items"]))); await query.answer("All selected"); await self.render_selection(query.message,s); return
         if data=="v2:selclear": s["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message,s); return
         if data.startswith("v2:p:"):
@@ -196,8 +190,14 @@ class V2Bot:
             if downs:
                 lines.append("📥 **DOWNLOADING**")
                 for n,r in enumerate(downs[:8],1):
-                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ **{title}{(' • '+res) if res else ''}**",f"{bar(pct)} **{pct:.0f}%**",f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}"]
-                    if det.get("hls_total"): lines.append(f"🧩 HLS: {int(det.get('hls_completed') or 0)} / {int(det.get('hls_total') or 0)} segments"+(f" • 🔁 {int(det.get('hls_retries') or 0)} retries" if det.get("hls_retries") else ""))
+                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ **{title}{(' • '+res) if res else ''}**",f"{bar(pct)} **{pct:.0f}%**"]
+                    if det.get("hls_total"):
+                        hls_done=int(det.get("hls_completed") or 0); hls_total=int(det.get("hls_total") or 0); hls_pct=(hls_done*100/hls_total) if hls_total else pct
+                        lines.append(f"🧩 HLS: **{hls_done} / {hls_total} segments** • **{hls_pct:.0f}%**")
+                        lines.append(f"📥 Downloaded: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
+                        if det.get("hls_retries"): lines.append(f"🔁 Retries: {int(det.get('hls_retries') or 0)}")
+                    else:
+                        lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
                     lines.append("")
             else: lines.append("📥 **DOWNLOADING**\nNo active downloads.\n")
             if ups:
