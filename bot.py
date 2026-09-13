@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from pyrogram import Client
@@ -10,8 +11,10 @@ from config import (
     LOG_DIR,
 )
 from database import init_db
+import handlers
 from handlers import register_handlers
 from queue_worker import start_queue_worker, stop_queue_worker
+import upload_manager
 
 
 logging.basicConfig(
@@ -29,7 +32,6 @@ logging.basicConfig(
 logger = logging.getLogger("telegram_bot")
 
 
-# Validate required configuration before starting.
 if not API_ID:
     raise RuntimeError("API_ID is missing")
 
@@ -40,14 +42,12 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
 
-# Initialize database.
 init_db()
 
 logger.info("Bot configuration loaded")
 logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
 
 
-# Create the Pyrogram client.
 app = Client(
     "telegram_bot_session",
     api_id=API_ID,
@@ -57,12 +57,23 @@ app = Client(
 )
 
 
-# Register all bot handlers.
 register_handlers(app)
+
+# The download worker must never own an upload slot.  Replace the old
+# fire-and-forget upload coroutine with a real bounded upload queue.
+_original_upload_pipeline = handlers._run_upload_pipeline
+
+
+async def _queued_upload_pipeline(*args):
+    task_id = args[-1]
+    await upload_manager.enqueue(task_id, args)
+
+
+handlers._run_upload_pipeline = _queued_upload_pipeline
 
 
 if __name__ == "__main__":
-    import asyncio
+
     from pyrogram import idle
 
     async def run_bot():
@@ -71,7 +82,6 @@ if __name__ == "__main__":
 
         logger.info("Telegram client started")
 
-        # Verify the configured upload channel before starting the queue.
         try:
             channel = await app.get_chat(DEFAULT_CHANNEL_ID)
             me = await app.get_chat_member(DEFAULT_CHANNEL_ID, "me")
@@ -87,14 +97,18 @@ if __name__ == "__main__":
                 channel_exc,
             )
 
+        await upload_manager.start(_original_upload_pipeline)
         start_queue_worker(app)
-        logger.info("Queue worker started")
+        logger.info("Queue worker and 4-slot upload pool started")
 
         try:
             await idle()
         finally:
             logger.info("Stopping queue worker...")
             await stop_queue_worker()
+
+            logger.info("Stopping upload pool...")
+            await upload_manager.stop()
 
             logger.info("Stopping Telegram bot...")
             await app.stop()
