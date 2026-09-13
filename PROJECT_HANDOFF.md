@@ -1,6 +1,8 @@
 # Project Handoff — Telegram Bot
 
-## Read this first
+## 🚨 Read this first
+
+**Before any AI/developer edits production code, read `AI_RULES.md` and `AGENTS.md` first.** They are the repository safety gate. No speculative or architecture-blind edits are allowed.
 
 This file is intentionally written for future ChatGPT chats. It prevents repeated explanations and prevents edits to the wrong architecture.
 
@@ -51,13 +53,14 @@ The user has little coding knowledge. Prefer complete, ready-to-paste commands o
 
 ### When changing the bot
 
-1. Verify the change against the V2 call path.
-2. Update code on `bot-vnext`.
-3. Update documentation when architecture/runtime behavior changes.
-4. Record the change in `CHANGELOG.md`.
-5. Run syntax/import tests.
-6. Deploy with `./update.sh`.
-7. Check service status and logs.
+1. **Read `AI_RULES.md` and `AGENTS.md` completely.**
+2. Verify the change against the V2 call path.
+3. Update code on `bot-vnext`.
+4. Update documentation when architecture/runtime behavior changes.
+5. Record the change in `CHANGELOG.md`.
+6. Run syntax/import tests.
+7. Deploy with `update.sh`.
+8. Check service status and logs.
 
 ### Current known history
 
