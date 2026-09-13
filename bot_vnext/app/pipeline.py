@@ -29,10 +29,7 @@ class Pipeline:
         self.on_complete = on_complete
         self.on_failed = on_failed
         self.telegram_gate = TelegramFloodGate(upload_max=4)
-        # Pyrogram defaults to automatically sleeping for short FloodWaits.
-        # Disable that hidden retry so the shared gate sees Telegram's exact
-        # wait signal and can coordinate the queue instead of letting several
-        # workers independently sleep/retry.
+        self._install_dashboard_hooks(client)
         try:
             client.sleep_threshold = 0
         except Exception:
@@ -41,6 +38,65 @@ class Pipeline:
         self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
         self._cleanup_task: asyncio.Task | None = None
+
+    def _install_dashboard_hooks(self, client) -> None:
+        """Route only the persistent live-dashboard message through the gate.
+
+        Pyrogram Message.edit_text() is a bound shortcut to Client.edit_message_text().
+        The existing dashboard also refetched its own message before every edit.
+        We cache the dashboard Message locally, remove that extra Telegram read,
+        and gate only dashboard-shaped edits so selection/UI edits stay normal.
+        """
+        if getattr(client, "_v2_dashboard_gate_installed", False):
+            return
+        setattr(client, "_v2_dashboard_gate_installed", True)
+        cache: dict[tuple[int | str, int], Any] = {}
+        gate = self.telegram_gate
+        original_send = client.send_message
+        original_get = client.get_messages
+        original_edit = client.edit_message_text
+
+        def is_dashboard_text(value: Any) -> bool:
+            return isinstance(value, str) and value.startswith("📊 **LIVE DOWNLOAD / UPLOAD**")
+
+        async def send_message(*args, **kwargs):
+            message = await original_send(*args, **kwargs)
+            text = kwargs.get("text")
+            if text is None and len(args) >= 2:
+                text = args[1]
+            if is_dashboard_text(text):
+                chat_id = kwargs.get("chat_id", args[0] if args else None)
+                if chat_id is not None and getattr(message, "id", None) is not None:
+                    cache[(chat_id, message.id)] = message
+            return message
+
+        async def get_messages(*args, **kwargs):
+            chat_id = kwargs.get("chat_id", args[0] if args else None)
+            message_ids = kwargs.get("message_ids", args[1] if len(args) >= 2 else None)
+            if isinstance(message_ids, int):
+                cached = cache.get((chat_id, message_ids))
+                if cached is not None:
+                    return cached
+            return await original_get(*args, **kwargs)
+
+        async def edit_message_text(*args, **kwargs):
+            chat_id = kwargs.get("chat_id", args[0] if args else None)
+            message_id = kwargs.get("message_id", args[1] if len(args) >= 2 else None)
+            text = kwargs.get("text", args[2] if len(args) >= 3 else None)
+            if not is_dashboard_text(text):
+                return await original_edit(*args, **kwargs)
+            key = f"{chat_id}:{message_id}"
+            async def operation():
+                result = await original_edit(*args, **kwargs)
+                if getattr(result, "id", None) is not None:
+                    cache[(chat_id, result.id)] = result
+                return result
+            await gate.publish_dashboard(key, operation)
+            return cache.get((chat_id, message_id))
+
+        client.send_message = send_message
+        client.get_messages = get_messages
+        client.edit_message_text = edit_message_text
 
     async def start(self) -> None:
         if self._started:
@@ -201,7 +257,11 @@ class Pipeline:
         await remove_artifact_async(item.payload.get("file_path") or (self.output_dir / item.payload.get("filename", f"{task_id}.mp4")))
         await self._cleanup_now()
         if self.on_failed:
-            await self.on_failed(task_id, error)
+            async def render_failed() -> None:
+                await self.on_failed(task_id, error)
+            chat_id = int(item.payload.get("chat_id")) if item.payload.get("chat_id") else None
+            if chat_id is not None:
+                await self.telegram_gate.publish_dashboard(str(chat_id), render_failed)
 
     async def _upload_complete(self, item: QueueItem):
         task_id = str(item.task_id)
