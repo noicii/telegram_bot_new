@@ -154,16 +154,45 @@ class V2Bot:
         if data.startswith("v2:m:"):
             m=data.rsplit(":",1)[1]
             if m not in METHODS: await query.answer("Invalid method",show_alert=True); return
-            await set_default_method(m); await query.answer(f"Default: {method_label(m)}"); await self.send_method_menu(query.message); return
+            s=self.sessions.get(query.from_user.id)
+            if s:
+                s["method"]=m
+                try: await set_method(s["items"][0].get("url") or s.get("source_url") or "",m)
+                except Exception: logger.exception("could not persist session method")
+                await query.answer(f"Method: {method_label(m)}")
+                await self.render_selection(query.message,s)
+            else:
+                await set_default_method(m); await query.answer(f"Default: {method_label(m)}"); await self.send_method_menu(query.message)
+            return
         if data=="v2:clear":
             if self.pipeline: await query.answer(f"Cleared {await self.pipeline.db.clear_finished()} task(s)"); await self.send_queue(query.message); return
             await query.answer()
+        if data.startswith("v2:cancel:"):
+            task_id=data.rsplit(":",1)[1].strip()
+            if not task_id: await query.answer("Invalid task",show_alert=True); return
+            if not self.pipeline: await query.answer("Pipeline is offline",show_alert=True); return
+            ok=await self.pipeline.cancel(task_id)
+            await query.answer("Task cancelled" if ok else "Task is not currently active",show_alert=not ok)
+            await self.send_queue(query.message)
+            return
         s=self.sessions.get(query.from_user.id)
         if not s: await query.answer("Selection expired",show_alert=True); return
+        if data.startswith("v2:t:"):
+            try: index=int(data.rsplit(":",1)[1])
+            except ValueError: await query.answer("Invalid selection",show_alert=True); return
+            if index<0 or index>=len(s["items"]): await query.answer("Invalid selection",show_alert=True); return
+            if index in s["selected"]:
+                s["selected"].remove(index); action="Deselected"
+            else:
+                s["selected"].add(index); action="Selected"
+            await query.answer(action)
+            await self.render_selection(query.message,s)
+            return
         if data=="v2:all": s["selected"]=set(range(len(s["items"]))); await query.answer("All selected"); await self.render_selection(query.message,s); return
         if data=="v2:selclear": s["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message,s); return
         if data.startswith("v2:p:"):
             d=int(data.rsplit(":",1)[1]); pages=max(1,(len(s["items"])+PAGE_SIZE-1)//PAGE_SIZE); s["page"]=max(0,min(pages-1,s["page"]+d)); await query.answer(); await self.render_selection(query.message,s); return
+        if data=="v2:method": await query.answer(); await self.send_method_menu(query.message); return
         if data=="v2:close": self.sessions.pop(query.from_user.id,None); await query.answer("Selection closed"); await query.message.edit_text("❌ Selection cancelled."); return
         if data=="v2:download":
             selected=sorted(s["selected"])
