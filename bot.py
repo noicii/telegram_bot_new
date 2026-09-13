@@ -10,6 +10,11 @@ from config import (
     LOG_DIR,
 )
 from database import init_db
+
+# Apply runtime hardening before handlers are imported.
+from runtime_hardening import apply as apply_runtime_hardening
+apply_runtime_hardening()
+
 from handlers import register_handlers
 from queue_worker import start_queue_worker, stop_queue_worker
 
@@ -18,36 +23,25 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
-        logging.FileHandler(
-            LOG_DIR / "bot.log",
-            encoding="utf-8",
-        ),
+        logging.FileHandler(LOG_DIR / "bot.log", encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
 
 logger = logging.getLogger("telegram_bot")
 
-
-# Validate required configuration before starting.
 if not API_ID:
     raise RuntimeError("API_ID is missing")
-
 if not API_HASH:
     raise RuntimeError("API_HASH is missing")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-
-# Initialize database.
 init_db()
-
 logger.info("Bot configuration loaded")
 logger.info("Default channel: %s", DEFAULT_CHANNEL_ID)
+logger.info("HLS segment concurrency: 16 per video")
 
-
-# Create the Pyrogram client.
 app = Client(
     "telegram_bot_session",
     api_id=API_ID,
@@ -56,8 +50,6 @@ app = Client(
     workers=8,
 )
 
-
-# Register all bot handlers.
 register_handlers(app)
 
 
@@ -68,10 +60,8 @@ if __name__ == "__main__":
     async def run_bot():
         logger.info("Starting Telegram bot...")
         await app.start()
-
         logger.info("Telegram client started")
 
-        # Verify the configured upload channel before starting the queue.
         try:
             channel = await app.get_chat(DEFAULT_CHANNEL_ID)
             me = await app.get_chat_member(DEFAULT_CHANNEL_ID, "me")
@@ -95,17 +85,14 @@ if __name__ == "__main__":
         finally:
             logger.info("Stopping queue worker...")
             await stop_queue_worker()
-
             logger.info("Stopping Telegram bot...")
             await app.stop()
             logger.info("Telegram bot stopped")
 
     try:
         asyncio.get_event_loop().run_until_complete(run_bot())
-
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-
     except Exception:
         logger.exception("Bot crashed")
         raise
