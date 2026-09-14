@@ -31,6 +31,7 @@ def main() -> None:
     engine = read(V2 / "app" / "downloader" / "engine.py")
     browser = read(V2 / "app" / "downloader" / "browser_hls.py")
     update = read(ROOT / "update.sh")
+    update_v2 = read(ROOT / "update_v2.sh")
     gitignore = read(ROOT / ".gitignore")
     database = read(V2 / "app" / "storage" / "database.py")
     pipeline = read(V2 / "app" / "pipeline.py")
@@ -118,10 +119,14 @@ def main() -> None:
             if re.search(pattern, source):
                 fail(f"unsafe construct {label} found in {path.relative_to(ROOT)}")
 
-    if "release_guard.py" not in update:
-        fail("update.sh does not invoke release_guard.py")
-    if "apply_ui_runtime_patch.py" in update:
-        fail("runtime patcher is still referenced by update.sh")
+    # update.sh is intentionally only a stable wrapper; the real deployment
+    # logic and release_guard invocation live in update_v2.sh.
+    if "update_v2.sh" not in update:
+        fail("update.sh does not invoke update_v2.sh")
+    if "release_guard.py" not in update_v2:
+        fail("update_v2.sh does not invoke release_guard.py")
+    if "apply_ui_runtime_patch.py" in update or "apply_ui_runtime_patch.py" in update_v2:
+        fail("runtime patcher is still referenced by updater")
     if (V2 / "apply_ui_runtime_patch.py").exists():
         fail("runtime patcher file still exists")
 
