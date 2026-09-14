@@ -103,7 +103,6 @@ class Database:
             conn.close()
 
     async def transition(self, task_id: str, from_statuses: tuple[str, ...], to_status: str, **fields) -> bool:
-        """Atomically change state only if the task is still in an expected state."""
         allowed = {"url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if isinstance(fields.get("metadata"), dict):
@@ -200,8 +199,8 @@ class Database:
         finally:
             conn.close()
 
-    async def mark_downloading(self, task_id):
-        return await self.transition(task_id, ("queued",), "downloading", started_at=time.time(), error=None)
+    async def mark_downloading(self, task_id, **fields):
+        return await self.transition(task_id, ("queued",), "downloading", started_at=time.time(), error=None, **fields)
 
     async def mark_uploading(self, task_id):
         return await self.transition(task_id, ("downloading",), "uploading", error=None)
@@ -210,23 +209,18 @@ class Database:
         return await self.transition(task_id, ("uploading",), "completed", progress=100, completed_at=time.time(), error=None)
 
     async def mark_failed(self, task_id, error):
-        task = await self.get_task(task_id)
-        if not task or task.get("status") in {"completed", "cancelled"}:
-            return False
         return await self.transition(task_id, ("queued", "downloading", "uploading"), "failed", error=str(error))
 
     async def mark_cancelled(self, task_id):
         return await self.transition(task_id, ("queued", "downloading", "uploading"), "cancelled")
 
     async def reset_for_retry(self, task_id: str) -> bool:
-        """Move a terminal task back to queued while preserving retry history."""
         task = await self.get_task(task_id)
         if not task or task.get("status") not in {"failed", "cancelled"}:
             return False
         count = int(task.get("retry_count") or 0) + 1
         maximum = max(0, int(task.get("max_retries") or 3))
         if count > maximum:
-            await self.mark_failed(task_id, f"Maximum retries exceeded ({maximum})")
             return False
         return await self.transition(
             task_id,
@@ -238,11 +232,9 @@ class Database:
             eta=0,
             error=None,
             completed_at=None,
-            file_path=None,
         )
 
     async def increment_retry(self, task_id):
-        """Backward-compatible retry counter helper with the same semantics."""
         return await self.reset_for_retry(task_id)
 
     async def update_progress(self, task_id, *, progress, speed=0, eta=0):
