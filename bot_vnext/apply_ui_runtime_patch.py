@@ -91,7 +91,6 @@ else:
     if old_rows not in text:
         raise SystemExit("ERROR: dashboard task query was not found; refusing unsafe patch")
     text = text.replace(old_rows, new_rows, 1)
-
     old_markup='reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])'
     new_markup='reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Retry {str(r.get(\'title\') or r.get(\'id\'))[:24]}",callback_data=f"v2:retry:{r.get(\'id\')}")] for r in failed_rows_for_retry]+[[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])'
     if old_markup not in text:
@@ -129,6 +128,27 @@ elif old_status in text:
     print("status callback patch applied")
 else:
     raise SystemExit("ERROR: v2:status callback anchor not found; refusing unsafe patch")
+
+# Make method-menu rendering explicitly support same-message edits. Callback/UI
+# flows use edit=True; the /method command still creates a fresh bot message.
+old_method = '''    async def send_method_menu(self,message): cur=await get_default_method(); await message.reply_text(f"🎯 **DOWNLOAD METHOD**\\n\\nCurrent default: **{method_label(cur)}**",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==cur else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS]))
+'''
+new_method = '''    async def send_method_menu(self,message,edit=False):
+        cur=await get_default_method()
+        markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==cur else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS])
+        text=f"🎯 **DOWNLOAD METHOD**\\n\\nCurrent default: **{method_label(cur)}**"
+        if edit:
+            await message.edit_text(text,reply_markup=markup)
+        else:
+            await message.reply_text(text,reply_markup=markup)
+'''
+if 'async def send_method_menu(self,message,edit=False):' in text:
+    print("same-message method menu helper already applied")
+elif old_method in text:
+    text = text.replace(old_method, new_method, 1)
+    print("same-message method menu helper applied")
+else:
+    raise SystemExit("ERROR: send_method_menu anchor not found; refusing safe UI patch")
 
 MAIN.write_text(text, encoding="utf-8")
 
@@ -175,7 +195,6 @@ ENGINE.write_text(engine, encoding="utf-8")
 # Browser HLS discovery + realtime segment UI hardening
 # ---------------------------------------------------------------------------
 browser = BROWSER_HLS.read_text(encoding="utf-8")
-
 old_capture_gate = '            if response.status != 200 or (".m3u8" not in low and "mpegurl" not in ct):\n                return\n'
 new_capture_gate = '''            manifest_hint = any(token in low for token in (".m3u8", "manifest", "playlist", "master"))
             manifest_ct = any(token in ct for token in ("mpegurl", "m3u8", "vnd.apple.mpegurl"))
@@ -205,15 +224,13 @@ new_trigger_loop = '''        deadline = time.monotonic() + 45
         tick = 0
         while time.monotonic() < deadline and not captured:
             task.check_cancelled()
-            # Players/iframes can appear after DOMContentLoaded. Re-trigger
-            # playback periodically instead of only once at initial load.
             if tick % 2 == 0:
                 await self._trigger_playback(page, task)
             await self._report(progress, 1.0, 0, None, 0.0, {"browser_hls_stage": "discovering"})
             tick += 1
             await asyncio.sleep(0.5)
 '''
-if 'tick = 0' in browser and 'Re-trigger' in browser:
+if 'tick = 0' in browser and 'if tick % 2 == 0' in browser:
     print("Browser HLS repeated playback trigger already applied")
 elif old_trigger_loop in browser:
     browser = browser.replace(old_trigger_loop, new_trigger_loop, 1)
@@ -240,8 +257,6 @@ new_cleanup = '''                try:
                     await browser.close()
                 except Exception:
                     pass
-                # TaskContext cleanup intentionally handles files, while this
-                # downloader owns a per-task directory.
                 shutil.rmtree(work, ignore_errors=True)
                 task.temp_paths.discard(work)
 '''
@@ -252,11 +267,8 @@ elif old_cleanup in browser:
     print("Browser HLS work-directory cleanup applied")
 else:
     raise SystemExit("ERROR: Browser HLS browser-close cleanup anchor not found; refusing unsafe patch")
-
 BROWSER_HLS.write_text(browser, encoding="utf-8")
 
-# Segmented downloads should show segment progress as the primary live metric,
-# with byte count as secondary data rather than replacing the segment counter.
 main = MAIN.read_text(encoding="utf-8")
 old_hls_ui = 'lines.append(f"🧩 HLS: **{hls_done} / {hls_total} segments** • **{hls_pct:.0f}%**")\n                        lines.append(f"📥 Downloaded: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")'
 new_hls_ui = 'lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**")\n                        lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")'
