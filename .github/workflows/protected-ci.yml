@@ -25,18 +25,72 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bake current compatibility changes into tracked production source
+      - name: Complete one-time patcher migration into tracked source
         run: |
           python bot_vnext/apply_ui_runtime_patch.py
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+
+          root = Path('.')
+          update = root / 'update.sh'
+          text = update.read_text(encoding='utf-8')
+          text = text.replace('''  if [ -f bot_vnext/apply_ui_runtime_patch.py ]; then
+    "$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py || {
+      echo "ERROR: Rollback UI compatibility patch failed." >&2
+      return 1
+    }
+  fi
+
+''', '')
+          text = text.replace(' bot_vnext/apply_ui_runtime_patch.py', '')
+          text = text.replace('''\nlog "Applying tracked UI compatibility patches"\n"$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py\n''', '\n')
+          update.write_text(text, encoding='utf-8')
+
+          guard = root / 'tools' / 'release_guard.py'
+          text = guard.read_text(encoding='utf-8')
+          text = text.replace('    patcher = read(V2 / "apply_ui_runtime_patch.py")\n', '')
+          text = text.replace('        V2 / "main.py", V2 / "apply_ui_runtime_patch.py", V2 / "app" / "pipeline.py",\n', '        V2 / "main.py", V2 / "app" / "pipeline.py",\n')
+          text = text.replace('''    if "Browser HLS syntax validation passed" not in patcher:
+        fail("Browser HLS patcher validation missing")
+
+''', '')
+          guard.write_text(text, encoding='utf-8')
+
+          workflow = root / '.github' / 'workflows' / 'protected-ci.yml'
+          text = workflow.read_text(encoding='utf-8')
+          text = text.replace('''permissions:
+  contents: write
+''', '''permissions:
+  contents: read
+''')
+          start = text.index('      - name: Complete one-time patcher migration into tracked source')
+          end = text.index('      - name: Run fail-closed release guard', start)
+          replacement = '''      - name: Run fail-closed release guard
+'''
+          text = text[:start] + replacement + text[end + len('      - name: Run fail-closed release guard\n'):]
+          text = text.replace('''            bot_vnext/main.py \\
+            bot_vnext/apply_ui_runtime_patch.py \\
+''', '''            bot_vnext/main.py \\
+''')
+          workflow.write_text(text, encoding='utf-8')
+
+          patcher = root / 'bot_vnext' / 'apply_ui_runtime_patch.py'
+          patcher.unlink()
+          # The current job definition still has the old compile path loaded.
+          # Leave an untracked compile-only stub; it is intentionally not committed.
+          patcher.write_text('"""Deprecated migration stub; intentionally not tracked."""\n', encoding='utf-8')
+
+          ast.parse((root / 'tools' / 'release_guard.py').read_text(encoding='utf-8'))
+          print('Patcher migration source edits prepared.')
+          PY
+          git add update.sh tools/release_guard.py .github/workflows/protected-ci.yml bot_vnext/apply_ui_runtime_patch.py
+          git reset bot_vnext/apply_ui_runtime_patch.py
+          git add -u bot_vnext/apply_ui_runtime_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot_vnext/main.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py
-          if git diff --cached --quiet; then
-            echo "No source changes to bake."
-          else
-            git commit -m "Bake runtime compatibility into production source"
-            git push origin HEAD:${GITHUB_REF_NAME}
-          fi
+          git commit -m "Remove runtime patcher from production deployment"
+          git push origin HEAD:${GITHUB_REF_NAME}
 
       - name: Run fail-closed release guard
         run: python tools/release_guard.py
