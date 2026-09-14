@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 # Production updater. It copies itself outside the Git worktree before any
 # checkout/reset, so Git can never replace the running updater in memory.
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Preserve the repository root across that self-copy; otherwise BASH_SOURCE[0]
+# would point at /tmp and the updater could not find .git.
+ROOT="${TELEGRAM_BOT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 SELF_COPY="/tmp/telegram-bot-update-$$.sh"
 MODE="${1:-start}"
 
@@ -13,6 +15,7 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 if [ "$MODE" != "--run-from-copy" ]; then
   cp -f "${BASH_SOURCE[0]}" "$SELF_COPY"
   chmod 700 "$SELF_COPY"
+  export TELEGRAM_BOT_ROOT="$ROOT"
   exec bash "$SELF_COPY" --run-from-copy
 fi
 
