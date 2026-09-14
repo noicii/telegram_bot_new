@@ -58,8 +58,6 @@ async def find_working_proxy(limit: int) -> tuple[str, str] | None:
     print(f"[TEST] Downloaded {len(candidates)} public HTTP proxy candidates")
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Return the actual proxy together with its exit IP so there is no
-        # ambiguity when asyncio.as_completed() wraps coroutine futures.
         async def check(proxy: str) -> tuple[str, str] | None:
             ip = await validate_proxy(session, proxy)
             return (proxy, ip) if ip else None
@@ -116,26 +114,22 @@ async def main() -> int:
         return 1
     proxy, exit_ip = proxy_info
 
-    # HybridDownloader requires an output_dir. This is an isolated test-only
-    # directory and is never used by the production bot process.
     test_output = ROOT / "test_results" / "proxy_compare_work"
     test_output.mkdir(parents=True, exist_ok=True)
     task = TaskContext(task_id="free-proxy-compare-test")
     downloader = HybridDownloader(output_dir=test_output)
-    try:
-        print("[TEST] Step 1: fresh HLS discovery")
-        stream = await downloader._discover_hls(args.url, task, {"User-Agent": "Mozilla/5.0"}, None)
-        if not stream:
-            print("[TEST] FINAL: FAIL - no HLS URL discovered")
-            return 1
-        print(f"[TEST] HLS DISCOVERY SUCCESS host={stream.split('/')[2] if '://' in stream else 'unknown'}")
 
-        timeout = aiohttp.ClientTimeout(total=35)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
-            await probe(session, stream, "DIRECT", None)
-            await probe(session, stream, f"FREE_PROXY exit={exit_ip}", proxy)
-    finally:
-        await downloader.close()
+    print("[TEST] Step 1: fresh HLS discovery")
+    stream = await downloader._discover_hls(args.url, task, {"User-Agent": "Mozilla/5.0"}, None)
+    if not stream:
+        print("[TEST] FINAL: FAIL - no HLS URL discovered")
+        return 1
+    print(f"[TEST] HLS DISCOVERY SUCCESS host={stream.split('/')[2] if '://' in stream else 'unknown'}")
+
+    timeout = aiohttp.ClientTimeout(total=35)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
+        await probe(session, stream, "DIRECT", None)
+        await probe(session, stream, f"FREE_PROXY exit={exit_ip}", proxy)
 
     print("[TEST] FINAL: COMPLETE - compare DIRECT and FREE_PROXY results above")
     return 0
