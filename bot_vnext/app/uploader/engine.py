@@ -257,7 +257,14 @@ class UploadEngine:
         return await self.client.send_video(video=str(path), **common)
 
     async def _split_large_video(self, task: TaskContext, source: Path, parts_dir: Path) -> list[Path]:
-        """Split a large video into upload-safe MP4 parts using stream copy."""
+        """Split a large video into upload-safe MP4 parts using adaptive stream copy.
+
+        The segment muxer normally cuts on keyframes, so a requested 1900 MiB
+        target can overshoot when a source has sparse keyframes or a very high
+        bitrate. Retry with progressively smaller time targets before failing.
+        This changes only the upload-side packaging; the downloaded source is
+        never re-encoded or otherwise modified.
+        """
         task.check_cancelled()
         await asyncio.to_thread(self._check_ffmpeg)
         parts_dir.mkdir(parents=True, exist_ok=True)
@@ -265,23 +272,61 @@ class UploadEngine:
         if duration <= 0:
             raise UploadError(f"Could not determine video duration for splitting: {source}")
         size = source.stat().st_size
-        target_seconds = max(30.0, duration * SPLIT_TARGET_BYTES / size * 0.88)
-        output_pattern = str(parts_dir / "part_%03d.mp4")
-        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", f"{target_seconds:.3f}", "-reset_timestamps", "1", "-movflags", "+faststart", output_pattern]
-        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            message = stderr.decode("utf-8", errors="replace")[-2000:]
-            raise UploadError(f"FFmpeg could not split large video: {message}")
-        parts = sorted(parts_dir.glob("part_*.mp4"))
-        if not parts:
-            raise UploadError(f"FFmpeg produced no upload parts for {source}")
-        oversized = [p for p in parts if p.stat().st_size > MAX_UPLOAD_BYTES]
-        if oversized:
-            biggest = max(p.stat().st_size for p in oversized) / 1024 / 1024
-            self._cleanup_parts(parts_dir, parts)
-            raise UploadError(f"FFmpeg split produced an oversized part ({biggest:.1f} MiB). Source bitrate/keyframes prevent safe automatic splitting.")
-        return parts
+
+        # Start close to the preferred 1900 MiB target, then progressively
+        # reduce the target if keyframe alignment makes any part too large.
+        target_factors = (0.88, 0.78, 0.68, 0.58, 0.48, 0.38)
+        last_oversized_mib = 0.0
+        last_error = ""
+
+        for attempt, factor in enumerate(target_factors, 1):
+            task.check_cancelled()
+            self._cleanup_parts(parts_dir, sorted(parts_dir.glob("part_*.mp4")))
+            parts_dir.mkdir(parents=True, exist_ok=True)
+
+            target_seconds = max(15.0, duration * SPLIT_TARGET_BYTES / size * factor)
+            output_pattern = str(parts_dir / "part_%03d.mp4")
+            command = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", "0", "-c", "copy",
+                "-f", "segment", "-segment_time", f"{target_seconds:.3f}",
+                "-reset_timestamps", "1", "-movflags", "+faststart", output_pattern,
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                last_error = stderr.decode("utf-8", errors="replace")[-2000:]
+                if attempt < len(target_factors):
+                    logger.warning("Large-video split attempt %d failed; retrying with smaller parts: %s", attempt, last_error)
+                    continue
+                raise UploadError(f"FFmpeg could not split large video: {last_error}")
+
+            parts = sorted(parts_dir.glob("part_*.mp4"))
+            if not parts:
+                last_error = f"FFmpeg produced no upload parts on attempt {attempt}"
+                if attempt < len(target_factors):
+                    continue
+                raise UploadError(last_error)
+
+            oversized = [p for p in parts if p.stat().st_size > MAX_UPLOAD_BYTES]
+            if not oversized:
+                logger.info("Large-video split succeeded on attempt %d with %d parts (target %.1f MiB)", attempt, len(parts), SPLIT_TARGET_BYTES / 1024 / 1024 * factor)
+                return parts
+
+            last_oversized_mib = max(p.stat().st_size for p in oversized) / 1024 / 1024
+            logger.warning(
+                "Large-video split attempt %d produced oversized part %.1f MiB; retrying with smaller target",
+                attempt, last_oversized_mib,
+            )
+
+        self._cleanup_parts(parts_dir, sorted(parts_dir.glob("part_*.mp4")))
+        raise UploadError(
+            f"Could not split video below 2000 MiB after {len(target_factors)} adaptive attempts "
+            f"(largest part remained about {last_oversized_mib:.1f} MiB). "
+            "Source bitrate/keyframes may prevent safe stream-copy splitting."
+        )
 
     @staticmethod
     def _check_ffmpeg() -> None:
