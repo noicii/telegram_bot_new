@@ -102,6 +102,28 @@ class Database:
         finally:
             conn.close()
 
+    async def transition(self, task_id: str, from_statuses: tuple[str, ...], to_status: str, **fields) -> bool:
+        """Atomically change state only if the task is still in an expected state."""
+        allowed = {"url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        if isinstance(fields.get("metadata"), dict):
+            fields["metadata"] = json.dumps(fields["metadata"], ensure_ascii=False)
+        fields["status"] = to_status
+        fields["updated_at"] = time.time()
+        return await asyncio.to_thread(self._transition_sync, task_id, from_statuses, fields)
+
+    def _transition_sync(self, task_id, from_statuses, fields):
+        marks = ",".join("?" for _ in from_statuses)
+        columns = ", ".join(f"{k} = ?" for k in fields)
+        values = list(fields.values()) + [task_id, *from_statuses]
+        conn = self._connect()
+        try:
+            cur = conn.execute(f"UPDATE tasks SET {columns} WHERE id = ? AND status IN ({marks})", values)
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
     async def get_task(self, task_id: str):
         return await asyncio.to_thread(self._get_sync, task_id)
 
@@ -179,19 +201,22 @@ class Database:
             conn.close()
 
     async def mark_downloading(self, task_id):
-        await self.update_task(task_id, status="downloading", started_at=time.time(), error=None)
+        return await self.transition(task_id, ("queued",), "downloading", started_at=time.time(), error=None)
 
     async def mark_uploading(self, task_id):
-        await self.update_task(task_id, status="uploading", error=None)
+        return await self.transition(task_id, ("downloading",), "uploading", error=None)
 
     async def mark_completed(self, task_id):
-        await self.update_task(task_id, status="completed", progress=100, completed_at=time.time(), error=None)
+        return await self.transition(task_id, ("uploading",), "completed", progress=100, completed_at=time.time(), error=None)
 
     async def mark_failed(self, task_id, error):
-        await self.update_task(task_id, status="failed", error=str(error))
+        task = await self.get_task(task_id)
+        if not task or task.get("status") in {"completed", "cancelled"}:
+            return False
+        return await self.transition(task_id, ("queued", "downloading", "uploading"), "failed", error=str(error))
 
     async def mark_cancelled(self, task_id):
-        await self.update_task(task_id, status="cancelled")
+        return await self.transition(task_id, ("queued", "downloading", "uploading"), "cancelled")
 
     async def reset_for_retry(self, task_id: str) -> bool:
         """Move a terminal task back to queued while preserving retry history."""
@@ -203,9 +228,10 @@ class Database:
         if count > maximum:
             await self.mark_failed(task_id, f"Maximum retries exceeded ({maximum})")
             return False
-        await self.update_task(
+        return await self.transition(
             task_id,
-            status="queued",
+            ("failed", "cancelled"),
+            "queued",
             retry_count=count,
             progress=0,
             speed=0,
@@ -214,7 +240,6 @@ class Database:
             completed_at=None,
             file_path=None,
         )
-        return True
 
     async def increment_retry(self, task_id):
         """Backward-compatible retry counter helper with the same semantics."""
