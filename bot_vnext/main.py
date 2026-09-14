@@ -22,6 +22,7 @@ from app.downloader.method_store import get_method, set_method, get_default_meth
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("bot_vnext")
 PAGE_SIZE = 8
+DIRECT_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".m3u8", ".mpd"}
 COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("failed","❌ Show failed download links"),("clear","🧹 Clear completed/failed/cancelled tasks"),("crawl","🔎 Crawl URL & select episodes"),("settings","⚙️ Bot settings & controls"),("method","🎯 Choose download method"),("health","🩺 Check bot & engine health")]
 def owner_only(message): return bool(OWNER_ID and message.from_user and message.from_user.id == OWNER_ID)
 def callback_owner(query): return bool(OWNER_ID and query.from_user and query.from_user.id == OWNER_ID)
@@ -122,11 +123,50 @@ class V2Bot:
         p=(message.text or "").split(maxsplit=1)
         if len(p)!=2: await message.reply_text("Usage: `/crawl https://example.com/episode-page`"); return
         await self.crawl_url(message,p[1].strip())
+    def _is_direct_media_url(self,url):
+        try:
+            parsed=urlparse(url)
+            if parsed.scheme not in {"http","https"} or not parsed.netloc: return False
+            path=parsed.path.lower()
+            return any(path.endswith(ext) for ext in DIRECT_MEDIA_EXTENSIONS)
+        except Exception:
+            return False
+    def _direct_media_method(self,url):
+        try:
+            ext=Path(urlparse(url).path.lower()).suffix
+        except Exception:
+            ext=""
+        if ext==".m3u8": return "hls-multi"
+        return "auto"
+    async def direct_media_url(self,message,url):
+        if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
+        parsed=urlparse(url)
+        raw_name=Path(parsed.path).name or "video"
+        stem=sanitize_filename(Path(raw_name).stem) or "video"
+        ext=Path(raw_name).suffix.lower()
+        if ext not in DIRECT_MEDIA_EXTENSIONS: ext=".mp4"
+        filename=stem+ext
+        if ext in {".m3u8",".mpd"}: filename=stem+".mp4"
+        tid=uuid.uuid4().hex
+        method=self._direct_media_method(url)
+        md={"source_url":url,"provider":"direct","download_method":method,"cookiefile":str(COOKIES_PATH) if COOKIES_PATH.is_file() else None,"headers":{"Referer":url}}
+        md={k:v for k,v in md.items() if v}
+        payload={"task_type":"download","url":url,"filename":filename,"chat_id":message.chat.id,"caption":stem,"thumbnail":str(THUMB_PATH) if THUMB_PATH.is_file() else None,"mode":"video","title":stem,"provider":"direct","resolution":None,"metadata":md}
+        try:
+            await self.pipeline.submit(tid,payload)
+            dash=await message.reply_text(f"🚀 **Direct media queued**\n🎬 {stem}\n🎯 Method: {method_label(method)}\n\n📊 Starting live dashboard…")
+            self.dashboard_messages[message.chat.id]=dash.id
+            await self.render_dashboard(message.chat.id,dash.id,True)
+        except Exception as exc:
+            logger.exception("direct media queue failed")
+            await message.reply_text(f"❌ Could not queue direct media\n`{str(exc)[:700]}`")
     async def text_url(self,client,message):
         if not owner_only(message): return
         t=(message.text or "").strip()
         if not t or t.startswith("/"): return
-        if t.startswith(("http://","https://")): await self.crawl_url(message,t)
+        if t.startswith(("http://","https://")):
+            if self._is_direct_media_url(t): await self.direct_media_url(message,t)
+            else: await self.crawl_url(message,t)
         else: await message.reply_text("🔗 Send a valid http/https URL or use `/crawl <URL>`.")
     async def crawl_url(self,message,url):
         wait=await message.reply_text("🔎 Crawling… please wait")
