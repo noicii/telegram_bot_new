@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-09-15
+
+### Reliability hardening
+- Added an atomic database task-state transition primitive so completion, upload handoff, failure, cancellation, and download start cannot overwrite a newer terminal state after a race.
+- Updated the pipeline to use guarded state transitions during download-to-upload handoff and final completion/failure paths.
+- Added a regression test proving two concurrent state transitions can only claim the same queued task once.
+- Browser HLS temporary work directories are registered with task cleanup and explicitly removed after browser shutdown; task-level cleanup also recursively removes registered directories.
+- Release guard now verifies the atomic state-transition contract and Browser HLS cleanup contract before deployment.
+
+### Retry safety
+- Retry history remains monotonic and is enforced atomically when a failed/cancelled task is requeued.
+
 ## 2026-09-13
 
 ### Downloader diagnostic test harness
