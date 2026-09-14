@@ -1,0 +1,40 @@
+name: Protected Bot V2 CI
+
+on:
+  push:
+    branches: ["bot-vnext"]
+  pull_request:
+    branches: ["bot-vnext"]
+
+permissions:
+  contents: read
+
+jobs:
+  protected-ci:
+    name: Protected Bot V2 CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply the same deterministic compatibility build used by production
+        run: python bot_vnext/apply_ui_runtime_patch.py
+
+      - name: Run fail-closed release guard
+        run: python tools/release_guard.py
+
+      - name: Compile production Python
+        run: |
+          python -m py_compile \
+            bot_vnext/main.py \
+            bot_vnext/apply_ui_runtime_patch.py \
+            bot_vnext/app/pipeline.py \
+            bot_vnext/app/downloader/engine.py \
+            bot_vnext/app/downloader/browser_hls.py \
+            bot_vnext/app/queue/upload_manager.py \
+            bot_vnext/app/uploader/engine.py
