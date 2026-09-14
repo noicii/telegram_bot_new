@@ -49,6 +49,7 @@ bot_vnext/main.py
       |       |
       |       +--> direct download
       |       +--> HLS Multi (16 segments/video target)
+      |       +--> Browser HLS (16 authenticated requests/video)
       |       +--> FFmpeg mux/remux
       |
       +--> UploadManager (4 workers)
@@ -67,10 +68,12 @@ bot_vnext/main.py
 | Download workers | 2 |
 | Upload workers | 4 |
 | HLS segment concurrency per video | **16 target** |
+| Browser HLS request concurrency | **16 target** |
 | HTTP connector total limit | 150 |
 | HTTP connector per-host limit | 40 |
 | HLS segment retries | 3 attempts |
-| Retry delays | 1s, 2s |
+| Retry budget | **3 manual retries after the original attempt** |
+| Retry history | Preserved; never reset to zero on manual retry |
 | Production bot processes | **1** |
 
 ## Queue / status
@@ -81,6 +84,7 @@ bot_vnext/main.py
 - Cancellation is propagated through the task context and upload manager.
 - The local SQLite database is disposable for deployments; a fresh update intentionally removes the old DB/queue state.
 - Interrupted `downloading`/`uploading` tasks are marked failed on restart and are not automatically resumed.
+- Manual retry increments and preserves `retry_count`; a task is not re-queued once its configured retry budget is exhausted.
 
 ## Media / storage lifecycle
 
@@ -90,6 +94,7 @@ bot_vnext/main.py
 - Cancelled downloads/uploads delete their local artifacts immediately.
 - Successful uploads delete the source media immediately.
 - Large-upload FFmpeg split parts are temporary and are removed after success or failure.
+- Browser HLS temporary directories are registered with `TaskContext` and recursively removed on task cleanup.
 - Old interrupted artifacts are removed at startup rather than resumed.
 - Stale `.part`, `.tmp`, `.ytdl`, and abandoned split directories are automatically cleaned.
 
@@ -112,10 +117,11 @@ See `bot_vnext/STORAGE_CLEANUP.md` for the complete lifecycle and operational ru
 - Upload engine reports final progress after the Telegram send operation returns.
 - Files larger than 2000 MiB are automatically split into upload-safe parts targeting about 1900 MiB.
 - Completed/failed upload artifacts are deleted automatically.
+- Telegram upload pressure is controlled by the shared FloodGate, which adapts between 1 and 4 concurrent sends.
 
 ## Dashboard / commands
 
-The V2 bot includes live queue/status dashboard functionality, including status and queue views and a refresh action. Exact command behavior must be checked in `bot_vnext/main.py` before changing it.
+The V2 bot includes live queue/status dashboard functionality, including status and queue views and a refresh action. The existing browser method is displayed as **Browser HLS** without adding a second UI method. Exact command behavior must be checked in `bot_vnext/main.py` before changing it.
 
 ## Dependencies
 
@@ -123,7 +129,7 @@ Dependencies are defined in `requirements.txt`. Current project requirements inc
 
 ## Deployment rule
 
-Do **not** manually mix old local Python files with GitHub code. Use `./update.sh` from the repository root. The updater requires systemd and the canonical `telegram-bot.service`; it never falls back to `nohup`. It stops the service, cleans leftover V2 processes, fetches and hard-resets the branch, installs dependencies, reloads/enables the service, starts it, and verifies one V2 process.
+Do **not** manually mix old local Python files with GitHub code. Use `./update.sh` from the repository root. The updater requires systemd and the canonical `telegram-bot.service`; it never falls back to `nohup`. It stops the service, cleans leftover V2 processes, fetches and hard-resets the branch, installs dependencies, validates protected contracts, starts it, and verifies one V2 process. Failed deployments are automatically rolled back to the last working Git revision.
 
 ## Important maintenance rule
 
