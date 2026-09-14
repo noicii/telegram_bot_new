@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnostic only: test the generic signed-HLS -> yt-dlp fallback path.
+"""Diagnostic only: test signed-HLS -> yt-dlp with browser request context.
 
 This tool does not modify production downloader behavior. The URL is supplied
 at runtime; no source-specific URL or provider is embedded in the repository.
@@ -7,6 +7,7 @@ at runtime; no source-specific URL or provider is embedded in the repository.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -15,10 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot_vnext"))
 
 from app.core.task import TaskContext
 from app.downloader.engine import HybridDownloader
+from config import COOKIES_PATH
 
 
 def _safe_line(line: str) -> str:
-    import re
     line = re.sub(r"https?://[^\s]+", "<redacted-url>", line)
     return line[-1000:]
 
@@ -36,13 +37,12 @@ async def main(source: str) -> int:
 
     task = TaskContext(task_id="signed-hls-fallback-test", metadata={})
     downloader = HybridDownloader(out_dir)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        )
-    }
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+    headers = {"User-Agent": user_agent, "Referer": source}
 
     try:
         print("[TEST] Discovering fresh signed HLS URL...")
@@ -56,12 +56,22 @@ async def main(source: str) -> int:
             binary,
             "--newline",
             "--no-part",
+            "--user-agent", user_agent,
+            "--referer", source,
+        ]
+        if COOKIES_PATH.is_file():
+            command += ["--cookies", str(COOKIES_PATH)]
+            print("[TEST] Using configured browser cookies")
+        else:
+            print("[TEST] No configured cookie file found")
+        command += [
             "-f", "bv*+ba/b",
             "--merge-output-format", "mp4",
             "-o", str(output),
             stream,
         ]
-        print("[TEST] Running yt-dlp against the fresh signed HLS URL...")
+
+        print("[TEST] Running yt-dlp with User-Agent + Referer + cookies...")
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
