@@ -40,6 +40,7 @@ class HybridDownloader:
             requested = "auto"
         plan = self._build_plan(url, requested)
         logger.info("task=%s download_method=%s plan=%s", task.task_id, requested, plan)
+        fallback_enabled = requested in {"auto", "hls-multi"}
 
         errors: list[str] = []
         for engine in plan:
@@ -57,9 +58,9 @@ class HybridDownloader:
                     elif engine == "direct":
                         await self._direct(url, output, task, progress)
                     elif engine == "ffmpeg":
-                        await self._ffmpeg(url, output, task, progress)
+                        await self._ffmpeg(task.metadata.get("stream_url") or url, output, task, progress, headers=task.metadata.get("headers") or None)
                     elif engine == "yt-dlp":
-                        await self._ytdlp(url, output, task, progress)
+                        await self._ytdlp(task.metadata.get("stream_url") or url, output, task, progress)
                     elif engine == "browser":
                         await self._browser(url, output, task, progress)
                     else:
@@ -77,17 +78,19 @@ class HybridDownloader:
                 except Exception as exc:
                     errors.append(f"{engine} attempt {attempt + 1}: {exc}")
                     logger.warning("task=%s %s attempt=%s failed: %s", task.task_id, engine, attempt + 1, exc)
-                    if requested != "auto" and attempt < self.retries:
+                    if attempt < self.retries:
                         await asyncio.sleep(min(2.0 * (attempt + 1), 5.0))
                         continue
-                    if requested != "auto":
+                    if not fallback_enabled:
                         raise DownloadError(f"Selected method '{engine}' failed after {self.retries + 1} attempts: {exc}") from exc
                     await asyncio.sleep(min(2.0 * (attempt + 1), 5.0))
+                    break
 
         raise DownloadError("All download methods failed: " + " | ".join(errors[-8:]))
 
     @staticmethod
     def _build_plan(url: str, requested: str = "auto") -> list[str]:
+        if requested == "hls-multi": return ["hls-multi", "ffmpeg", "browser", "yt-dlp", "direct"]
         if requested != "auto": return [requested]
         lower = url.lower()
         if ".m3u8" in lower or ".mpd" in lower: return ["hls-multi", "ffmpeg", "browser", "yt-dlp", "direct"]
@@ -116,6 +119,7 @@ class HybridDownloader:
         stream_url = url if ".m3u8" in url.lower() else await self._discover_hls(url, task, headers, progress)
         if not stream_url: raise DownloadError("HLS stream URL could not be discovered")
         task.metadata["stream_url"] = stream_url
+        task.metadata["headers"] = headers
 
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
         connector = aiohttp.TCPConnector(limit=150, limit_per_host=40, ttl_dns_cache=300, enable_cleanup_closed=True)
@@ -123,6 +127,7 @@ class HybridDownloader:
             playlist = await self._fetch_text(session, stream_url)
             if "#EXT-X-STREAM-INF" in playlist:
                 stream_url = self._best_variant(stream_url, playlist)
+                task.metadata["stream_url"] = stream_url
                 playlist = await self._fetch_text(session, stream_url)
 
             if "#EXT-X-KEY:" in playlist:
@@ -156,14 +161,7 @@ class HybridDownloader:
                                 completed += 1
                                 total_bytes += len(data)
                                 elapsed = max(time.monotonic() - started, 0.001)
-                                await self._report(
-                                    progress,
-                                    completed * 100 / len(segments),
-                                    total_bytes,
-                                    None,
-                                    total_bytes / elapsed,
-                                    {"hls_completed": completed, "hls_total": len(segments), "hls_retries": retry_count},
-                                )
+                                await self._report(progress, completed * 100 / len(segments), total_bytes, None, total_bytes / elapsed, {"hls_completed": completed, "hls_total": len(segments), "hls_retries": retry_count})
                                 return
                         except TaskCancelled:
                             raise
@@ -182,10 +180,7 @@ class HybridDownloader:
                 await asyncio.gather(*workers, return_exceptions=True)
                 raise
 
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-movflags", "+faststart", str(output),
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-            )
+            proc = await asyncio.create_subprocess_exec("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", "pipe:0", "-c", "copy", "-movflags", "+faststart", str(output), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             task.register_process(proc)
             try:
                 for data in results:
