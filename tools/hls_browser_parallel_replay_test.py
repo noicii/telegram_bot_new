@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
-from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
@@ -27,7 +26,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
     parser.add_argument("--segments", type=int, default=4)
-    parser.add_argument("--wait", type=int, default=60)
+    parser.add_argument("--wait", type=int, default=90)
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
 
@@ -38,6 +37,7 @@ async def main() -> int:
     print("[TEST] Production files are NOT modified.")
 
     captured: dict[str, dict] = {}
+    request_headers: dict[str, dict[str, str]] = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -59,13 +59,24 @@ async def main() -> int:
         def on_request(params):
             req = params.get("request") or {}
             url = str(req.get("url") or "")
-            if ".ts" not in url.lower() or url in captured:
+            if ".ts" not in url.lower():
                 return
             headers = {str(k): str(v) for k, v in (req.get("headers") or {}).items()}
-            captured[url] = {"headers": headers}
-            print(f"[CAPTURE] segment={segment_number(url)} host={urlparse(url).hostname}")
+            request_headers[url] = headers
+
+        def on_response(params):
+            response = params.get("response") or {}
+            url = str(response.get("url") or "")
+            status = int(response.get("status") or 0)
+            if ".ts" not in url.lower() or status != 200:
+                return
+            if url in captured:
+                return
+            captured[url] = {"headers": dict(request_headers.get(url, {}))}
+            print(f"[CAPTURE] segment={segment_number(url)} status=200 host={urlparse(url).hostname}")
 
         cdp.on("Network.requestWillBeSent", on_request)
+        cdp.on("Network.responseReceived", on_response)
 
         print("[TEST] Opening source page...")
         try:
@@ -81,10 +92,14 @@ async def main() -> int:
                     await videos.first.evaluate(
                         "v => { v.muted=true; v.autoplay=true; const p=v.play(); if(p) p.catch(()=>{}); }"
                     )
-                loc = frame.locator(".jwplayer")
-                if await loc.count():
+                    print(f"[TEST] play() requested in frame={frame.url}")
+                for selector in (".jwplayer", "[class*='play' i]", "button[aria-label*='play' i]", ".jw-icon-playback"):
                     try:
-                        await loc.first.click(timeout=2000, force=True)
+                        loc = frame.locator(selector)
+                        if await loc.count():
+                            await loc.first.click(timeout=2000, force=True)
+                            print(f"[TEST] clicked {selector} in frame={frame.url}")
+                            break
                     except Exception:
                         pass
             except Exception:
@@ -96,7 +111,7 @@ async def main() -> int:
 
         selected = sorted(captured.items(), key=lambda kv: segment_number(kv[0]))[:args.segments]
         if len(selected) < args.segments:
-            print(f"[TEST] FINAL: FAIL - browser captured only {len(selected)} TS URLs; need {args.segments}")
+            print(f"[TEST] FINAL: FAIL - browser captured only {len(selected)} successful TS URLs; need {args.segments}")
             await context.close()
             await browser.close()
             return 1
@@ -114,7 +129,6 @@ async def main() -> int:
                 t0 = time.monotonic()
                 try:
                     headers = dict(info["headers"])
-                    # Browser-controlled pseudo/header fields are not accepted as normal headers.
                     for key in list(headers):
                         if key.lower() in {":authority", ":method", ":path", ":scheme", "content-length"}:
                             headers.pop(key, None)
@@ -126,18 +140,9 @@ async def main() -> int:
                     )
                     body = await response.body()
                     elapsed = time.monotonic() - t0
-                    result = {
-                        "index": index,
-                        "segment": segment_number(url),
-                        "status": response.status,
-                        "bytes": len(body),
-                        "seconds": elapsed,
-                    }
+                    result = {"index": index, "segment": segment_number(url), "status": response.status, "bytes": len(body), "seconds": elapsed}
                     results.append(result)
-                    print(
-                        f"[REPLAY] #{index} segment={result['segment']} status={result['status']} "
-                        f"bytes={result['bytes']} time={elapsed:.3f}s"
-                    )
+                    print(f"[REPLAY] #{index} segment={result['segment']} status={result['status']} bytes={result['bytes']} time={elapsed:.3f}s")
                 except Exception as exc:
                     elapsed = time.monotonic() - t0
                     results.append({"index": index, "segment": segment_number(url), "status": None, "bytes": 0, "seconds": elapsed, "error": str(exc)})
