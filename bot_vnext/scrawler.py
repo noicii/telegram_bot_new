@@ -17,6 +17,7 @@ MEDIA_CONTENT_TYPES = ("video/", "application/vnd.apple.mpegurl", "application/x
 PLAYER_MARKERS = ("/embed/", "/player/", "embed.", "player.", "/watch", "/play/", "/stream/", "iframe", "m3u8", "mpd", "video")
 URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.I)
 ATTRIBUTES = ("href", "src", "data", "content", "data-src", "data-url", "data-file", "data-video", "data-video-url", "data-video-src", "data-stream", "data-stream-url", "data-source", "data-hls", "data-m3u8", "data-mpd", "data-link", "data-download", "data-player", "data-embed", "data-iframe", "data-manifest", "data-playlist")
+DEFAULT_MAX_PAGES = 2000
 
 
 def _canon(url: str, base: str = "") -> str:
@@ -101,15 +102,22 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int]):
     return {u for u in media if u}, links
 
 
-def crawl_website_media_urls(raw_url: str, max_pages: int = 300, workers: int = 16) -> list[str]:
-    """Crawl same-domain pages and return only unique actual media URLs."""
+def crawl_website_media_urls(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = 16) -> list[str]:
+    """Crawl same-domain pages and return only unique actual media URLs.
+
+    The legacy caller passes 300; that value is now treated as the old default
+    and upgraded to the 2000-page safe crawl limit.
+    """
     start = _canon(raw_url)
     if not start:
         return []
     root_host = (urlparse(start).hostname or "").lower()
     if not root_host:
         return []
-    max_pages = max(1, min(int(max_pages or 300), 2000))
+    requested_pages = int(max_pages or DEFAULT_MAX_PAGES)
+    if requested_pages == 300:
+        requested_pages = DEFAULT_MAX_PAGES
+    max_pages = max(1, min(requested_pages, DEFAULT_MAX_PAGES))
     workers = max(1, min(int(workers or 16), 32))
     queue = deque([start])
     queued = {start}
