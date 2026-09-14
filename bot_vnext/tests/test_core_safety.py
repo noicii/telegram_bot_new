@@ -54,6 +54,22 @@ class CoreSafetyTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_state_transition_is_atomic(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                db = Database(Path(directory) / "tasks.db")
+                await db.init()
+                await db.create_task("race", "download", url="https://example.invalid/video")
+                results = await asyncio.gather(
+                    db.transition("race", ("queued",), "downloading"),
+                    db.transition("race", ("queued",), "downloading"),
+                )
+                self.assertEqual(sum(bool(x) for x in results), 1)
+                row = await db.get_task("race")
+                self.assertEqual(row["status"], "downloading")
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()
