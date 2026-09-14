@@ -53,25 +53,22 @@ class UploadManager:
             raise RuntimeError(f"Upload task {task_id} is already active")
         self._cancelled.discard(key)
         self.contexts[key] = TaskContext(task_id)
-        await self.pool.put(QueueItem(task_id, payload))
+        try:
+            await self.pool.put(QueueItem(task_id, payload))
+        except Exception:
+            self.contexts.pop(key, None)
+            raise
 
     async def cancel(self, task_id: int | str) -> bool:
         key = str(task_id)
         ctx = self.contexts.get(key)
         if not ctx:
-            self._cancelled.add(key)
-            if self.database:
-                await self.database.mark_cancelled(task_id)
             return False
-
         self._cancelled.add(key)
         await ctx.cancel()
         running = self.running_tasks.get(key)
         if running and not running.done() and running is not asyncio.current_task():
             running.cancel()
-
-        if self.database:
-            await self.database.mark_cancelled(task_id)
         return True
 
     async def _handle(self, item: QueueItem) -> None:
@@ -88,7 +85,18 @@ class UploadManager:
                 if asyncio.iscoroutine(result):
                     await result
 
-        file_path = Path(payload["file_path"])
+        raw_path = payload.get("file_path")
+        if not raw_path:
+            error = ValueError(f"Upload task {item.task_id} has no file_path")
+            if self.database:
+                await self.database.mark_failed(key, str(error))
+            if self.on_failed:
+                await self.on_failed(item, error)
+            self.contexts.pop(key, None)
+            self.running_tasks.pop(key, None)
+            self._cancelled.discard(key)
+            return
+        file_path = Path(raw_path)
         destination = DESTINATION_CHAT_ID
         try:
             if key in self._cancelled:
@@ -96,13 +104,18 @@ class UploadManager:
 
             ctx.metadata.update(payload.get("metadata") or {})
             if self.database:
-                await self.database.mark_uploading(item.task_id)
+                changed = await self.database.mark_uploading(item.task_id)
+                if not changed:
+                    raise TaskCancelled(f"Upload task {item.task_id} is no longer queued/downloading")
+
+            if not file_path.is_file() or file_path.stat().st_size <= 0:
+                raise FileNotFoundError(f"Upload file not found or empty: {file_path}")
 
             logger.info(
                 "upload START task=%s file=%s size=%.1fMiB destination=%s mode=%s gate_limit=%s",
                 item.task_id,
                 file_path,
-                file_path.stat().st_size / 1024 / 1024 if file_path.is_file() else 0,
+                file_path.stat().st_size / 1024 / 1024,
                 destination,
                 payload.get("mode", "video"),
                 self.telegram_gate.upload_limit,
@@ -136,7 +149,10 @@ class UploadManager:
             )
 
             if self.database:
-                await self.database.mark_completed(item.task_id)
+                changed = await self.database.mark_completed(item.task_id)
+                if not changed:
+                    logger.warning("upload result ignored because task state changed task=%s", item.task_id)
+                    return
 
             if self.delete_after_upload:
                 self._delete_file(file_path)
@@ -146,9 +162,13 @@ class UploadManager:
 
         except TaskCancelled:
             logger.info("upload CANCELLED task=%s destination=%s", item.task_id, destination)
+            if self.database:
+                await self.database.mark_cancelled(item.task_id)
             self._delete_file(file_path)
         except asyncio.CancelledError:
             logger.info("upload asyncio-CANCELLED task=%s destination=%s", item.task_id, destination)
+            if self.database and key in self._cancelled:
+                await self.database.mark_cancelled(item.task_id)
             self._delete_file(file_path)
             raise
         except Exception as exc:
@@ -180,7 +200,6 @@ class UploadManager:
         return self.pool.qsize()
 
     def active_workers(self) -> int:
-        """Return the number of currently processing upload tasks."""
         return len(self.running_tasks)
 
     async def stop(self) -> None:
