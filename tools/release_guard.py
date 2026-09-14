@@ -34,6 +34,7 @@ def main() -> None:
     update = read(ROOT / "update.sh")
     gitignore = read(ROOT / ".gitignore")
     database = read(V2 / "app" / "storage" / "database.py")
+    pipeline = read(V2 / "app" / "pipeline.py")
     task = read(V2 / "app" / "core" / "task.py")
 
     tracked_names = {p.relative_to(ROOT).as_posix() for p in tracked_files()}
@@ -79,16 +80,34 @@ def main() -> None:
         fail("Browser HLS integration missing")
     if "context.request" not in browser:
         fail("Browser HLS is not using browser-context authenticated requests")
+    if "task.register_temp(work)" not in browser:
+        fail("Browser HLS work directory is not registered with task cleanup")
+    if "shutil.rmtree(work, ignore_errors=True)" not in browser:
+        fail("Browser HLS explicit work cleanup missing")
 
     if "🧩 Segments:" not in main_py or "hls_total" not in main_py or "hls_completed" not in main_py:
         fail("segmented realtime UI contract missing")
 
+    if "async def transition(" not in database or "WHERE id = ? AND status IN" not in database:
+        fail("atomic task state transition primitive missing")
+    if "return await self.transition(task_id, (\"queued\",), \"downloading\"" not in database:
+        fail("download start does not use atomic state transition")
+    if "return await self.transition(task_id, (\"downloading\",), \"uploading\"" not in database:
+        fail("upload handoff does not use atomic state transition")
+    if "return await self.transition(task_id, (\"uploading\",), \"completed\"" not in database:
+        fail("completion does not use atomic state transition")
     if "async def reset_for_retry" not in database or "retry_count=count" not in database:
         fail("retry counter preservation missing")
     if "count = int(task.get(\"retry_count\") or 0) + 1" not in database:
         fail("retry counter is not incremented")
     if "if count > maximum:" not in database:
         fail("retry budget enforcement missing")
+    if "await self.db.mark_uploading(task_id)" not in pipeline:
+        fail("pipeline upload handoff is not guarded by atomic transition")
+    if "await self.db.mark_completed(task_id)" not in pipeline:
+        fail("pipeline completion is not guarded by atomic transition")
+    if "await self.db.mark_failed(task_id, str(error))" not in pipeline:
+        fail("pipeline failure path missing")
     if "shutil.rmtree(path, ignore_errors=True)" not in task:
         fail("TaskContext directory cleanup missing")
 
@@ -108,8 +127,8 @@ def main() -> None:
     print("RELEASE GUARD: PASS")
     print("Protected: owner-only callbacks, single-message method menu, status dashboard")
     print("Protected: HLS 16-way segments + realtime segment progress")
-    print("Protected: Browser HLS authenticated requests")
-    print("Protected: retry budget + recursive task cleanup")
+    print("Protected: Browser HLS authenticated requests + cleanup")
+    print("Protected: atomic task states + retry budget + recursive cleanup")
     print("Security: .env untracked + dangerous Python constructs rejected")
 
 
