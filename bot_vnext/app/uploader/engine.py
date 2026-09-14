@@ -47,15 +47,17 @@ class UploadEngine:
         if not path.is_file() or path.stat().st_size <= 0:
             raise UploadError(f"Upload file not found or empty: {path}")
         task.check_cancelled()
-        original_size = path.stat().st_size
-        effective_thumbnail, generated_thumbnail = await self._ensure_thumbnail(task, path, thumbnail)
+
+        clean_path, generated_clean = await self._strip_media_metadata(task, path, mode)
+        effective_thumbnail, generated_thumbnail = await self._ensure_thumbnail(task, clean_path, thumbnail)
         try:
+            original_size = clean_path.stat().st_size
             if original_size > MAX_UPLOAD_BYTES:
                 normalized = (mode or "video").lower()
                 if normalized not in {"video", "document", "file", "doc"}:
-                    raise UploadError(f"File is larger than 2000 MiB and automatic splitting is only supported for video/document uploads: {path}")
-                parts_dir = path.parent / f".{path.stem}_parts"
-                parts = await self._split_large_video(task, path, parts_dir)
+                    raise UploadError(f"File is larger than 2000 MiB and automatic splitting is only supported for video/document uploads: {clean_path}")
+                parts_dir = clean_path.parent / f".{clean_path.stem}_parts"
+                parts = await self._split_large_video(task, clean_path, parts_dir)
                 try:
                     uploaded = None
                     completed_bytes = 0
@@ -75,12 +77,7 @@ class UploadEngine:
                             if progress:
                                 overall_current = base + min(current, psize)
                                 overall_percent = (overall_current * 100.0 / total_bytes) if total_bytes else percent
-                                details = {
-                                    "part": part_no,
-                                    "parts": parts_total,
-                                    "part_current": min(current, psize),
-                                    "part_total": psize,
-                                }
+                                details = {"part": part_no, "parts": parts_total, "part_current": min(current, psize), "part_total": psize}
                                 result = progress(overall_percent, overall_current, total_bytes, speed, eta, details)
                                 if asyncio.iscoroutine(result):
                                     await result
@@ -91,14 +88,14 @@ class UploadEngine:
                             reply_to_message_id=reply_to_message_id)
                         completed_bytes += part_size
                     if progress:
-                        result = progress(100.0, total_bytes, total_bytes, 0.0, 0, {"part": part_count, "parts": part_count, "part_current": total_bytes and parts[-1].stat().st_size, "part_total": parts[-1].stat().st_size})
+                        result = progress(100.0, total_bytes, total_bytes, 0.0, 0, {"part": part_count, "parts": part_count, "part_current": parts[-1].stat().st_size, "part_total": parts[-1].stat().st_size})
                         if asyncio.iscoroutine(result):
                             await result
                     return uploaded
                 finally:
                     self._cleanup_parts(parts_dir, parts)
 
-            return await self._upload_single(task, path, chat_id=chat_id, caption=caption, thumbnail=effective_thumbnail,
+            return await self._upload_single(task, clean_path, chat_id=chat_id, caption=caption, thumbnail=effective_thumbnail,
                 mode=mode, title=title, duration=duration, width=width, height=height,
                 supports_streaming=supports_streaming, progress=progress, reply_to_message_id=reply_to_message_id)
         finally:
@@ -107,6 +104,42 @@ class UploadEngine:
                     generated_thumbnail.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("Could not delete generated thumbnail: %s", generated_thumbnail)
+            if generated_clean:
+                try:
+                    generated_clean.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not delete metadata-cleaned media: %s", generated_clean)
+
+    async def _strip_media_metadata(self, task: TaskContext, source: Path, mode: str) -> tuple[Path, Path | None]:
+        """Remux video/audio without container metadata, preserving streams via copy."""
+        normalized = (mode or "video").lower()
+        if normalized not in {"video", "audio", "music", "document", "file", "doc"}:
+            return source, None
+        task.check_cancelled()
+        suffix = source.suffix or ".mp4"
+        cleaned = source.with_name(f".{source.stem}.telegram_clean{suffix}")
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-map", "0", "-c", "copy",
+            "-map_metadata", "-1", "-map_chapters", "-1",
+        ]
+        if suffix.lower() in {".mp4", ".m4v", ".mov"}:
+            command += ["-movflags", "+faststart"]
+        command.append(str(cleaned))
+        try:
+            await asyncio.to_thread(self._check_ffmpeg)
+            process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _stdout, stderr = await process.communicate()
+            if process.returncode != 0 or not cleaned.is_file() or cleaned.stat().st_size <= 0:
+                message = stderr.decode("utf-8", errors="replace")[-1500:]
+                raise UploadError(f"Could not create metadata-clean upload file: {message or source}")
+            return cleaned, cleaned
+        except TaskCancelled:
+            cleaned.unlink(missing_ok=True)
+            raise
+        except Exception:
+            cleaned.unlink(missing_ok=True)
+            raise
 
     async def _ensure_thumbnail(self, task: TaskContext, source: Path, thumbnail: str | Path | None) -> tuple[Path | None, Path | None]:
         """Return a valid thumbnail, generating one from the video when needed."""
@@ -118,12 +151,7 @@ class UploadEngine:
 
         task.check_cancelled()
         generated = source.with_name(f".{source.stem}.telegram_thumb.jpg")
-        command = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", "1", "-i", str(source),
-            "-frames:v", "1", "-vf", "scale='min(320,iw)':-2",
-            "-q:v", "8", str(generated),
-        ]
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1", "-i", str(source), "-frames:v", "1", "-vf", "scale='min(320,iw)':-2", "-q:v", "8", str(generated)]
         try:
             await asyncio.to_thread(self._check_ffmpeg)
             process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -189,23 +217,7 @@ class UploadEngine:
             for attempt in range(self.retries + 1):
                 task.check_cancelled()
                 try:
-                    result = await self.telegram_gate.run_upload(
-                        lambda: self._send(
-                            task,
-                            path,
-                            chat_id=chat_id,
-                            caption=caption,
-                            thumbnail=thumbnail,
-                            mode=mode,
-                            title=title,
-                            duration=duration,
-                            width=width,
-                            height=height,
-                            supports_streaming=supports_streaming,
-                            progress=pyrogram_progress,
-                            reply_to_message_id=reply_to_message_id,
-                        )
-                    )
+                    result = await self.telegram_gate.run_upload(lambda: self._send(task, path, chat_id=chat_id, caption=caption, thumbnail=thumbnail, mode=mode, title=title, duration=duration, width=width, height=height, supports_streaming=supports_streaming, progress=pyrogram_progress, reply_to_message_id=reply_to_message_id))
                     task.check_cancelled()
                     await report(total, force=True)
                     return result
@@ -255,7 +267,6 @@ class UploadEngine:
         size = source.stat().st_size
         target_seconds = max(30.0, duration * SPLIT_TARGET_BYTES / size * 0.88)
         output_pattern = str(parts_dir / "part_%03d.mp4")
-        logger.info("splitting large upload file=%s size=%.1fMiB duration=%.1fs target_segment=%.1fs", source, size / 1024 / 1024, duration, target_seconds)
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", f"{target_seconds:.3f}", "-reset_timestamps", "1", "-movflags", "+faststart", output_pattern]
         process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         _stdout, stderr = await process.communicate()
