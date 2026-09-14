@@ -57,7 +57,7 @@ class V2Bot:
     async def stop(self):
         if self.pipeline: await self.pipeline.stop(); self.pipeline=None
     async def start_cmd(self,client,message):
-        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n🕷 `/scrawl <URL>` — scan website & return only video links\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: ON")
+        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & return video links as TXT\n🕷 `/scrawl <URL>` — scan website & return video links as TXT\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: ON")
     async def status_cmd(self,client,message):
         if owner_only(message): await self.show_dashboard(message.chat.id,message)
     async def show_dashboard(self,chat_id,source=None):
@@ -123,7 +123,7 @@ class V2Bot:
         if not owner_only(message): return
         p=(message.text or "").split(maxsplit=1)
         if len(p)!=2: await message.reply_text("Usage: `/crawl https://example.com/episode-page`"); return
-        await self.crawl_url(message,p[1].strip())
+        await self.crawl_url(message,p[1].strip(),as_file=True)
     async def scrawl_cmd(self,client,message):
         if not owner_only(message): return
         p=(message.text or "").split(maxsplit=1)
@@ -140,19 +140,21 @@ class V2Bot:
             return
         try: await wait.delete()
         except Exception: pass
+        links=list(dict.fromkeys(str(u).strip() for u in links if str(u).strip()))
         if not links:
             await message.reply_text("❌ No actual video links found.")
             return
-        chunks=[]; current=[]; size=0
-        for link in links:
-            add=len(link)+1
-            if current and size+add>3800:
-                chunks.append("\n".join(current)); current=[]; size=0
-            current.append(link); size+=add
-        if current: chunks.append("\n".join(current))
-        for chunk in chunks:
-            try: await message.reply_text(chunk,disable_web_page_preview=True)
-            except Exception: logger.exception("could not send scrawl result chunk")
+        path=DOWNLOAD_DIR / f"scrawl_{uuid.uuid4().hex}.txt"
+        try:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text("\n".join(links)+"\n",encoding="utf-8")
+            await message.reply_document(str(path),caption=f"🕷 Scrawl complete • {len(links)} video link(s)")
+        except Exception as exc:
+            logger.exception("could not send scrawl TXT")
+            await message.reply_text(f"❌ Could not create/send scrawl TXT\n`{str(exc)[:700]}`")
+        finally:
+            try: path.unlink(missing_ok=True)
+            except Exception: pass
     def _is_direct_media_url(self,url):
         try:
             parsed=urlparse(url)
@@ -198,11 +200,37 @@ class V2Bot:
             if self._is_direct_media_url(t): await self.direct_media_url(message,t)
             else: await self.crawl_url(message,t)
         else: await message.reply_text("🔗 Send a valid http/https URL or use `/crawl <URL>`.")
-    async def crawl_url(self,message,url):
+    async def crawl_url(self,message,url,as_file=False):
         wait=await message.reply_text("🔎 Crawling… please wait")
         try: items=await asyncio.to_thread(crawl_blog_episodes,url)
         except Exception as exc: logger.exception("crawl failed"); await wait.edit_text(f"❌ Crawl failed\n`{str(exc)[:700]}`"); return
         if not items: await wait.edit_text("❌ No downloadable episode links found."); return
+        if as_file:
+            links=[]; seen=set()
+            for item in items:
+                u=str(item.get("url") or "").strip()
+                if u and u not in seen:
+                    seen.add(u); links.append(u)
+            if not links:
+                await wait.edit_text("❌ No downloadable video links found.")
+                return
+            path=DOWNLOAD_DIR / f"crawl_{uuid.uuid4().hex}.txt"
+            try:
+                path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_text("\n".join(links)+"\n",encoding="utf-8")
+                try: await wait.delete()
+                except Exception: pass
+                await message.reply_document(str(path),caption=f"🔗 Crawl complete • {len(links)} video link(s)")
+            except Exception as exc:
+                logger.exception("could not send crawl TXT")
+                try: await wait.edit_text(f"❌ Could not create/send crawl TXT\n`{str(exc)[:700]}`")
+                except Exception: await message.reply_text(f"❌ Could not create/send crawl TXT\n`{str(exc)[:700]}`")
+            finally:
+                try: path.unlink(missing_ok=True)
+                except Exception: pass
+            return
+        try: await wait.delete()
+        except Exception: pass
         series=self._series_name(items); saved=await get_method(items[0].get("url") or url); self.sessions[message.from_user.id]={"items":items,"page":0,"selected":set(),"series":series,"source_url":url,"message_id":wait.id,"method":saved}; await self.render_selection(wait,self.sessions[message.from_user.id])
     def _series_name(self,items):
         title=str(items[0].get("title") or "Series"); ep=str(items[0].get("episode") or ""); res=str(items[0].get("resolution") or "")
