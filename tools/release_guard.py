@@ -91,7 +91,7 @@ def main() -> None:
         fail("atomic task state transition primitive missing")
     if "return await self.transition(task_id, (\"queued\",), \"downloading\"" not in database:
         fail("download start does not use atomic state transition")
-    if "return await self.transition(task_id, (\"downloading\",), \"uploading\"" not in database:
+    if "return await self.transition(task_id, (\"queued\", \"downloading\"), \"uploading\"" not in database:
         fail("upload handoff does not use atomic state transition")
     if "return await self.transition(task_id, (\"uploading\",), \"completed\"" not in database:
         fail("completion does not use atomic state transition")
@@ -101,10 +101,10 @@ def main() -> None:
         fail("retry counter is not incremented")
     if "if count > maximum:" not in database:
         fail("retry budget enforcement missing")
-    if "await self.db.mark_uploading(task_id)" not in pipeline:
-        fail("pipeline upload handoff is not guarded by atomic transition")
-    if "await self.db.mark_completed(task_id)" not in pipeline:
-        fail("pipeline completion is not guarded by atomic transition")
+    if "await self.db.mark_completed(task_id)" in pipeline:
+        fail("pipeline must not own upload completion; UploadManager is the single owner")
+    if "await self.db.mark_uploading(task_id)" in pipeline:
+        fail("pipeline must not own upload-state transition; UploadManager is the single owner")
     if "await self.db.mark_failed(task_id, str(error))" not in pipeline:
         fail("pipeline failure path missing")
     if "shutil.rmtree(path, ignore_errors=True)" not in task:
