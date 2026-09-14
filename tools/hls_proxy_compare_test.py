@@ -32,7 +32,7 @@ async def fetch_candidates(limit: int) -> list[str]:
         async with session.get(PROXY_LIST) as r:
             r.raise_for_status()
             text = await r.text()
-    out = []
+    out: list[str] = []
     for line in text.splitlines():
         p = line.strip()
         if p and not p.startswith("#") and ":" in p:
@@ -58,19 +58,23 @@ async def find_working_proxy(limit: int) -> tuple[str, str] | None:
     print(f"[TEST] Downloaded {len(candidates)} public HTTP proxy candidates")
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = {asyncio.create_task(validate_proxy(session, p)): p for p in candidates}
-        for task in asyncio.as_completed(tasks):
-            ip = await task
-            proxy = candidates[0] if False else tasks[task] if task in tasks else None
-            # asyncio.as_completed may return wrapper futures, so resolve by result below.
-            if ip:
-                # The matching proxy is recovered by checking candidates sequentially only
-                # when a successful task is found; validation is cheap and the list is small.
-                for p in candidates:
-                    if await validate_proxy(session, p) == ip:
-                        print(f"[TEST] FREE PROXY VALID: {p} exit_ip={ip}")
-                        return p, ip
-    return None
+        # Return the actual proxy together with its exit IP so there is no
+        # ambiguity when asyncio.as_completed() wraps coroutine futures.
+        async def check(proxy: str) -> tuple[str, str] | None:
+            ip = await validate_proxy(session, proxy)
+            return (proxy, ip) if ip else None
+
+        pending = [asyncio.create_task(check(proxy)) for proxy in candidates]
+        for future in asyncio.as_completed(pending):
+            result = await future
+            if result:
+                proxy, ip = result
+                for other in pending:
+                    if not other.done():
+                        other.cancel()
+                print(f"[TEST] FREE PROXY VALID: {proxy} exit_ip={ip}")
+                return proxy, ip
+        return None
 
 
 async def probe(session, url: str, label: str, proxy: str | None) -> None:
@@ -79,8 +83,14 @@ async def probe(session, url: str, label: str, proxy: str | None) -> None:
         async with session.get(url, proxy=proxy, allow_redirects=True) as response:
             body = await response.content.read(4096)
             elapsed = time.monotonic() - started
-            print(f"[PROBE] {label}: status={response.status} time={elapsed:.2f}s bytes={len(body)} final_host={response.url.host}")
-            print(f"[PROBE] {label}: content-type={response.headers.get('content-type')} server={response.headers.get('server')}")
+            print(
+                f"[PROBE] {label}: status={response.status} time={elapsed:.2f}s "
+                f"bytes={len(body)} final_host={response.url.host}"
+            )
+            print(
+                f"[PROBE] {label}: content-type={response.headers.get('content-type')} "
+                f"server={response.headers.get('server')}"
+            )
             retry_after = response.headers.get("retry-after")
             if retry_after:
                 print(f"[PROBE] {label}: retry-after={retry_after}")
@@ -106,8 +116,12 @@ async def main() -> int:
         return 1
     proxy, exit_ip = proxy_info
 
+    # HybridDownloader requires an output_dir. This is an isolated test-only
+    # directory and is never used by the production bot process.
+    test_output = ROOT / "test_results" / "proxy_compare_work"
+    test_output.mkdir(parents=True, exist_ok=True)
     task = TaskContext(task_id="free-proxy-compare-test")
-    downloader = HybridDownloader()
+    downloader = HybridDownloader(output_dir=test_output)
     try:
         print("[TEST] Step 1: fresh HLS discovery")
         stream = await downloader._discover_hls(args.url, task, {"User-Agent": "Mozilla/5.0"}, None)
