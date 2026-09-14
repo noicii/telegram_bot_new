@@ -28,7 +28,7 @@ jobs:
       - name: Verify runtime patcher is removed
         run: |
           test ! -e bot_vnext/apply_ui_runtime_patch.py
-          ! grep -R "apply_ui_runtime_patch.py" update.sh tools/release_guard.py .github/workflows/protected-ci.yml
+          ! grep -R "apply_ui_runtime_patch.py" update.sh tools/release_guard.py
 
       - name: Run fail-closed release guard
         run: python tools/release_guard.py
