@@ -17,8 +17,15 @@ from app.core.task import TaskContext
 from app.downloader.engine import HybridDownloader
 
 
+def _safe_line(line: str) -> str:
+    import re
+    line = re.sub(r"https?://[^\s]+", "<redacted-url>", line)
+    return line[-1000:]
+
+
 async def main(source: str) -> int:
-    if not shutil.which("yt-dlp"):
+    binary = shutil.which("yt-dlp")
+    if not binary:
         print("[TEST] yt-dlp is not installed")
         return 2
 
@@ -45,13 +52,39 @@ async def main(source: str) -> int:
             return 1
         print("[TEST] HLS DISCOVERY SUCCESS")
 
-        task.metadata["stream_url"] = stream
-        task.metadata["headers"] = headers
+        command = [
+            binary,
+            "--newline",
+            "--no-part",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "-o", str(output),
+            stream,
+        ]
         print("[TEST] Running yt-dlp against the fresh signed HLS URL...")
-        await downloader._ytdlp(stream, output, task, None)
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            print("[TEST] DOWNLOAD FAILED: yt-dlp timeout after 600s")
+            return 1
+
+        lines = stdout.decode(errors="replace").splitlines()
+        if proc.returncode != 0:
+            print(f"[TEST] yt-dlp exit code: {proc.returncode}")
+            print("[TEST] yt-dlp diagnostic output (last 30 lines):")
+            for line in lines[-30:]:
+                print("[YTDLP]", _safe_line(line))
+            return 1
 
         if not output.is_file() or output.stat().st_size <= 0:
-            print("[TEST] DOWNLOAD FAILED: no valid output")
+            print("[TEST] DOWNLOAD FAILED: yt-dlp exited 0 but no valid output")
             return 1
 
         print(f"[TEST] DOWNLOAD SUCCESS: {output.stat().st_size} bytes")
