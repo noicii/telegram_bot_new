@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Test-only diagnostic: discover a signed HLS playlist in the browser, then
-fetch a batch of its exact signed TS segment URLs concurrently.
+"""Test-only diagnostic: browser-discover HLS, resolve the media playlist,
+then fetch signed TS segments concurrently.
 
-Production files are NOT modified. The browser is used only to obtain the
-actual playlist and request context; playback itself is not required to fetch
-all segments serially. The test validates concurrent HTTP 200 bodies and
-reports wall-clock speedup.
+Production files are NOT modified. The source often returns a master playlist
+first; this test follows its media-playlist URI before selecting TS segments.
 """
 from __future__ import annotations
 
@@ -23,12 +21,36 @@ def seg_num(url: str) -> int:
     return int(m.group(1)) if m else 10**9
 
 
+def playlist_links(base: str, body: str) -> list[str]:
+    out: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        u = urljoin(base, line)
+        if ".m3u8" in u.lower():
+            out.append(u)
+    return list(dict.fromkeys(out))
+
+
+def ts_links(base: str, body: str) -> list[str]:
+    out: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        u = urljoin(base, line)
+        if ".ts" in u.lower() or "seg-" in u.lower():
+            out.append(u)
+    return sorted(set(out), key=seg_num)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
     parser.add_argument("--segments", type=int, default=16)
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--wait", type=int, default=45)
+    parser.add_argument("--wait", type=int, default=60)
     args = parser.parse_args()
 
     print("[TEST] === BROWSER HLS PLAYLIST -> PARALLEL SEGMENT FETCH TEST ===")
@@ -36,9 +58,6 @@ async def main() -> int:
     print(f"[TEST] Target segments: {args.segments}")
     print(f"[TEST] Fetch concurrency: {args.workers}")
     print("[TEST] Production files are NOT modified.")
-
-    playlists: list[dict] = []
-    seen_playlists: set[str] = set()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -50,13 +69,17 @@ async def main() -> int:
             viewport={"width": 1280, "height": 720},
         )
         page = await context.new_page()
+        api = context.request
+
+        captured_playlists: list[tuple[str, str]] = []
+        seen: set[str] = set()
 
         async def capture(response):
             url = response.url
             ct = (response.headers.get("content-type") or "").lower()
             if response.status != 200 or (".m3u8" not in url.lower() and "mpegurl" not in ct):
                 return
-            if url in seen_playlists:
+            if url in seen:
                 return
             try:
                 body = await response.text()
@@ -64,8 +87,8 @@ async def main() -> int:
                 return
             if "#EXTM3U" not in body:
                 return
-            seen_playlists.add(url)
-            playlists.append({"url": url, "body": body})
+            seen.add(url)
+            captured_playlists.append((url, body))
             print(f"[PLAYLIST] status=200 bytes={len(body.encode())} host={urlparse(url).hostname} url={url[:260]}")
 
         page.on("response", lambda r: asyncio.create_task(capture(r)))
@@ -97,53 +120,69 @@ async def main() -> int:
                 pass
 
         deadline = time.monotonic() + max(1, args.wait)
-        while time.monotonic() < deadline and not playlists:
+        while time.monotonic() < deadline and not captured_playlists:
             await page.wait_for_timeout(250)
 
-        if not playlists:
+        if not captured_playlists:
             print("[TEST] FINAL: FAIL - browser captured no successful HLS playlist")
             await context.close()
             await browser.close()
             return 1
 
-        # Prefer a media playlist containing actual TS segment references.
-        selected_playlist = None
-        for item in playlists:
-            if ".ts" in item["body"].lower() or "seg-" in item["body"]:
-                selected_playlist = item
+        selected_base = None
+        selected_body = None
+        for base, body in captured_playlists:
+            if ts_links(base, body):
+                selected_base, selected_body = base, body
                 break
-        if selected_playlist is None:
-            selected_playlist = playlists[-1]
 
-        base = selected_playlist["url"]
-        body = selected_playlist["body"]
-        segment_urls = []
-        for raw in body.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            u = urljoin(base, line)
-            if ".ts" in u.lower() or "seg-" in u.lower():
-                segment_urls.append(u)
+        if selected_body is None:
+            master_base, master_body = captured_playlists[-1]
+            variants = playlist_links(master_base, master_body)
+            print(f"[TEST] Master playlist yielded {len(variants)} nested playlist URLs")
+            browser_headers = {
+                "referer": page.url,
+                "user-agent": await page.evaluate("navigator.userAgent"),
+                "accept": "*/*",
+            }
+            for variant in variants:
+                try:
+                    r = await api.get(variant, headers=browser_headers, timeout=30000, fail_on_status_code=False)
+                    body = await r.text()
+                    print(f"[VARIANT] status={r.status} bytes={len(body.encode())} host={urlparse(variant).hostname} url={variant[:260]}")
+                    if r.status == 200 and "#EXTM3U" in body and ts_links(variant, body):
+                        selected_base, selected_body = variant, body
+                        break
+                except Exception as exc:
+                    print(f"[VARIANT] ERROR={type(exc).__name__}: {exc}")
 
-        segment_urls = sorted(set(segment_urls), key=seg_num)[: args.segments]
-        print(f"[TEST] Playlist yielded {len(segment_urls)} segment URLs")
-        if len(segment_urls) < args.segments:
-            print("[TEST] FINAL: FAIL - selected playlist did not contain enough TS segments")
+        if selected_body is None or selected_base is None:
+            print("[TEST] FINAL: FAIL - could not resolve a media playlist containing TS segments")
             await context.close()
             await browser.close()
             return 1
 
-        # Use the browser's request context so cookies/proxy/TLS state remain browser-side.
-        api = context.request
+        all_segments = ts_links(selected_base, selected_body)
+        segment_urls = all_segments[: args.segments]
+        print(f"[TEST] Media playlist: {selected_base[:260]}")
+        print(f"[TEST] Media playlist yielded {len(all_segments)} TS segment URLs")
+        if len(segment_urls) < args.segments:
+            print("[TEST] FINAL: FAIL - media playlist did not contain enough TS segments")
+            await context.close()
+            await browser.close()
+            return 1
+
+        print(f"[TEST] Selected segments: {[seg_num(u) for u in segment_urls]}")
+        print("[TEST] Starting parallel segment fetch...")
+
         headers = {
             "referer": page.url,
             "user-agent": await page.evaluate("navigator.userAgent"),
             "accept": "*/*",
         }
-        start = time.monotonic()
         sem = asyncio.Semaphore(max(1, args.workers))
         results: list[dict] = []
+        start = time.monotonic()
 
         async def fetch_one(i: int, url: str):
             async with sem:
