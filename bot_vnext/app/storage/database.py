@@ -173,8 +173,6 @@ class Database:
         now = time.time()
         conn = self._connect()
         try:
-            # Never resume an interrupted download/upload automatically.
-            # Its local artifact is disposable and will be cleaned on startup.
             conn.execute("UPDATE tasks SET status = 'failed', error = 'Interrupted by bot restart', updated_at = ? WHERE status IN ('downloading', 'uploading')", (now,))
             conn.commit()
         finally:
@@ -196,23 +194,31 @@ class Database:
         await self.update_task(task_id, status="cancelled")
 
     async def reset_for_retry(self, task_id: str) -> bool:
+        """Move a terminal task back to queued while preserving retry history."""
         task = await self.get_task(task_id)
         if not task or task.get("status") not in {"failed", "cancelled"}:
             return False
-        await self.update_task(task_id, status="queued", retry_count=0, progress=0, speed=0, eta=0, error=None, completed_at=None)
-        return True
-
-    async def increment_retry(self, task_id):
-        task = await self.get_task(task_id)
-        if not task:
-            return False
         count = int(task.get("retry_count") or 0) + 1
-        maximum = int(task.get("max_retries") or 3)
+        maximum = max(0, int(task.get("max_retries") or 3))
         if count > maximum:
             await self.mark_failed(task_id, f"Maximum retries exceeded ({maximum})")
             return False
-        await self.update_task(task_id, retry_count=count, status="queued", error=None)
+        await self.update_task(
+            task_id,
+            status="queued",
+            retry_count=count,
+            progress=0,
+            speed=0,
+            eta=0,
+            error=None,
+            completed_at=None,
+            file_path=None,
+        )
         return True
+
+    async def increment_retry(self, task_id):
+        """Backward-compatible retry counter helper with the same semantics."""
+        return await self.reset_for_retry(task_id)
 
     async def update_progress(self, task_id, *, progress, speed=0, eta=0):
         await self.update_task(task_id, progress=max(0.0, min(100.0, float(progress))), speed=max(0.0, float(speed)), eta=max(0, int(eta)))
