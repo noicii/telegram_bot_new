@@ -34,8 +34,12 @@ class Pipeline:
             client.sleep_threshold = 0
         except Exception:
             logger.debug("could not set Pyrogram sleep_threshold=0", exc_info=True)
-        self.upload = UploadManager(client, workers=4, database=self.db, telegram_gate=self.telegram_gate, on_progress=self._upload_progress, on_complete=self._upload_complete, on_failed=self._upload_failed)
-        self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
+        self.upload = UploadManager(client, workers=4, database=self.db, telegram_gate=self.telegram_gate,
+                                    on_progress=self._upload_progress, on_complete=self._upload_complete,
+                                    on_failed=self._upload_failed)
+        self.download = DownloadManager(output_dir, workers=2, database=self.db,
+                                        on_progress=self._download_progress, on_complete=self._download_complete,
+                                        on_failed=self._download_failed)
         self._started = False
         self._cleanup_task: asyncio.Task | None = None
 
@@ -80,11 +84,13 @@ class Pipeline:
             if not is_dashboard_text(text):
                 return await original_edit(*args, **kwargs)
             key = f"{chat_id}:{message_id}"
+
             async def operation():
                 result = await original_edit(*args, **kwargs)
                 if getattr(result, "id", None) is not None:
                     cache[(chat_id, result.id)] = result
                 return result
+
             await gate.publish_dashboard(key, operation)
             return cache.get((chat_id, message_id))
 
@@ -153,11 +159,16 @@ class Pipeline:
             await self.download.submit(task_id, payload)
 
     async def submit(self, task_id: int | str, payload: dict[str, Any]) -> None:
-        await self.db.create_task(str(task_id), payload.get("task_type", "download"), **{k: v for k, v in payload.items() if k != "task_type"})
+        await self.db.create_task(str(task_id), payload.get("task_type", "download"),
+                                  **{k: v for k, v in payload.items() if k != "task_type"})
         row = await self.db.get_task(str(task_id))
         if not row:
             raise RuntimeError(f"Task {task_id} was not persisted")
-        await self._dispatch_row(row)
+        try:
+            await self._dispatch_row(row)
+        except Exception as exc:
+            await self.db.mark_failed(str(task_id), str(exc))
+            raise
 
     async def retry(self, task_id: int | str, method: str | None = None) -> bool:
         task_id = str(task_id)
@@ -168,21 +179,23 @@ class Pipeline:
             selected = method or await get_default_method()
             metadata = dict(task.get("metadata") or {})
             metadata["download_method"] = selected
-            await self.db.update_task(task_id, metadata=metadata, file_path=None)
+            await self.db.update_task(task_id, metadata=metadata)
         if not await self.db.reset_for_retry(task_id):
             return False
         row = await self.db.get_task(task_id)
         if not row:
             return False
-        await self._dispatch_row(row)
+        try:
+            await self._dispatch_row(row)
+        except Exception as exc:
+            await self.db.mark_failed(task_id, str(exc))
+            return False
         return True
 
     async def cancel_download(self, task_id: int | str) -> bool:
         cancelled = await self.download.cancel(task_id)
         if cancelled:
-            changed = await self.db.mark_cancelled(str(task_id))
-            if not changed:
-                logger.info("download cancellation lost race task=%s; state already changed", task_id)
+            await self.db.mark_cancelled(str(task_id))
             task = await self.db.get_task(str(task_id))
             if task and task.get("file_path") and task.get("status") == "cancelled":
                 await remove_artifact_async(task["file_path"])
@@ -192,9 +205,7 @@ class Pipeline:
     async def cancel_upload(self, task_id: int | str) -> bool:
         cancelled = await self.upload.cancel(task_id)
         if cancelled:
-            changed = await self.db.mark_cancelled(str(task_id))
-            if not changed:
-                logger.info("upload cancellation lost race task=%s; state already changed", task_id)
+            await self.db.mark_cancelled(str(task_id))
             task = await self.db.get_task(str(task_id))
             if task and task.get("file_path") and task.get("status") == "cancelled":
                 await remove_artifact_async(task["file_path"])
@@ -202,7 +213,13 @@ class Pipeline:
         return cancelled
 
     async def cancel(self, task_id: int | str) -> bool:
-        return (await self.cancel_download(task_id)) or (await self.cancel_upload(task_id))
+        # Determine the owner first so cancellation never pollutes the other manager.
+        task = await self.db.get_task(str(task_id))
+        if not task or task.get("status") not in {"queued", "downloading", "uploading"}:
+            return False
+        if task.get("status") == "uploading":
+            return await self.cancel_upload(task_id)
+        return await self.cancel_download(task_id)
 
     async def _forward_progress(self, kind, args):
         task_id = str(args[0]) if args else ""
@@ -234,23 +251,20 @@ class Pipeline:
 
     async def _download_complete(self, item: QueueItem, path: Path):
         task_id = str(item.task_id)
-        destination = item.payload.get("chat_id")
-        logger.info(
-            "download COMPLETE task=%s file=%s size=%.1fMiB; handing off to upload destination=%s",
-            task_id,
-            path,
-            path.stat().st_size / 1024 / 1024 if path.is_file() else 0,
-            destination,
-        )
-        changed = await self.db.mark_uploading(task_id)
-        if not changed:
-            logger.warning("download completion ignored because task is no longer downloading task=%s", task_id)
-            return
+        logger.info("download COMPLETE task=%s file=%s size=%.1fMiB; handing off to upload",
+                    task_id, path, path.stat().st_size / 1024 / 1024 if path.is_file() else 0)
+        # Keep the task in `downloading` until UploadManager atomically claims it.
+        # This gives upload state one owner and avoids double transitions.
         await self.db.update_task(task_id, file_path=str(path), progress=0)
         payload = dict(item.payload)
         payload["file_path"] = str(path)
         payload["task_type"] = "upload"
-        await self.upload.submit(item.task_id, payload)
+        try:
+            await self.upload.submit(item.task_id, payload)
+        except Exception as exc:
+            await self.db.mark_failed(task_id, str(exc))
+            await remove_artifact_async(path)
+            raise
         logger.info("upload QUEUED task=%s file=%s", task_id, path)
 
     async def _download_failed(self, item: QueueItem, error: Exception):
@@ -270,10 +284,6 @@ class Pipeline:
 
     async def _upload_complete(self, item: QueueItem):
         task_id = str(item.task_id)
-        changed = await self.db.mark_completed(task_id)
-        if not changed:
-            logger.warning("upload completion ignored because task is no longer uploading task=%s", task_id)
-            return
         task = await self.db.get_task(task_id)
         if task and task.get("file_path"):
             await remove_artifact_async(task["file_path"])
@@ -287,17 +297,14 @@ class Pipeline:
 
     async def _upload_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
-        changed = await self.db.mark_failed(task_id, str(error))
-        if not changed:
-            logger.info("upload failure ignored because task state already terminal task=%s", task_id)
-            return
+        task = await self.db.get_task(task_id)
         if item.payload.get("file_path"):
             await remove_artifact_async(item.payload["file_path"])
         await self._cleanup_now()
         if self.on_failed:
             async def render_failed() -> None:
                 await self.on_failed(task_id, error)
-            chat_id = int(item.payload.get("chat_id")) if item.payload.get("chat_id") else None
+            chat_id = int(task.get("chat_id")) if task and task.get("chat_id") else (int(item.payload.get("chat_id")) if item.payload.get("chat_id") else None)
             if chat_id is not None:
                 await self.telegram_gate.publish_dashboard(str(chat_id), render_failed)
 
