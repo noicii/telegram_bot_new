@@ -103,14 +103,7 @@ rollback(){
     "$PYTHON_BIN" -m playwright install chromium >/dev/null 2>&1 || true
   fi
 
-  if [ -f bot_vnext/apply_ui_runtime_patch.py ]; then
-    "$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py || {
-      echo "ERROR: Rollback UI compatibility patch failed." >&2
-      return 1
-    }
-  fi
-
-  "$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py || {
+  "$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py || {
     echo "ERROR: Rolled-back revision failed syntax validation." >&2
     return 1
   }
@@ -195,14 +188,11 @@ if "$PYTHON_BIN" -c 'import playwright' >/dev/null 2>&1; then
   "$PYTHON_BIN" -m playwright install chromium
 fi
 
-log "Applying tracked UI compatibility patches"
-"$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py
-
 log "Running protected release guard"
 "$PYTHON_BIN" tools/release_guard.py
 
 log "Running syntax checks"
-"$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py
+"$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py
 
 log "Verifying active HLS concurrency"
 grep -nE 'Semaphore\(16\)|16 segments download concurrently' "$ACTIVE_HLS" || fail "HLS concurrency is not 16"
