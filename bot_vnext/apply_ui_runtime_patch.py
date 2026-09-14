@@ -1,9 +1,14 @@
 from pathlib import Path
 
 MAIN = Path(__file__).resolve().parent / "main.py"
+ENGINE = Path(__file__).resolve().parent / "app" / "downloader" / "engine.py"
+BROWSER_HLS = Path(__file__).resolve().parent / "app" / "downloader" / "browser_hls.py"
+
+# ---------------------------------------------------------------------------
+# Existing UI compatibility patches
+# ---------------------------------------------------------------------------
 text = MAIN.read_text(encoding="utf-8")
 
-# Add /failed to the Telegram command menu.
 old_commands = 'COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("clear","🧹 Clear completed/failed/cancelled tasks")'
 new_commands = 'COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("failed","❌ Show failed download links"),("clear","🧹 Clear completed/failed/cancelled tasks")'
 if '("failed","❌ Show failed download links")' in text:
@@ -14,7 +19,6 @@ elif old_commands in text:
 else:
     raise SystemExit("ERROR: COMMANDS anchor not found; refusing unsafe patch")
 
-# Add /failed command handler before /clear.
 old_clear = '    async def clear_cmd(self,client,message):\n        if not owner_only(message): return\n'
 new_failed = '''    async def failed_cmd(self,client,message):
         if not owner_only(message): return
@@ -48,7 +52,6 @@ elif old_clear in text:
 else:
     raise SystemExit("ERROR: clear_cmd anchor not found; refusing unsafe patch")
 
-# Register /failed with Pyrogram.
 old_handler = 'app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear")));'
 new_handler = 'app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.failed_cmd,filters.command("failed"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear")));'
 if 'MessageHandler(bot.failed_cmd,filters.command("failed"))' in text:
@@ -59,11 +62,10 @@ elif old_handler in text:
 else:
     raise SystemExit("ERROR: command registration anchor not found; refusing unsafe patch")
 
-# Existing method-menu fix.
 OLD = '        if data=="v2:method": await query.answer(); await self.send_method_menu(query.message); return\n'
 NEW = '''        if data=="v2:method":
             await query.answer()
-            current_method=s.get("method") or await get_default_method()
+            current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method()
             await query.message.edit_text(
                 f"🎯 **DOWNLOAD METHOD**\\n\\nCurrent selection: **{method_label(current_method)}**",
                 reply_markup=InlineKeyboardMarkup([
@@ -81,7 +83,6 @@ elif OLD in text:
 else:
     raise SystemExit("ERROR: expected v2:method callback block was not found; refusing unsafe patch")
 
-# Add direct Retry buttons to the live dashboard for failed tasks.
 if 'failed_rows_for_retry=await self.pipeline.db.get_tasks' in text:
     print("UI retry-button patch already applied")
 else:
@@ -98,7 +99,6 @@ else:
     text = text.replace(old_markup, new_markup, 1)
     print("UI retry-button patch applied")
 
-# Add callback handler for direct dashboard retry buttons.
 if 'data.startswith("v2:retry:")' in text:
     print("UI retry callback already applied")
 else:
@@ -116,4 +116,65 @@ else:
     text = text.replace(old_retry_anchor, new_retry_anchor, 1)
     print("UI retry callback patch applied")
 
-MAIN.write_text(text,encoding="utf-8")
+# Fix the status/refresh callback so it always opens or refreshes the real
+# dashboard message instead of trying to render into an unrelated UI message.
+old_status = '        if data=="v2:status": await query.answer(); self.dashboard_messages[query.message.chat.id]=query.message.id; await self.render_dashboard(query.message.chat.id,query.message.id,True); return\n'
+new_status = '''        if data=="v2:status":
+            await query.answer("📊 Refreshing status…")
+            await self.show_dashboard(query.message.chat.id, query.message)
+            return
+'''
+if 'await self.show_dashboard(query.message.chat.id, query.message)' in text:
+    print("status callback patch already applied")
+elif old_status in text:
+    text = text.replace(old_status, new_status, 1)
+    print("status callback patch applied")
+else:
+    raise SystemExit("ERROR: v2:status callback anchor not found; refusing unsafe patch")
+
+MAIN.write_text(text, encoding="utf-8")
+
+# ---------------------------------------------------------------------------
+# Browser HLS production integration
+# ---------------------------------------------------------------------------
+if not BROWSER_HLS.is_file():
+    raise SystemExit("ERROR: browser_hls.py is missing; refusing unsafe integration")
+
+engine = ENGINE.read_text(encoding="utf-8")
+import_anchor = 'from app.core.task import TaskCancelled, TaskContext\n'
+import_line = 'from app.downloader.browser_hls import BrowserHLSDownloader\n'
+if import_line not in engine:
+    if import_anchor not in engine:
+        raise SystemExit("ERROR: downloader import anchor not found; refusing unsafe Browser HLS patch")
+    engine = engine.replace(import_anchor, import_anchor + import_line, 1)
+    print("Browser HLS import integrated")
+
+old_browser = '''    async def _browser(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
+        stream = await self._discover_hls(url, task, {"User-Agent": "Mozilla/5.0"}, progress)
+        if not stream: raise DownloadError("Browser could not discover media stream")
+        await self._ffmpeg(stream, output, task, progress)
+'''
+new_browser = '''    async def _browser(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
+        """Browser HLS: browser discovers/authenticates the stream, then fetches media concurrently."""
+        downloader = BrowserHLSDownloader(self.output_dir)
+        try:
+            await downloader.download(url, output, task, progress)
+        except BrowserHLSError as exc:
+            raise DownloadError(str(exc)) from exc
+'''
+if new_browser in engine:
+    print("Browser HLS engine integration already applied")
+elif old_browser in engine:
+    engine = engine.replace(old_browser, new_browser, 1)
+    engine = engine.replace('from app.downloader.browser_hls import BrowserHLSDownloader\n', 'from app.downloader.browser_hls import BrowserHLSDownloader, BrowserHLSError\n', 1)
+    print("Browser HLS engine integration applied")
+else:
+    raise SystemExit("ERROR: existing _browser method anchor not found; refusing unsafe Browser HLS patch")
+
+ENGINE.write_text(engine, encoding="utf-8")
+
+# Validate the new standalone engine before the service is allowed to start.
+import py_compile
+py_compile.compile(str(BROWSER_HLS), doraise=True)
+py_compile.compile(str(ENGINE), doraise=True)
+print("Browser HLS syntax validation passed")
