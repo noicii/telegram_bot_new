@@ -44,5 +44,6 @@ jobs:
             bot_vnext/app/storage/database.py \
             bot_vnext/app/core/task.py
 
+      # Keep the package root on PYTHONPATH so the app.* test imports resolve.
       - name: Run core safety regression tests
         run: python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
