@@ -16,6 +16,7 @@ from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from config import API_HASH, API_ID, BOT_TOKEN, OWNER_ID, DOWNLOAD_DIR, THUMB_PATH, COOKIES_PATH
 from crawler import crawl_blog_episodes
+from scrawler import crawl_website_media_urls
 from utils import sanitize_filename
 from app.pipeline import Pipeline
 from app.downloader.method_store import get_method, set_method, get_default_method, set_default_method, next_method, method_label, METHODS
@@ -23,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("bot_vnext")
 PAGE_SIZE = 8
 DIRECT_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".m3u8", ".mpd"}
-COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("failed","❌ Show failed download links"),("clear","🧹 Clear completed/failed/cancelled tasks"),("crawl","🔎 Crawl URL & select episodes"),("settings","⚙️ Bot settings & controls"),("method","🎯 Choose download method"),("health","🩺 Check bot & engine health")]
+COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("failed","❌ Show failed download links"),("clear","🧹 Clear completed/failed/cancelled tasks"),("crawl","🔎 Crawl URL & select episodes"),("scrawl","🕷 Website-wide video link scrawler"),("settings","⚙️ Bot settings & controls"),("method","🎯 Choose download method"),("health","🩺 Check bot & engine health")]
 def owner_only(message): return bool(OWNER_ID and message.from_user and message.from_user.id == OWNER_ID)
 def callback_owner(query): return bool(OWNER_ID and query.from_user and query.from_user.id == OWNER_ID)
 def fmt_bytes(v):
@@ -56,7 +57,7 @@ class V2Bot:
     async def stop(self):
         if self.pipeline: await self.pipeline.stop(); self.pipeline=None
     async def start_cmd(self,client,message):
-        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: ON")
+        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n🕷 `/scrawl <URL>` — scan website & return only video links\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: ON")
     async def status_cmd(self,client,message):
         if owner_only(message): await self.show_dashboard(message.chat.id,message)
     async def show_dashboard(self,chat_id,source=None):
@@ -123,6 +124,35 @@ class V2Bot:
         p=(message.text or "").split(maxsplit=1)
         if len(p)!=2: await message.reply_text("Usage: `/crawl https://example.com/episode-page`"); return
         await self.crawl_url(message,p[1].strip())
+    async def scrawl_cmd(self,client,message):
+        if not owner_only(message): return
+        p=(message.text or "").split(maxsplit=1)
+        if len(p)!=2:
+            await message.reply_text("Usage: `/scrawl https://example.com`")
+            return
+        url=p[1].strip()
+        wait=await message.reply_text("🕷 Scrawling website…")
+        try:
+            links=await asyncio.to_thread(crawl_website_media_urls,url,300,16)
+        except Exception as exc:
+            logger.exception("website scrawl failed")
+            await wait.edit_text(f"❌ Website scrawl failed\n`{str(exc)[:700]}`")
+            return
+        try: await wait.delete()
+        except Exception: pass
+        if not links:
+            await message.reply_text("❌ No actual video links found.")
+            return
+        chunks=[]; current=[]; size=0
+        for link in links:
+            add=len(link)+1
+            if current and size+add>3800:
+                chunks.append("\n".join(current)); current=[]; size=0
+            current.append(link); size+=add
+        if current: chunks.append("\n".join(current))
+        for chunk in chunks:
+            try: await message.reply_text(chunk,disable_web_page_preview=True)
+            except Exception: logger.exception("could not send scrawl result chunk")
     def _is_direct_media_url(self,url):
         try:
             parsed=urlparse(url)
@@ -265,13 +295,7 @@ class V2Bot:
         if data=="v2:method":
             await query.answer()
             current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method()
-            await query.message.edit_text(
-                f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: {method_label(current_method)}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")]
-                    for m in METHODS
-                ]),
-            )
+            await query.message.edit_text(f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: {method_label(current_method)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS]))
             return
         if data=="v2:close": self.sessions.pop(query.from_user.id,None); await query.answer("Selection closed"); await query.message.edit_text("❌ Selection cancelled."); return
         if data=="v2:download":
@@ -342,7 +366,7 @@ class V2Bot:
 async def run():
     if not BOT_TOKEN or not API_ID or not API_HASH or not OWNER_ID: raise RuntimeError("API_ID, API_HASH, BOT_TOKEN and OWNER_ID must be configured")
     app=Client("telegram_bot_v2",api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,max_concurrent_transmissions=4,workdir=str(ROOT/"data")); bot=V2Bot(app)
-    app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.failed_cmd,filters.command("failed"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
+    app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.failed_cmd,filters.command("failed"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.scrawl_cmd,filters.command("scrawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
     async with app:
         await bot.start()
         try: await asyncio.Event().wait()
