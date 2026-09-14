@@ -60,6 +60,11 @@ async def main(source: str) -> int:
             "--no-part",
             "--user-agent", user_agent,
             "--referer", source,
+            "--add-header", "Accept-Language: en-US,en;q=0.9",
+            "--add-header", "Accept: */*",
+            "--add-header", "Sec-Fetch-Dest: empty",
+            "--add-header", "Sec-Fetch-Mode: cors",
+            "--add-header", "Sec-Fetch-Site: cross-site",
         ]
         if COOKIES_PATH.is_file():
             command += ["--cookies", str(COOKIES_PATH)]
@@ -73,7 +78,7 @@ async def main(source: str) -> int:
             stream,
         ]
 
-        print("[TEST] Running yt-dlp with User-Agent + Referer + cookies...")
+        print("[TEST] Running yt-dlp with browser-like headers + cookies...")
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
