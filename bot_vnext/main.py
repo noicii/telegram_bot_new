@@ -55,7 +55,7 @@ class V2Bot:
     async def stop(self):
         if self.pipeline: await self.pipeline.stop(); self.pipeline=None
     async def start_cmd(self,client,message):
-        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: **ON**")
+        if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: ON")
     async def status_cmd(self,client,message):
         if owner_only(message): await self.show_dashboard(message.chat.id,message)
     async def show_dashboard(self,chat_id,source=None):
@@ -92,7 +92,7 @@ class V2Bot:
         p=(message.text or "").split(maxsplit=1)
         if len(p)!=2: await message.reply_text("Usage: `/retry TASK_ID`"); return
         if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
-        m=await get_default_method(); ok=await self.pipeline.retry(p[1].strip(),method=m); await message.reply_text(f"🔁 Task re-queued with **{method_label(m)}** (max 3 attempts)." if ok else "⚠️ Retry is available only for failed/cancelled tasks.")
+        m=await get_default_method(); ok=await self.pipeline.retry(p[1].strip(),method=m); await message.reply_text(f"🔁 Task re-queued with {method_label(m)} (max 3 attempts)." if ok else "⚠️ Retry is available only for failed/cancelled tasks.")
     async def failed_cmd(self,client,message):
         if not owner_only(message): return
         if not self.pipeline:
@@ -108,16 +108,15 @@ class V2Bot:
             title=str(r.get("title") or r.get("url") or r.get("id") or "Unknown")[:80]
             url=str(r.get("url") or "—")[:700]
             error=str(r.get("error") or "Unknown error")[:300]
-            lines += [f"**{i}. {title}**",f"🔗 {url}",f"🆔 `{r.get('id')}`",f"⚠️ {error}",""]
+            lines += [f"{i}. {title}",f"🔗 {url}",f"🆔 `{r.get('id')}`",f"⚠️ {error}",""]
             buttons.append([InlineKeyboardButton(f"🔁 Retry {i}",callback_data=f"v2:retry:{r.get('id')}")])
         if len(rows)>6:
             lines.append("Showing the latest 6 with retry buttons.")
         await message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
     async def clear_cmd(self,client,message):
         if not owner_only(message): return
         if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
-        await message.reply_text(f"🧹 Cleared **{await self.pipeline.db.clear_finished()}** completed/failed/cancelled task(s).")
+        await message.reply_text(f"🧹 Cleared {await self.pipeline.db.clear_finished()} completed/failed/cancelled task(s).")
     async def crawl_cmd(self,client,message):
         if not owner_only(message): return
         p=(message.text or "").split(maxsplit=1)
@@ -143,7 +142,7 @@ class V2Bot:
     def _button_label(self,item,index,selected): return f"{'☑️' if index in selected else '⬜'} {item.get('episode') or 'Episode ?'} • {item.get('resolution') or 'Unknown'} • {urlparse(item.get('url') or '').netloc or 'Unknown'}"
     async def render_selection(self,message,s):
         items,page,selected=s["items"],s["page"],s["selected"]; pages=max(1,(len(items)+PAGE_SIZE-1)//PAGE_SIZE); start=page*PAGE_SIZE; end=min(len(items),start+PAGE_SIZE)
-        lines=[f"🎬 **{s['series']}**",f"📦 **{len(items)} Options**",""]+[self._button_label(items[i],i,selected) for i in range(start,end)]+["",f"📄 Page {page+1}/{pages} • ☑️ {len(selected)}/{len(items)}",f"🎯 **Download method: {method_label(s.get('method','auto'))}**"]
+        lines=[f"🎬 **{s['series']}**",f"📦 {len(items)} Options",""]+[self._button_label(items[i],i,selected) for i in range(start,end)]+["",f"📄 Page {page+1}/{pages} • ☑️ {len(selected)}/{len(items)}",f"🎯 Download method: {method_label(s.get('method','auto'))}"]
         buttons=[[InlineKeyboardButton(self._button_label(items[i],i,selected),callback_data=f"v2:t:{i}")] for i in range(start,end)]; nav=[]
         if page>0: nav.append(InlineKeyboardButton("◀️ Previous",callback_data="v2:p:-1"))
         if page+1<pages: nav.append(InlineKeyboardButton("Next ▶️",callback_data="v2:p:1"))
@@ -153,11 +152,11 @@ class V2Bot:
     async def method_cmd(self,client,message):
         if owner_only(message): await self.send_method_menu(message)
     async def send_method_menu(self,message):
-        cur=await get_default_method(); await message.reply_text(f"🎯 **DOWNLOAD METHOD**\n\nCurrent default: **{method_label(cur)}**",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==cur else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS]))
+        cur=await get_default_method(); await message.reply_text(f"🎯 **DOWNLOAD METHOD**\n\nCurrent default: {method_label(cur)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==cur else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS]))
     async def settings_cmd(self,client,message):
         if owner_only(message): await self.send_settings(message)
     async def send_settings(self,message):
-        m=await get_default_method(); await message.reply_text(f"⚙️ **BOT V2 SETTINGS**\n\n🎯 Download method: **{method_label(m)}**\n⬇️ Download workers: **2**\n⬆️ Upload workers: **4**\n🛑 Independent cancellation: **ON**\n💾 Persistent SQLite queue: **ON**\n🖼️ Auto thumbnail: configured\n🍪 Cookies: auto-detected",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Download Method",callback_data="v2:methodmenu")],[InlineKeyboardButton("📊 Live Status",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")],[InlineKeyboardButton("🩺 Health Check",callback_data="v2:health")],[InlineKeyboardButton("🧹 Clear Finished",callback_data="v2:clear")]]))
+        m=await get_default_method(); await message.reply_text(f"⚙️ **BOT V2 SETTINGS**\n\n🎯 Download method: {method_label(m)}\n⬇️ Download workers: 2\n⬆️ Upload workers: 4\n🛑 Independent cancellation: ON\n💾 Persistent SQLite queue: ON\n🖼️ Auto thumbnail: configured\n🍪 Cookies: auto-detected",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Download Method",callback_data="v2:methodmenu")],[InlineKeyboardButton("📊 Live Status",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")],[InlineKeyboardButton("🩺 Health Check",callback_data="v2:health")],[InlineKeyboardButton("🧹 Clear Finished",callback_data="v2:clear")]]))
     async def health_cmd(self,client,message):
         if owner_only(message): await self.send_health(message)
     async def send_health(self,message):
@@ -227,7 +226,7 @@ class V2Bot:
             await query.answer()
             current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method()
             await query.message.edit_text(
-                f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: **{method_label(current_method)}**",
+                f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: {method_label(current_method)}",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")]
                     for m in METHODS
@@ -255,16 +254,16 @@ class V2Bot:
             now=asyncio.get_running_loop().time()
             if not force and now-self.dashboard_last_edit.get(chat_id,0)<1.2: return True
             rows=await self.pipeline.db.get_tasks(statuses=("queued","downloading","uploading"),limit=25); failed_rows_for_retry=await self.pipeline.db.get_tasks(statuses=("failed",),limit=10); counts=await self.pipeline.db.counts(); d,u=counts.get("download",{}),counts.get("upload",{}); ad,au=self.pipeline.download.active_workers(),self.pipeline.upload.active_workers(); qd,qu=d.get("queued",0),u.get("queued",0)
-            lines=["📊 **LIVE DOWNLOAD / UPLOAD**","",f"⬇️ Downloads: **{ad}/2 active** • {qd} queued",f"⬆️ Uploads: **{au}/4 active** • {qu} queued",""]
+            lines=["📊 **LIVE DOWNLOAD / UPLOAD**","",f"⬇️ Downloads: {ad}/2 active • {qd} queued",f"⬆️ Uploads: {au}/4 active • {qu} queued",""]
             downs=[r for r in rows if r.get("status") in {"queued","downloading"}]; ups=[r for r in rows if r.get("status")=="uploading"]
             if downs:
                 lines.append("📥 **DOWNLOADING**")
                 for n,r in enumerate(downs[:8],1):
-                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ **{title}{(' • '+res) if res else ''}**",f"{bar(pct)} **{pct:.0f}%**"]
+                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ {title}{(' • '+res) if res else ''}",f"{bar(pct)} {pct:.0f}%"]
                     if det.get("hls_total"):
                         hls_done=int(det.get("hls_completed") or 0); hls_total=int(det.get("hls_total") or 0); hls_pct=(hls_done*100/hls_total) if hls_total else pct
-                        lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**")
-                        lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
+                        lines.append(f"🧩 Segments: {hls_done} / {hls_total} • {hls_pct:.0f}%")
+                        lines.append(f"💾 Data: {fmt_bytes(cur)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
                         if det.get("hls_retries"): lines.append(f"🔁 Retries: {int(det.get('hls_retries') or 0)}")
                     else:
                         lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
@@ -273,7 +272,7 @@ class V2Bot:
             if ups:
                 lines.append("📤 **UPLOADING**")
                 for n,r in enumerate(ups[:8],1):
-                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; lines += [f"{n}️⃣ **{title}**",f"{bar(pct)} **{pct:.0f}%**",f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}"]
+                    live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; lines += [f"{n}️⃣ {title}",f"{bar(pct)} {pct:.0f}%",f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}"]
                     if int(det.get("parts") or 1)>1: lines.append(f"📦 Part {int(det.get('part') or 1)}/{int(det.get('parts') or 1)}")
                     lines.append("")
             else: lines.append("📤 **UPLOADING**\nNo active uploads.\n")
