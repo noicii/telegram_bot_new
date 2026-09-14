@@ -40,13 +40,7 @@ class Pipeline:
         self._cleanup_task: asyncio.Task | None = None
 
     def _install_dashboard_hooks(self, client) -> None:
-        """Route only the persistent live-dashboard message through the gate.
-
-        Pyrogram Message.edit_text() is a bound shortcut to Client.edit_message_text().
-        The existing dashboard also refetched its own message before every edit.
-        We cache the dashboard Message locally, remove that extra Telegram read,
-        and gate only dashboard-shaped edits so selection/UI edits stay normal.
-        """
+        """Route only the persistent live-dashboard message through the gate."""
         if getattr(client, "_v2_dashboard_gate_installed", False):
             return
         setattr(client, "_v2_dashboard_gate_installed", True)
@@ -186,9 +180,11 @@ class Pipeline:
     async def cancel_download(self, task_id: int | str) -> bool:
         cancelled = await self.download.cancel(task_id)
         if cancelled:
-            await self.db.mark_cancelled(str(task_id))
+            changed = await self.db.mark_cancelled(str(task_id))
+            if not changed:
+                logger.info("download cancellation lost race task=%s; state already changed", task_id)
             task = await self.db.get_task(str(task_id))
-            if task and task.get("file_path"):
+            if task and task.get("file_path") and task.get("status") == "cancelled":
                 await remove_artifact_async(task["file_path"])
             await self._cleanup_now()
         return cancelled
@@ -196,9 +192,11 @@ class Pipeline:
     async def cancel_upload(self, task_id: int | str) -> bool:
         cancelled = await self.upload.cancel(task_id)
         if cancelled:
-            await self.db.mark_cancelled(str(task_id))
+            changed = await self.db.mark_cancelled(str(task_id))
+            if not changed:
+                logger.info("upload cancellation lost race task=%s; state already changed", task_id)
             task = await self.db.get_task(str(task_id))
-            if task and task.get("file_path"):
+            if task and task.get("file_path") and task.get("status") == "cancelled":
                 await remove_artifact_async(task["file_path"])
             await self._cleanup_now()
         return cancelled
@@ -244,7 +242,11 @@ class Pipeline:
             path.stat().st_size / 1024 / 1024 if path.is_file() else 0,
             destination,
         )
-        await self.db.update_task(task_id, status="uploading", file_path=str(path), progress=0)
+        changed = await self.db.mark_uploading(task_id)
+        if not changed:
+            logger.warning("download completion ignored because task is no longer downloading task=%s", task_id)
+            return
+        await self.db.update_task(task_id, file_path=str(path), progress=0)
         payload = dict(item.payload)
         payload["file_path"] = str(path)
         payload["task_type"] = "upload"
@@ -253,7 +255,10 @@ class Pipeline:
 
     async def _download_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
-        await self.db.mark_failed(task_id, str(error))
+        changed = await self.db.mark_failed(task_id, str(error))
+        if not changed:
+            logger.info("download failure ignored because task state already terminal task=%s", task_id)
+            return
         await remove_artifact_async(item.payload.get("file_path") or (self.output_dir / item.payload.get("filename", f"{task_id}.mp4")))
         await self._cleanup_now()
         if self.on_failed:
@@ -265,10 +270,13 @@ class Pipeline:
 
     async def _upload_complete(self, item: QueueItem):
         task_id = str(item.task_id)
+        changed = await self.db.mark_completed(task_id)
+        if not changed:
+            logger.warning("upload completion ignored because task is no longer uploading task=%s", task_id)
+            return
         task = await self.db.get_task(task_id)
         if task and task.get("file_path"):
             await remove_artifact_async(task["file_path"])
-        await self.db.mark_completed(task_id)
         await self._cleanup_now()
         if self.on_complete:
             async def render_complete() -> None:
@@ -279,7 +287,10 @@ class Pipeline:
 
     async def _upload_failed(self, item: QueueItem, error: Exception):
         task_id = str(item.task_id)
-        await self.db.mark_failed(task_id, str(error))
+        changed = await self.db.mark_failed(task_id, str(error))
+        if not changed:
+            logger.info("upload failure ignored because task state already terminal task=%s", task_id)
+            return
         if item.payload.get("file_path"):
             await remove_artifact_async(item.payload["file_path"])
         await self._cleanup_now()
