@@ -12,7 +12,9 @@ import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot_vnext"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "bot_vnext"))
 
 from app.core.task import TaskContext
 from app.downloader.engine import HybridDownloader
@@ -30,7 +32,7 @@ async def main(source: str) -> int:
         print("[TEST] yt-dlp is not installed")
         return 2
 
-    out_dir = Path("test_results/downloader/media")
+    out_dir = ROOT / "test_results/downloader/media"
     out_dir.mkdir(parents=True, exist_ok=True)
     output = out_dir / "signed_hls_fallback_test.mp4"
     output.unlink(missing_ok=True)
