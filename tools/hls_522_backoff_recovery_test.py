@@ -12,6 +12,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+# Make bot_vnext/app importable when this script is launched from repo root.
+ROOT = Path(__file__).resolve().parents[1]
+BOT_ROOT = ROOT / "bot_vnext"
+if str(BOT_ROOT) not in sys.path:
+    sys.path.insert(0, str(BOT_ROOT))
 
 from app.core.task import TaskContext
 from app.downloader.engine import HybridDownloader
