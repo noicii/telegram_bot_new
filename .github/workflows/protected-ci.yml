@@ -37,4 +37,9 @@ jobs:
             bot_vnext/app/downloader/engine.py \
             bot_vnext/app/downloader/browser_hls.py \
             bot_vnext/app/queue/upload_manager.py \
-            bot_vnext/app/uploader/engine.py
+            bot_vnext/app/uploader/engine.py \
+            bot_vnext/app/storage/database.py \
+            bot_vnext/app/core/task.py
+
+      - name: Run core safety regression tests
+        run: python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
