@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Test-only diagnostic: compare direct vs proxy access to a freshly discovered HLS URL.
+"""Test-only diagnostic: compare direct HLS access with a free public HTTP proxy.
 
-No production files are imported or modified. The proxy is supplied at runtime via
---proxy, so credentials are not committed to the repository.
+Production files are not modified. No proxy is stored in the repository; a live
+public list is fetched at runtime and candidates are validated before use.
 """
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+import aiohttp
+
 ROOT = Path(__file__).resolve().parents[1]
 BOT_ROOT = ROOT / "bot_vnext"
 if str(BOT_ROOT) not in sys.path:
@@ -19,6 +21,56 @@ if str(BOT_ROOT) not in sys.path:
 
 from app.core.task import TaskContext
 from app.downloader.engine import HybridDownloader
+
+PROXY_LIST = "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/http.txt"
+IP_CHECK = "https://api.ipify.org"
+
+
+async def fetch_candidates(limit: int) -> list[str]:
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(PROXY_LIST) as r:
+            r.raise_for_status()
+            text = await r.text()
+    out = []
+    for line in text.splitlines():
+        p = line.strip()
+        if p and not p.startswith("#") and ":" in p:
+            out.append("http://" + p)
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def validate_proxy(session: aiohttp.ClientSession, proxy: str) -> str | None:
+    try:
+        async with session.get(IP_CHECK, proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 200:
+                ip = (await r.text()).strip()
+                return ip or None
+    except Exception:
+        return None
+    return None
+
+
+async def find_working_proxy(limit: int) -> tuple[str, str] | None:
+    candidates = await fetch_candidates(limit)
+    print(f"[TEST] Downloaded {len(candidates)} public HTTP proxy candidates")
+    connector = aiohttp.TCPConnector(limit=20, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = {asyncio.create_task(validate_proxy(session, p)): p for p in candidates}
+        for task in asyncio.as_completed(tasks):
+            ip = await task
+            proxy = candidates[0] if False else tasks[task] if task in tasks else None
+            # asyncio.as_completed may return wrapper futures, so resolve by result below.
+            if ip:
+                # The matching proxy is recovered by checking candidates sequentially only
+                # when a successful task is found; validation is cheap and the list is small.
+                for p in candidates:
+                    if await validate_proxy(session, p) == ip:
+                        print(f"[TEST] FREE PROXY VALID: {p} exit_ip={ip}")
+                        return p, ip
+    return None
 
 
 async def probe(session, url: str, label: str, proxy: str | None) -> None:
@@ -40,31 +92,38 @@ async def probe(session, url: str, label: str, proxy: str | None) -> None:
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url", help="source page URL")
-    parser.add_argument("--proxy", required=True, help="HTTP/HTTPS/SOCKS proxy URL; supplied only at runtime")
+    parser.add_argument("--candidates", type=int, default=30, help="public proxies to validate")
     args = parser.parse_args()
 
-    task = TaskContext(task_id="proxy-compare-test")
-    downloader = HybridDownloader()
-    print("[TEST] === DIRECT vs PROXY HLS HTTP PROBE ===")
+    print("[TEST] === DIRECT vs FREE PUBLIC PROXY HLS PROBE ===")
     print(f"[TEST] Source: {args.url}")
     print("[TEST] Production files are NOT modified.")
-    print("[TEST] Step 1: fresh HLS discovery")
+    print("[TEST] Public proxy source: HProxy live HTTP list")
 
+    proxy_info = await find_working_proxy(max(1, min(args.candidates, 100)))
+    if not proxy_info:
+        print("[TEST] FINAL: FAIL - no free public HTTP proxy passed validation")
+        return 1
+    proxy, exit_ip = proxy_info
+
+    task = TaskContext(task_id="free-proxy-compare-test")
+    downloader = HybridDownloader()
     try:
+        print("[TEST] Step 1: fresh HLS discovery")
         stream = await downloader._discover_hls(args.url, task, {"User-Agent": "Mozilla/5.0"}, None)
         if not stream:
             print("[TEST] FINAL: FAIL - no HLS URL discovered")
             return 1
         print(f"[TEST] HLS DISCOVERY SUCCESS host={stream.split('/')[2] if '://' in stream else 'unknown'}")
 
-        timeout = __import__("aiohttp").ClientTimeout(total=35)
-        async with __import__("aiohttp").ClientSession(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
+        timeout = aiohttp.ClientTimeout(total=35)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
             await probe(session, stream, "DIRECT", None)
-            await probe(session, stream, "PROXY", args.proxy)
+            await probe(session, stream, f"FREE_PROXY exit={exit_ip}", proxy)
     finally:
         await downloader.close()
 
-    print("[TEST] FINAL: COMPLETE - compare DIRECT and PROXY results above")
+    print("[TEST] FINAL: COMPLETE - compare DIRECT and FREE_PROXY results above")
     return 0
 
 
