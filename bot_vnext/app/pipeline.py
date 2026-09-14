@@ -192,25 +192,42 @@ class Pipeline:
             return False
         return True
 
+    async def _cancel_owned(self, task_id: int | str, *, manager) -> bool:
+        """Atomically claim cancellation in DB before stopping worker execution.
+
+        This ordering closes the cancel-vs-complete race: if completion already
+        won the DB transition, cancellation returns False and never tears down a
+        successfully completed task. If cancellation wins, worker completion
+        transitions become no-ops because the task is already terminal.
+        """
+        key = str(task_id)
+        task = await self.db.get_task(key)
+        if not task or task.get("status") not in {"queued", "downloading", "uploading"}:
+            return False
+        changed = await self.db.mark_cancelled(key)
+        if not changed:
+            return False
+        try:
+            await manager.cancel(key)
+        except Exception:
+            logger.exception("worker cancellation failed after DB cancellation task=%s", key)
+        task = await self.db.get_task(key)
+        if task and task.get("file_path"):
+            await remove_artifact_async(task["file_path"])
+        await self._cleanup_now()
+        return True
+
     async def cancel_download(self, task_id: int | str) -> bool:
-        cancelled = await self.download.cancel(task_id)
-        if cancelled:
-            await self.db.mark_cancelled(str(task_id))
-            task = await self.db.get_task(str(task_id))
-            if task and task.get("file_path") and task.get("status") == "cancelled":
-                await remove_artifact_async(task["file_path"])
-            await self._cleanup_now()
-        return cancelled
+        task = await self.db.get_task(str(task_id))
+        if not task or task.get("status") not in {"queued", "downloading"}:
+            return False
+        return await self._cancel_owned(task_id, manager=self.download)
 
     async def cancel_upload(self, task_id: int | str) -> bool:
-        cancelled = await self.upload.cancel(task_id)
-        if cancelled:
-            await self.db.mark_cancelled(str(task_id))
-            task = await self.db.get_task(str(task_id))
-            if task and task.get("file_path") and task.get("status") == "cancelled":
-                await remove_artifact_async(task["file_path"])
-            await self._cleanup_now()
-        return cancelled
+        task = await self.db.get_task(str(task_id))
+        if not task or task.get("status") != "uploading":
+            return False
+        return await self._cancel_owned(task_id, manager=self.upload)
 
     async def cancel(self, task_id: int | str) -> bool:
         # Determine the owner first so cancellation never pollutes the other manager.
@@ -253,8 +270,6 @@ class Pipeline:
         task_id = str(item.task_id)
         logger.info("download COMPLETE task=%s file=%s size=%.1fMiB; handing off to upload",
                     task_id, path, path.stat().st_size / 1024 / 1024 if path.is_file() else 0)
-        # Keep the task in `downloading` until UploadManager atomically claims it.
-        # This gives upload state one owner and avoids double transitions.
         await self.db.update_task(task_id, file_path=str(path), progress=0)
         payload = dict(item.payload)
         payload["file_path"] = str(path)
