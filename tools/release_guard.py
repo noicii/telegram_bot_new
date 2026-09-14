@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed checks for production Bot V2 releases.
 
-This is intentionally independent of documentation.  update.sh runs it after
+This is intentionally independent of documentation. update.sh runs it after
 any compatibility/build step, so a future change that regresses protected
 behaviour stops the deployment before systemd is started.
 """
@@ -51,7 +51,15 @@ def main() -> None:
         fail(".env is not protected by .gitignore")
 
     # Python must parse cleanly before deployment.
-    for path in [V2 / "main.py", V2 / "apply_ui_runtime_patch.py", V2 / "app" / "pipeline.py", V2 / "app" / "downloader" / "engine.py", V2 / "app" / "downloader" / "browser_hls.py", V2 / "app" / "queue" / "upload_manager.py", V2 / "app" / "uploader" / "engine.py"]:
+    for path in [
+        V2 / "main.py",
+        V2 / "apply_ui_runtime_patch.py",
+        V2 / "app" / "pipeline.py",
+        V2 / "app" / "downloader" / "engine.py",
+        V2 / "app" / "downloader" / "browser_hls.py",
+        V2 / "app" / "queue" / "upload_manager.py",
+        V2 / "app" / "uploader" / "engine.py",
+    ]:
         try:
             ast.parse(read(path), filename=str(path))
         except SyntaxError as exc:
@@ -67,7 +75,11 @@ def main() -> None:
 
     # The method menu must edit the current message. A regression to
     # send_method_menu() in the v2:method callback creates duplicate menus.
-    method_match = re.search(r'if data==["\']v2:method["\']:(.*?)(?=\n\s*if data==|\n\s*s=self\.sessions|\Z)', main_py, re.S)
+    method_match = re.search(
+        r'if data==["\']v2:method["\']:(.*?)(?=\n\s*if data==|\n\s*s=self\.sessions|\Z)',
+        main_py,
+        re.S,
+    )
     if not method_match:
         fail("v2:method callback missing")
     method_block = method_match.group(1)
@@ -77,7 +89,11 @@ def main() -> None:
         fail("method callback does not edit the existing message")
 
     # Status refresh must use the canonical dashboard message flow.
-    status_match = re.search(r'if data==["\']v2:status["\']:(.*?)(?=\n\s*if data==|\Z)', main_py, re.S)
+    status_match = re.search(
+        r'if data==["\']v2:status["\']:(.*?)(?=\n\s*if data==|\Z)',
+        main_py,
+        re.S,
+    )
     if not status_match or "show_dashboard" not in status_match.group(1):
         fail("status callback is not wired to the canonical dashboard")
 
@@ -88,7 +104,9 @@ def main() -> None:
         fail("HLS segment progress fields missing")
     if "BrowserHLSDownloader" not in engine:
         fail("Browser HLS integration missing")
-    if "browser_context.request" not in browser:
+    # Production implementation aliases the browser-context request API as
+    # `context.request` (Playwright's BrowserContext.request property).
+    if "context.request" not in browser:
         fail("Browser HLS is not using browser-context authenticated requests")
     if "shutil.rmtree(work" not in browser:
         fail("Browser HLS work-directory cleanup missing")
