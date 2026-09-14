@@ -116,8 +116,6 @@ else:
     text = text.replace(old_retry_anchor, new_retry_anchor, 1)
     print("UI retry callback patch applied")
 
-# Fix the status/refresh callback so it always opens or refreshes the real
-# dashboard message instead of trying to render into an unrelated UI message.
 old_status = '        if data=="v2:status": await query.answer(); self.dashboard_messages[query.message.chat.id]=query.message.id; await self.render_dashboard(query.message.chat.id,query.message.id,True); return\n'
 new_status = '''        if data=="v2:status":
             await query.answer("📊 Refreshing status…")
@@ -143,7 +141,7 @@ if not BROWSER_HLS.is_file():
 engine = ENGINE.read_text(encoding="utf-8")
 import_anchor = 'from app.core.task import TaskCancelled, TaskContext\n'
 import_line = 'from app.downloader.browser_hls import BrowserHLSDownloader\n'
-if import_line not in engine:
+if import_line not in engine and 'from app.downloader.browser_hls import BrowserHLSDownloader, BrowserHLSError' not in engine:
     if import_anchor not in engine:
         raise SystemExit("ERROR: downloader import anchor not found; refusing unsafe Browser HLS patch")
     engine = engine.replace(import_anchor, import_anchor + import_line, 1)
@@ -173,8 +171,106 @@ else:
 
 ENGINE.write_text(engine, encoding="utf-8")
 
-# Validate the new standalone engine before the service is allowed to start.
+# ---------------------------------------------------------------------------
+# Browser HLS discovery + realtime segment UI hardening
+# ---------------------------------------------------------------------------
+browser = BROWSER_HLS.read_text(encoding="utf-8")
+
+old_capture_gate = '            if response.status != 200 or (".m3u8" not in low and "mpegurl" not in ct):\n                return\n'
+new_capture_gate = '''            manifest_hint = any(token in low for token in (".m3u8", "manifest", "playlist", "master"))
+            manifest_ct = any(token in ct for token in ("mpegurl", "m3u8", "vnd.apple.mpegurl"))
+            try:
+                content_length = int(response.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                content_length = 0
+            text_candidate = ct.startswith(("text/", "application/json", "application/octet-stream")) and (not content_length or content_length <= MAX_PLAYLIST_BYTES)
+            if response.status != 200 or not (manifest_hint or manifest_ct or text_candidate):
+                return
+'''
+if 'manifest_hint = any(token in low' in browser:
+    print("Browser HLS broad playlist response matching already applied")
+elif old_capture_gate in browser:
+    browser = browser.replace(old_capture_gate, new_capture_gate, 1)
+    print("Browser HLS broad playlist response matching applied")
+else:
+    raise SystemExit("ERROR: Browser HLS capture gate not found; refusing unsafe discovery patch")
+
+old_trigger_loop = '''        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline and not captured:
+            task.check_cancelled()
+            await self._report(progress, 1.0, 0, None, 0.0, {"browser_hls_stage": "discovering"})
+            await asyncio.sleep(0.5)
+'''
+new_trigger_loop = '''        deadline = time.monotonic() + 45
+        tick = 0
+        while time.monotonic() < deadline and not captured:
+            task.check_cancelled()
+            # Players/iframes can appear after DOMContentLoaded. Re-trigger
+            # playback periodically instead of only once at initial load.
+            if tick % 2 == 0:
+                await self._trigger_playback(page, task)
+            await self._report(progress, 1.0, 0, None, 0.0, {"browser_hls_stage": "discovering"})
+            tick += 1
+            await asyncio.sleep(0.5)
+'''
+if 'tick = 0' in browser and 'Re-trigger' in browser:
+    print("Browser HLS repeated playback trigger already applied")
+elif old_trigger_loop in browser:
+    browser = browser.replace(old_trigger_loop, new_trigger_loop, 1)
+    print("Browser HLS repeated playback trigger applied")
+else:
+    raise SystemExit("ERROR: Browser HLS discovery wait loop not found; refusing unsafe patch")
+
+old_candidate_filter = '                        if isinstance(item, str) and ".m3u8" in item and item not in seen:\n'
+new_candidate_filter = '                        if isinstance(item, str) and item.startswith(("http://", "https://")) and item not in seen:\n'
+if 'item.startswith(("http://", "https://"))' in browser:
+    print("Browser HLS config URL fallback already applied")
+elif old_candidate_filter in browser:
+    browser = browser.replace(old_candidate_filter, new_candidate_filter, 1)
+    print("Browser HLS config URL fallback applied")
+else:
+    raise SystemExit("ERROR: Browser HLS config candidate filter not found; refusing unsafe patch")
+
+old_cleanup = '''                try:
+                    await browser.close()
+                except Exception:
+                    pass
+'''
+new_cleanup = '''                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                # TaskContext cleanup intentionally handles files, while this
+                # downloader owns a per-task directory.
+                shutil.rmtree(work, ignore_errors=True)
+                task.temp_paths.discard(work)
+'''
+if 'shutil.rmtree(work, ignore_errors=True)' in browser:
+    print("Browser HLS work-directory cleanup already applied")
+elif old_cleanup in browser:
+    browser = browser.replace(old_cleanup, new_cleanup, 1)
+    print("Browser HLS work-directory cleanup applied")
+else:
+    raise SystemExit("ERROR: Browser HLS browser-close cleanup anchor not found; refusing unsafe patch")
+
+BROWSER_HLS.write_text(browser, encoding="utf-8")
+
+# Segmented downloads should show segment progress as the primary live metric,
+# with byte count as secondary data rather than replacing the segment counter.
+main = MAIN.read_text(encoding="utf-8")
+old_hls_ui = 'lines.append(f"🧩 HLS: **{hls_done} / {hls_total} segments** • **{hls_pct:.0f}%**")\n                        lines.append(f"📥 Downloaded: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")'
+new_hls_ui = 'lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**")\n                        lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")'
+if 'lines.append(f"🧩 Segments: **{hls_done} / {hls_total}**' in main:
+    print("Segment realtime dashboard format already applied")
+elif old_hls_ui in main:
+    main = main.replace(old_hls_ui, new_hls_ui, 1)
+    MAIN.write_text(main, encoding="utf-8")
+    print("Segment realtime dashboard format applied")
+else:
+    raise SystemExit("ERROR: HLS dashboard rendering block not found; refusing unsafe UI patch")
+
 import py_compile
 py_compile.compile(str(BROWSER_HLS), doraise=True)
 py_compile.compile(str(ENGINE), doraise=True)
-print("Browser HLS syntax validation passed")
+py_compile.compile(str(MAIN), doraise=True)
+print("Browser HLS + segmented dashboard syntax validation passed")
