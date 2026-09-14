@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(BOT_ROOT))
 
 from app.downloader.engine import HybridDownloader
-from app.downloader.models import TaskContext
+from app.core.task import TaskContext
 
 
 async def main() -> int:
@@ -39,8 +39,8 @@ async def main() -> int:
     output = out_dir / "production_equivalent_hls_test.mp4"
     output.unlink(missing_ok=True)
 
-    task = TaskContext(id=f"production-equivalent-{int(time.time())}", chat_id=0, url=args.url, metadata={})
-    downloader = HybridDownloader()
+    task = TaskContext(task_id=f"production-equivalent-{int(time.time())}")
+    downloader = HybridDownloader(out_dir)
     headers = {"User-Agent": "Mozilla/5.0"}
 
     print("[TEST] === PRODUCTION-EQUIVALENT HLS ROUTE ===")
@@ -59,7 +59,6 @@ async def main() -> int:
         print("[TEST] HLS DISCOVERY SUCCESS")
         print("[TEST] Step 2: production _ffmpeg() invocation against discovered stream")
 
-        # This calls the existing production _ffmpeg implementation directly.
         await asyncio.wait_for(
             downloader._ffmpeg(stream, output, task, None, headers=headers),
             timeout=args.timeout,
