@@ -106,8 +106,12 @@ rollback(){
     }
   fi
 
-  "$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py || {
+  "$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py || {
     echo "ERROR: Rolled-back revision failed syntax validation." >&2
+    return 1
+  }
+  "$PYTHON_BIN" tools/release_guard.py || {
+    echo "ERROR: Rolled-back revision failed the protected release guard." >&2
     return 1
   }
 
@@ -190,8 +194,11 @@ fi
 log "Applying tracked UI compatibility patches"
 "$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py
 
+log "Running protected release guard"
+"$PYTHON_BIN" tools/release_guard.py
+
 log "Running syntax checks"
-"$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py
+"$PYTHON_BIN" -m py_compile bot_vnext/main.py bot_vnext/apply_ui_runtime_patch.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py
 
 log "Verifying active HLS concurrency"
 grep -nE 'Semaphore\(16\)|16 segments download concurrently' "$ACTIVE_HLS" || fail "HLS concurrency is not 16"
@@ -210,12 +217,9 @@ sudo systemctl is-active "$SERVICE" >/dev/null || {
 sudo systemctl --no-pager --full status "$SERVICE" || true
 
 log "Verifying exactly one V2 Python process"
-# systemd's flock wrapper command line also contains the Python command.
-# Count only the real interpreter whose executable path starts the command.
 mapfile -t RUNNING < <(pgrep -u "$(id -u)" -x -f "$PYTHON_BIN[[:space:]]+$ROOT/bot_vnext/main.py([[:space:]]|$)" || true)
 [ "${#RUNNING[@]}" -eq 1 ] || fail "Expected exactly 1 V2 Python process, found ${#RUNNING[@]}"
 
-# This is the commit we are now willing to call "last working".
 printf '%s\n' "$(git rev-parse HEAD)" > "$LAST_WORKING_FILE"
 rm -f "$LAST_WORKING_FILE.pending"
 
@@ -228,5 +232,6 @@ echo "Old SQLite queue/database: removed"
 echo "Old local code: reset/cleaned"
 echo "Secrets: .env preserved"
 echo "Selection method menu: same-message"
+echo "Protected release guard: PASS"
 echo "Last-working backup: $UPDATE_BACKUP"
 echo "Last-working commit: $(git rev-parse HEAD)"
