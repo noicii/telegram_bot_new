@@ -76,7 +76,7 @@ def method_label(method: str) -> str:
         "auto": "🤖 Auto",
         "hls-multi": "⚡ HLS Multi 4x",
         "yt-dlp": "🎯 yt-dlp",
-        "browser": "🌐 Browser",
+        "browser": "🌐 Browser HLS",
         "ffmpeg": "🎞️ FFmpeg",
         "aria2c": "⚡ aria2c",
         "direct": "📥 Direct",
