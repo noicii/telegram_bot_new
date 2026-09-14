@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONPATH: bot_vnext
+
 jobs:
   protected-ci:
     name: Protected Bot V2 CI
