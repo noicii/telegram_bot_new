@@ -2,13 +2,7 @@
 set -Eeuo pipefail
 
 # Canonical production updater.
-# Update flow:
-#   1) snapshot the currently running/working Git revision WITHOUT stopping the service
-#   2) fetch/reset/install the new revision
-#   3) validate and start the new revision
-#   4) if any deployment/start validation fails, automatically restore the last working revision
-#      and restart it
-# .env and the virtualenv are preserved. Disposable runtime state is reset.
+# .env and the virtualenv are preserved; disposable runtime state is reset.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 BRANCH="bot-vnext"
@@ -28,11 +22,10 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 [ -d .git ] || fail "Run this from ~/telegram_bot_new (Git repository root)."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required for production."
 command -v git >/dev/null 2>&1 || fail "git is required."
+command -v tar >/dev/null 2>&1 || fail "tar is required for rollback recovery."
 
 mkdir -p "$BACKUP_ROOT"
 
-# Keep the backup outside the repository so git clean/reset can never remove it.
-# The marker is only advanced after a deployment has passed all checks and is active.
 if [ -s "$LAST_WORKING_FILE" ]; then
   SAVED_SHA="$(tr -d '[:space:]' < "$LAST_WORKING_FILE")"
   if git cat-file -e "${SAVED_SHA}^{commit}" 2>/dev/null; then
@@ -50,7 +43,6 @@ mkdir -p "$UPDATE_BACKUP"
 log "Creating last-working-version backup WITHOUT stopping the service"
 echo "$PREVIOUS_SHA" > "$UPDATE_BACKUP/commit"
 echo "$PREVIOUS_SHA" > "$LAST_WORKING_FILE.pending"
-# git archive gives us a complete tracked-code snapshot; .env is intentionally not included.
 git archive --format=tar "$PREVIOUS_SHA" | gzip -c > "$UPDATE_BACKUP/source.tar.gz"
 cp -f "$LAST_WORKING_FILE" "$UPDATE_BACKUP/previous_marker" 2>/dev/null || true
 ln -sfn "$UPDATE_BACKUP" "$BACKUP_ROOT/latest"
@@ -67,11 +59,23 @@ rollback(){
 
   sudo systemctl stop "$SERVICE" >/dev/null 2>&1 || true
 
-  # Restore the exact known-good tracked revision.
-  git reset --hard "$PREVIOUS_SHA" >/dev/null 2>&1 || {
-    echo "ERROR: Git rollback to $PREVIOUS_SHA failed." >&2
-    return 1
-  }
+  # Prefer the known-good Git revision. If that object is unavailable/corrupt,
+  # recover the exact tracked source snapshot created before the update.
+  RESTORED_FROM="git"
+  if ! git reset --hard "$PREVIOUS_SHA" >/dev/null 2>&1; then
+    echo "WARN: Git rollback to $PREVIOUS_SHA failed; restoring source archive." >&2
+    [ -s "$UPDATE_BACKUP/source.tar.gz" ] || {
+      echo "ERROR: Rollback archive is missing: $UPDATE_BACKUP/source.tar.gz" >&2
+      return 1
+    }
+    git clean -fdx -e .env -e venv/ -e .venv/ >/dev/null 2>&1 || true
+    tar -xzf "$UPDATE_BACKUP/source.tar.gz" -C "$ROOT" || {
+      echo "ERROR: Rollback archive extraction failed." >&2
+      return 1
+    }
+    RESTORED_FROM="archive"
+  fi
+
   git clean -fdx -e .env -e venv/ -e .venv/ >/dev/null 2>&1 || true
   rm -f bot_vnext.db bot_vnext/app/storage/bot_vnext.db
   rm -rf backup_upload_rebuild_* 2>/dev/null || true
@@ -134,7 +138,7 @@ rollback(){
 
   printf '%s\n' "$PREVIOUS_SHA" > "$LAST_WORKING_FILE"
   rm -f "$LAST_WORKING_FILE.pending"
-  log "Automatic rollback SUCCESS — service restored to $PREVIOUS_SHA"
+  log "Automatic rollback SUCCESS — restored from $RESTORED_FROM (known-good $PREVIOUS_SHA)"
   echo "Backup kept at: $UPDATE_BACKUP"
   return 0
 }
