@@ -5,7 +5,6 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
 
 DB_PATH = Path(__file__).resolve().parents[3] / "bot_vnext.db"
 
@@ -203,7 +202,7 @@ class Database:
         return await self.transition(task_id, ("queued",), "downloading", started_at=time.time(), error=None, **fields)
 
     async def mark_uploading(self, task_id):
-        return await self.transition(task_id, ("downloading",), "uploading", error=None)
+        return await self.transition(task_id, ("queued", "downloading"), "uploading", error=None)
 
     async def mark_completed(self, task_id):
         return await self.transition(task_id, ("uploading",), "completed", progress=100, completed_at=time.time(), error=None)
