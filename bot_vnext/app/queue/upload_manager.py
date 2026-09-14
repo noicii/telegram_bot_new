@@ -203,6 +203,14 @@ class UploadManager:
         return len(self.running_tasks)
 
     async def stop(self) -> None:
+        # Mark active DB tasks as interrupted before cancelling asyncio workers.
+        # Queued items remain queued so the next startup can recover them.
+        active_ids = list(self.running_tasks)
+        if self.database:
+            for key in active_ids:
+                changed = await self.database.mark_failed(key, "Interrupted by bot shutdown")
+                if changed:
+                    logger.info("upload task %s marked failed for shutdown recovery", key)
         for ctx in list(self.contexts.values()):
             await ctx.cancel()
         for task in list(self.running_tasks.values()):
