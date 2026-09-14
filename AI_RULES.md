@@ -146,6 +146,22 @@ Documentation can become stale. Code can also contradict documentation. Therefor
 
 Never invent configuration values, file locations, worker counts, or runtime behavior.
 
+### 9.1 Downloader diagnostic rule — generic fixes only
+
+When using `DOWNLOADER_TESTING.md` / `tools/downloader_test.py`, every test URL is a **diagnostic sample**, not a target for a special-case fix.
+
+AI agents must:
+
+- diagnose the failure from evidence before editing downloader code;
+- make fixes in the generic production downloader path so the same failure pattern can be handled across valid links;
+- never hardcode a test URL, hostname, provider, CDN, episode, signed token, or one-off path merely to make the test pass;
+- not treat one successful URL as proof that the downloader is globally fixed;
+- validate other link/source patterns after the original failing case succeeds when practical;
+- follow the user's evidence-first loop: **Attempt 1 → diagnose → generic fix → Attempt 2 → diagnose → generic fix → ... → SUCCESS**;
+- run one bounded attempt at a time during troubleshooting rather than blindly looping until success.
+
+If a proposed change only helps one specific link and does not address a reproducible generic failure pattern, **STOP and do not merge it as a downloader fix**.
+
 ## 10. Validation gate
 
 After every meaningful production change:
