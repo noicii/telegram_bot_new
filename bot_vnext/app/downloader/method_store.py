@@ -74,7 +74,7 @@ def next_method(method: str) -> str:
 def method_label(method: str) -> str:
     return {
         "auto": "🤖 Auto",
-        "hls-multi": "⚡ HLS Multi 4x",
+        "hls-multi": "⚡ HLS Multi 16x",
         "yt-dlp": "🎯 yt-dlp",
         "browser": "🌐 Browser HLS",
         "ffmpeg": "🎞️ FFmpeg",
