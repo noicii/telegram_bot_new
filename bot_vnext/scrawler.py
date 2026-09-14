@@ -10,9 +10,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from config import USER_AGENT
+from crawler import _browser_discover
 
 MEDIA_EXTENSIONS = (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".m3u8", ".mpd")
 MEDIA_CONTENT_TYPES = ("video/", "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")
+PLAYER_MARKERS = ("/embed/", "/player/", "embed.", "player.", "/watch", "/play/", "/stream/", "iframe", "m3u8", "mpd", "video")
 URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.I)
 ATTRIBUTES = ("href", "src", "data", "content", "data-src", "data-url", "data-file", "data-video", "data-video-url", "data-video-src", "data-stream", "data-stream-url", "data-source", "data-hls", "data-m3u8", "data-mpd", "data-link", "data-download", "data-player", "data-embed", "data-iframe", "data-manifest", "data-playlist")
 
@@ -56,7 +58,7 @@ def _fetch(url: str, timeout: int = 20):
         return None
 
 
-def _scan_page(url: str, root_host: str):
+def _scan_page(url: str, root_host: str, browser_budget: list[int]):
     response = _fetch(url)
     if response is None:
         return set(), set()
@@ -68,7 +70,11 @@ def _scan_page(url: str, root_host: str):
     media = _extract_media(text, final_url)
     soup = BeautifulSoup(text, "lxml")
     links: set[str] = set()
+    player_like = False
     for tag in soup.find_all(True):
+        tag_text = str(tag).lower()
+        if any(marker in tag_text for marker in PLAYER_MARKERS):
+            player_like = True
         for attr in ATTRIBUTES:
             value = tag.get(attr)
             if not value:
@@ -82,7 +88,17 @@ def _scan_page(url: str, root_host: str):
                 elif urlparse(u).hostname == root_host and tag.name in {"a", "area", "link", "iframe", "frame"}:
                     links.add(u)
     media.update(_extract_media(text, final_url))
-    return media, links
+    if not media and player_like and browser_budget[0] > 0:
+        browser_budget[0] -= 1
+        try:
+            browser_urls, browser_text = _browser_discover(final_url)
+            for u in browser_urls:
+                if _is_media(u):
+                    media.add(_canon(u, final_url))
+            media.update(_extract_media(browser_text, final_url))
+        except Exception:
+            pass
+    return {u for u in media if u}, links
 
 
 def crawl_website_media_urls(raw_url: str, max_pages: int = 300, workers: int = 16) -> list[str]:
@@ -99,12 +115,14 @@ def crawl_website_media_urls(raw_url: str, max_pages: int = 300, workers: int = 
     queued = {start}
     visited: set[str] = set()
     media: set[str] = set()
+    browser_budget = [min(40, max_pages)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         while queue and len(visited) < max_pages:
             batch = []
             while queue and len(batch) < workers and len(visited) + len(batch) < max_pages:
                 batch.append(queue.popleft())
-            for url, future in zip(batch, [pool.submit(_scan_page, u, root_host) for u in batch]):
+            futures = [pool.submit(_scan_page, u, root_host, browser_budget) for u in batch]
+            for url, future in zip(batch, futures):
                 visited.add(url)
                 try:
                     page_media, links = future.result()
