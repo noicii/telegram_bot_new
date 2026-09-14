@@ -92,6 +92,8 @@ class BrowserHLSDownloader:
                     await browser.close()
                 except Exception:
                     pass
+                shutil.rmtree(work, ignore_errors=True)
+                task.temp_paths.discard(work)
 
     async def _discover(self, browser, url, task, progress):
         context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1280, "height": 720})
@@ -103,7 +105,14 @@ class BrowserHLSDownloader:
         async def capture(response):
             low = response.url.lower()
             ct = (response.headers.get("content-type") or "").lower()
-            if response.status != 200 or (".m3u8" not in low and "mpegurl" not in ct):
+            manifest_hint = any(token in low for token in (".m3u8", "manifest", "playlist", "master"))
+            manifest_ct = any(token in ct for token in ("mpegurl", "m3u8", "vnd.apple.mpegurl"))
+            try:
+                content_length = int(response.headers.get("content-length") or 0)
+            except (TypeError, ValueError):
+                content_length = 0
+            text_candidate = ct.startswith(("text/", "application/json", "application/octet-stream")) and (not content_length or content_length <= MAX_PLAYLIST_BYTES)
+            if response.status != 200 or not (manifest_hint or manifest_ct or text_candidate):
                 return
             if response.url in seen:
                 return
@@ -125,9 +134,13 @@ class BrowserHLSDownloader:
 
         await self._trigger_playback(page, task)
         deadline = time.monotonic() + 45
+        tick = 0
         while time.monotonic() < deadline and not captured:
             task.check_cancelled()
+            if tick % 2 == 0:
+                await self._trigger_playback(page, task)
             await self._report(progress, 1.0, 0, None, 0.0, {"browser_hls_stage": "discovering"})
+            tick += 1
             await asyncio.sleep(0.5)
 
         if not captured:
@@ -154,7 +167,7 @@ class BrowserHLSDownloader:
                         }"""
                     )
                     for item in found or []:
-                        if isinstance(item, str) and ".m3u8" in item and item not in seen:
+                        if isinstance(item, str) and item.startswith(("http://", "https://")) and item not in seen:
                             try:
                                 response = await context.request.get(item, timeout=REQUEST_TIMEOUT_MS, fail_on_status_code=False)
                                 body = await response.text()

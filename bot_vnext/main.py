@@ -22,7 +22,7 @@ from app.downloader.method_store import get_method, set_method, get_default_meth
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("bot_vnext")
 PAGE_SIZE = 8
-COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("clear","🧹 Clear completed/failed/cancelled tasks"),("crawl","🔎 Crawl URL & select episodes"),("settings","⚙️ Bot settings & controls"),("method","🎯 Choose download method"),("health","🩺 Check bot & engine health")]
+COMMANDS = [("start","🚀 Start Bot V2"),("status","📊 Live download/upload progress"),("queue","📋 Running & queued tasks"),("cancel","🛑 Cancel a download/upload task"),("retry","🔁 Retry a failed task"),("failed","❌ Show failed download links"),("clear","🧹 Clear completed/failed/cancelled tasks"),("crawl","🔎 Crawl URL & select episodes"),("settings","⚙️ Bot settings & controls"),("method","🎯 Choose download method"),("health","🩺 Check bot & engine health")]
 def owner_only(message): return bool(OWNER_ID and message.from_user and message.from_user.id == OWNER_ID)
 def callback_owner(query): return bool(OWNER_ID and query.from_user and query.from_user.id == OWNER_ID)
 def fmt_bytes(v):
@@ -93,6 +93,27 @@ class V2Bot:
         if len(p)!=2: await message.reply_text("Usage: `/retry TASK_ID`"); return
         if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
         m=await get_default_method(); ok=await self.pipeline.retry(p[1].strip(),method=m); await message.reply_text(f"🔁 Task re-queued with **{method_label(m)}** (max 3 attempts)." if ok else "⚠️ Retry is available only for failed/cancelled tasks.")
+    async def failed_cmd(self,client,message):
+        if not owner_only(message): return
+        if not self.pipeline:
+            await message.reply_text("❌ V2 pipeline is offline.")
+            return
+        rows=await self.pipeline.db.get_tasks(statuses=("failed",),limit=10)
+        if not rows:
+            await message.reply_text("✅ **NO FAILED TASKS**\n\nThere are no failed downloads/uploads.")
+            return
+        lines=[f"❌ **FAILED DOWNLOADS** • {len(rows)} latest",""]
+        buttons=[]
+        for i,r in enumerate(rows[:6],1):
+            title=str(r.get("title") or r.get("url") or r.get("id") or "Unknown")[:80]
+            url=str(r.get("url") or "—")[:700]
+            error=str(r.get("error") or "Unknown error")[:300]
+            lines += [f"**{i}. {title}**",f"🔗 {url}",f"🆔 `{r.get('id')}`",f"⚠️ {error}",""]
+            buttons.append([InlineKeyboardButton(f"🔁 Retry {i}",callback_data=f"v2:retry:{r.get('id')}")])
+        if len(rows)>6:
+            lines.append("Showing the latest 6 with retry buttons.")
+        await message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
     async def clear_cmd(self,client,message):
         if not owner_only(message): return
         if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
@@ -146,7 +167,10 @@ class V2Bot:
     async def callback(self,client,query):
         if not callback_owner(query): await query.answer("Not allowed",show_alert=True); return
         data=query.data or ""
-        if data=="v2:status": await query.answer(); self.dashboard_messages[query.message.chat.id]=query.message.id; await self.render_dashboard(query.message.chat.id,query.message.id,True); return
+        if data=="v2:status":
+            await query.answer("📊 Refreshing status…")
+            await self.show_dashboard(query.message.chat.id, query.message)
+            return
         if data=="v2:queue": await query.answer(); await self.send_queue(query.message); return
         if data=="v2:settings": await query.answer(); await self.send_settings(query.message); return
         if data in {"v2:health","v2:healthmenu"}: await query.answer(); await self.send_health(query.message); return
@@ -163,6 +187,13 @@ class V2Bot:
                 await self.render_selection(query.message,s)
             else:
                 await set_default_method(m); await query.answer(f"Default: {method_label(m)}"); await self.send_method_menu(query.message)
+            return
+        if data.startswith("v2:retry:"):
+            tid=data.split(":",2)[2]
+            m=await get_default_method()
+            ok=bool(self.pipeline and await self.pipeline.retry(tid,method=m))
+            await query.answer("🔁 Retried" if ok else "⚠️ Task is no longer retryable",show_alert=not ok)
+            await self.render_dashboard(query.message.chat.id,query.message.id,True)
             return
         if data=="v2:clear":
             if self.pipeline: await query.answer(f"Cleared {await self.pipeline.db.clear_finished()} task(s)"); await self.send_queue(query.message); return
@@ -192,7 +223,17 @@ class V2Bot:
         if data=="v2:selclear": s["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message,s); return
         if data.startswith("v2:p:"):
             d=int(data.rsplit(":",1)[1]); pages=max(1,(len(s["items"])+PAGE_SIZE-1)//PAGE_SIZE); s["page"]=max(0,min(pages-1,s["page"]+d)); await query.answer(); await self.render_selection(query.message,s); return
-        if data=="v2:method": await query.answer(); await self.send_method_menu(query.message); return
+        if data=="v2:method":
+            await query.answer()
+            current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method()
+            await query.message.edit_text(
+                f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: **{method_label(current_method)}**",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")]
+                    for m in METHODS
+                ]),
+            )
+            return
         if data=="v2:close": self.sessions.pop(query.from_user.id,None); await query.answer("Selection closed"); await query.message.edit_text("❌ Selection cancelled."); return
         if data=="v2:download":
             selected=sorted(s["selected"])
@@ -213,7 +254,7 @@ class V2Bot:
         async with self.lock(chat_id):
             now=asyncio.get_running_loop().time()
             if not force and now-self.dashboard_last_edit.get(chat_id,0)<1.2: return True
-            rows=await self.pipeline.db.get_tasks(statuses=("queued","downloading","uploading"),limit=25); counts=await self.pipeline.db.counts(); d,u=counts.get("download",{}),counts.get("upload",{}); ad,au=self.pipeline.download.active_workers(),self.pipeline.upload.active_workers(); qd,qu=d.get("queued",0),u.get("queued",0)
+            rows=await self.pipeline.db.get_tasks(statuses=("queued","downloading","uploading"),limit=25); failed_rows_for_retry=await self.pipeline.db.get_tasks(statuses=("failed",),limit=10); counts=await self.pipeline.db.counts(); d,u=counts.get("download",{}),counts.get("upload",{}); ad,au=self.pipeline.download.active_workers(),self.pipeline.upload.active_workers(); qd,qu=d.get("queued",0),u.get("queued",0)
             lines=["📊 **LIVE DOWNLOAD / UPLOAD**","",f"⬇️ Downloads: **{ad}/2 active** • {qd} queued",f"⬆️ Uploads: **{au}/4 active** • {qu} queued",""]
             downs=[r for r in rows if r.get("status") in {"queued","downloading"}]; ups=[r for r in rows if r.get("status")=="uploading"]
             if downs:
@@ -222,8 +263,8 @@ class V2Bot:
                     live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ **{title}{(' • '+res) if res else ''}**",f"{bar(pct)} **{pct:.0f}%**"]
                     if det.get("hls_total"):
                         hls_done=int(det.get("hls_completed") or 0); hls_total=int(det.get("hls_total") or 0); hls_pct=(hls_done*100/hls_total) if hls_total else pct
-                        lines.append(f"🧩 HLS: **{hls_done} / {hls_total} segments** • **{hls_pct:.0f}%**")
-                        lines.append(f"📥 Downloaded: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
+                        lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**")
+                        lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
                         if det.get("hls_retries"): lines.append(f"🔁 Retries: {int(det.get('hls_retries') or 0)}")
                     else:
                         lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
@@ -239,7 +280,7 @@ class V2Bot:
             disk=shutil.disk_usage(DOWNLOAD_DIR); used=disk.total-disk.free; dp=used*100/disk.total if disk.total else 0; icon="🔴" if dp>=90 else "🟠" if dp>=80 else "🟢"; lines.append(f"{icon} **Disk:** {used/(1024**3):.1f}/{disk.total/(1024**3):.1f} GB used • {disk.free/(1024**3):.1f} GB free ({dp:.0f}%)")
             lines.append(f"\n✅ Done: {d.get('completed',0)+u.get('completed',0)} • ❌ Failed: {d.get('failed',0)+u.get('failed',0)} • 🛑 Cancelled: {d.get('cancelled',0)+u.get('cancelled',0)}")
             try:
-                msg=await self.client.get_messages(chat_id,message_id); await msg.edit_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])); self.dashboard_last_edit[chat_id]=now; return True
+                msg=await self.client.get_messages(chat_id,message_id); await msg.edit_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Retry {str(r.get('title') or r.get('id'))[:24]}",callback_data=f"v2:retry:{r.get('id')}")] for r in failed_rows_for_retry]+[[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])); self.dashboard_last_edit[chat_id]=now; return True
             except Exception as exc: logger.debug("dashboard edit failed: %s",exc); return False
     async def on_progress(self,kind,task_id,percent=None,current=None,total=None,speed=None,eta=None,details=None):
         self.progress_cache[str(task_id)]={"percent":percent,"current":current or 0,"total":total or 0,"speed":speed or 0,"eta":eta or 0,"details":details or {},"kind":kind}
@@ -262,7 +303,7 @@ class V2Bot:
 async def run():
     if not BOT_TOKEN or not API_ID or not API_HASH or not OWNER_ID: raise RuntimeError("API_ID, API_HASH, BOT_TOKEN and OWNER_ID must be configured")
     app=Client("telegram_bot_v2",api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,max_concurrent_transmissions=4,workdir=str(ROOT/"data")); bot=V2Bot(app)
-    app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
+    app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.failed_cmd,filters.command("failed"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
     async with app:
         await bot.start()
         try: await asyncio.Event().wait()

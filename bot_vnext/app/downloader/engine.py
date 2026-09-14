@@ -12,6 +12,7 @@ from typing import Awaitable, Callable
 from urllib.parse import urljoin, urlparse
 
 from app.core.task import TaskCancelled, TaskContext
+from app.downloader.browser_hls import BrowserHLSDownloader, BrowserHLSError
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[..., Awaitable[None] | None]
@@ -323,9 +324,12 @@ class HybridDownloader:
         finally: task.unregister_process(proc)
 
     async def _browser(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
-        stream = await self._discover_hls(url, task, {"User-Agent": "Mozilla/5.0"}, progress)
-        if not stream: raise DownloadError("Browser could not discover media stream")
-        await self._ffmpeg(stream, output, task, progress)
+        """Browser HLS: browser discovers/authenticates the stream, then fetches media concurrently."""
+        downloader = BrowserHLSDownloader(self.output_dir)
+        try:
+            await downloader.download(url, output, task, progress)
+        except BrowserHLSError as exc:
+            raise DownloadError(str(exc)) from exc
 
     @staticmethod
     async def _report(callback, percent, current, total, speed, details=None):
