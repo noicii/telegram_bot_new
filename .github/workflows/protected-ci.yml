@@ -7,103 +7,43 @@ on:
     branches: ["bot-vnext"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   PYTHONPATH: bot_vnext
 
 jobs:
-  migrate-patcher:
-    name: Remove runtime patcher from production
+  protected-ci:
+    name: Protected Bot V2 CI
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: "3.12"
 
-      - name: Migrate patcher changes into tracked source
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import ast
-
-          root = Path('.')
-          patcher = root / 'bot_vnext' / 'apply_ui_runtime_patch.py'
-          if not patcher.is_file():
-              raise SystemExit('Runtime patcher is already removed; refusing migration rewrite.')
-
-          update = root / 'update.sh'
-          text = update.read_text(encoding='utf-8')
-          old = '''  if [ -f bot_vnext/apply_ui_runtime_patch.py ]; then
-    "$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py || {
-      echo "ERROR: Rollback UI compatibility patch failed." >&2
-      return 1
-    }
-  fi
-
-'''
-          if old not in text:
-              raise SystemExit('Rollback patcher block not found; refusing unsafe migration.')
-          text = text.replace(old, '', 1)
-          old = '''log "Applying tracked UI compatibility patches"
-"$PYTHON_BIN" bot_vnext/apply_ui_runtime_patch.py
-
-'''
-          if old not in text:
-              raise SystemExit('Deployment patcher block not found; refusing unsafe migration.')
-          text = text.replace(old, '', 1)
-          if ' bot_vnext/apply_ui_runtime_patch.py' in text:
-              raise SystemExit('Patcher compile reference remains in update.sh; refusing migration.')
-          update.write_text(text, encoding='utf-8')
-
-          guard = root / 'tools' / 'release_guard.py'
-          text = guard.read_text(encoding='utf-8')
-          if 'apply_ui_runtime_patch.py' not in text:
-              raise SystemExit('Release guard already has no patcher reference; refusing migration rewrite.')
-          text = text.replace('    patcher = read(V2 / "apply_ui_runtime_patch.py")\n', '', 1)
-          text = text.replace('        V2 / "main.py", V2 / "apply_ui_runtime_patch.py", V2 / "app" / "pipeline.py",\n', '        V2 / "main.py", V2 / "app" / "pipeline.py",\n', 1)
-          old = '''    if "Browser HLS syntax validation passed" not in patcher:
-        fail("Browser HLS patcher validation missing")
-
-'''
-          if old not in text:
-              raise SystemExit('Release guard patcher validation block not found; refusing unsafe migration.')
-          text = text.replace(old, '', 1)
-          text = text.replace('''    if "release_guard.py" not in update:
-        fail("update.sh does not invoke release_guard.py")
-''', '''    if "release_guard.py" not in update:
-        fail("update.sh does not invoke release_guard.py")
-    if "apply_ui_runtime_patch.py" in update:
-        fail("runtime patcher is still referenced by update.sh")
-    if (V2 / "apply_ui_runtime_patch.py").exists():
-        fail("runtime patcher file still exists")
-''', 1)
-          guard.write_text(text, encoding='utf-8')
-
-          patcher.unlink()
-
-          for path in [root / 'bot_vnext' / 'main.py', root / 'bot_vnext' / 'app' / 'downloader' / 'engine.py', root / 'bot_vnext' / 'app' / 'downloader' / 'browser_hls.py', root / 'tools' / 'release_guard.py']:
-              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
-          print('Runtime patcher removed; source migration validated.')
-          PY
-
-      - name: Verify no runtime patcher remains
+      - name: Verify runtime patcher is removed
         run: |
           test ! -e bot_vnext/apply_ui_runtime_patch.py
           ! grep -R "apply_ui_runtime_patch.py" update.sh tools/release_guard.py .github/workflows/protected-ci.yml
 
-      - name: Commit migration
-        run: |
-          git add update.sh tools/release_guard.py .github/workflows/protected-ci.yml
-          git rm --cached --ignore-unmatch bot_vnext/apply_ui_runtime_patch.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Remove runtime patcher from production deployment"
-          git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Run fail-closed release guard
+        run: python tools/release_guard.py
 
-      - name: Validate migrated source
+      - name: Compile production Python
         run: |
-          python tools/release_guard.py
-          python -m py_compile bot_vnext/main.py bot_vnext/app/pipeline.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py bot_vnext/app/queue/upload_manager.py bot_vnext/app/uploader/engine.py bot_vnext/app/storage/database.py bot_vnext/app/core/task.py
-          python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
+          python -m py_compile \
+            bot_vnext/main.py \
+            bot_vnext/app/pipeline.py \
+            bot_vnext/app/downloader/engine.py \
+            bot_vnext/app/downloader/browser_hls.py \
+            bot_vnext/app/queue/upload_manager.py \
+            bot_vnext/app/uploader/engine.py \
+            bot_vnext/app/storage/database.py \
+            bot_vnext/app/core/task.py
+
+      - name: Run core safety regression tests
+        run: python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
