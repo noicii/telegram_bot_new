@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,15 +74,17 @@ class TaskContext:
                 pass
 
     async def cleanup(self) -> None:
-        """Remove registered temporary artifacts after the task has stopped."""
+        """Remove registered temporary files and directories after the task stops."""
         if self._closed:
             return
         self._closed = True
         await self.terminate_processes()
         for path in list(self.temp_paths):
             try:
-                if path.is_file() or path.is_symlink():
+                if path.is_symlink() or path.is_file():
                     path.unlink(missing_ok=True)
+                elif path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
             except OSError:
                 pass
         self.temp_paths.clear()
