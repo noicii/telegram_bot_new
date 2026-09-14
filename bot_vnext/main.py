@@ -229,8 +229,6 @@ class V2Bot:
                 try: path.unlink(missing_ok=True)
                 except Exception: pass
             return
-        try: await wait.delete()
-        except Exception: pass
         series=self._series_name(items); saved=await get_method(items[0].get("url") or url); self.sessions[message.from_user.id]={"items":items,"page":0,"selected":set(),"series":series,"source_url":url,"message_id":wait.id,"method":saved}; await self.render_selection(wait,self.sessions[message.from_user.id])
     def _series_name(self,items):
         title=str(items[0].get("title") or "Series"); ep=str(items[0].get("episode") or ""); res=str(items[0].get("resolution") or "")
