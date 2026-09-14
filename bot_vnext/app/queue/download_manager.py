@@ -39,13 +39,16 @@ class DownloadManager:
             raise RuntimeError(f"Download task {task_id} is already active")
         self._cancelled.discard(key)
         self.contexts[key] = TaskContext(task_id)
-        await self.pool.put(QueueItem(task_id, payload))
+        try:
+            await self.pool.put(QueueItem(task_id, payload))
+        except Exception:
+            self.contexts.pop(key, None)
+            raise
 
     async def cancel(self, task_id: int | str) -> bool:
         key = str(task_id)
         ctx = self.contexts.get(key)
         if not ctx:
-            self._cancelled.add(key)
             return False
         self._cancelled.add(key)
         await ctx.cancel()
@@ -75,7 +78,9 @@ class DownloadManager:
 
             ctx.metadata.update(payload.get("metadata") or {})
             if self.database:
-                await self.database.update_task(key, status="downloading", file_path=str(expected_path))
+                changed = await self.database.mark_downloading(key, file_path=str(expected_path))
+                if not changed:
+                    raise TaskCancelled(f"Download task {item.task_id} is no longer queued")
 
             result = await self.engine.download(payload["url"], ctx, payload["filename"], progress=report)
             ctx.check_cancelled()
@@ -94,6 +99,8 @@ class DownloadManager:
             logger.exception("download task %s failed", item.task_id)
             if self.on_failed:
                 await self.on_failed(item, exc)
+            elif self.database:
+                await self.database.mark_failed(key, str(exc))
         finally:
             self.running_tasks.pop(key, None)
             await ctx.cleanup()
