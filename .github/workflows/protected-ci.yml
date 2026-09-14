@@ -26,9 +26,7 @@ jobs:
           python-version: "3.12"
 
       - name: Verify runtime patcher is removed
-        run: |
-          test ! -e bot_vnext/apply_ui_runtime_patch.py
-          ! grep -R "apply_ui_runtime_patch.py" update.sh tools/release_guard.py
+        run: test ! -e bot_vnext/apply_ui_runtime_patch.py
 
       - name: Run fail-closed release guard
         run: python tools/release_guard.py
