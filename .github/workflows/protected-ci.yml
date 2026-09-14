@@ -7,7 +7,7 @@ on:
     branches: ["bot-vnext"]
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   PYTHONPATH: bot_vnext
@@ -25,8 +25,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Apply the same deterministic compatibility build used by production
-        run: python bot_vnext/apply_ui_runtime_patch.py
+      - name: Bake current compatibility changes into tracked production source
+        run: |
+          python bot_vnext/apply_ui_runtime_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot_vnext/main.py bot_vnext/app/downloader/engine.py bot_vnext/app/downloader/browser_hls.py
+          if git diff --cached --quiet; then
+            echo "No source changes to bake."
+          else
+            git commit -m "Bake runtime compatibility into production source"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
 
       - name: Run fail-closed release guard
         run: python tools/release_guard.py
