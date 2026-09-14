@@ -30,7 +30,6 @@ def main() -> None:
     main_py = read(V2 / "main.py")
     engine = read(V2 / "app" / "downloader" / "engine.py")
     browser = read(V2 / "app" / "downloader" / "browser_hls.py")
-    patcher = read(V2 / "apply_ui_runtime_patch.py")
     update = read(ROOT / "update.sh")
     gitignore = read(ROOT / ".gitignore")
     database = read(V2 / "app" / "storage" / "database.py")
@@ -44,7 +43,7 @@ def main() -> None:
         fail(".env is not protected by .gitignore")
 
     for path in [
-        V2 / "main.py", V2 / "apply_ui_runtime_patch.py", V2 / "app" / "pipeline.py",
+        V2 / "main.py", V2 / "app" / "pipeline.py",
         V2 / "app" / "downloader" / "engine.py", V2 / "app" / "downloader" / "browser_hls.py",
         V2 / "app" / "queue" / "upload_manager.py", V2 / "app" / "uploader" / "engine.py",
         V2 / "app" / "storage" / "database.py", V2 / "app" / "core" / "task.py",
@@ -121,8 +120,10 @@ def main() -> None:
 
     if "release_guard.py" not in update:
         fail("update.sh does not invoke release_guard.py")
-    if "Browser HLS syntax validation passed" not in patcher:
-        fail("Browser HLS patcher validation missing")
+    if "apply_ui_runtime_patch.py" in update:
+        fail("runtime patcher is still referenced by update.sh")
+    if (V2 / "apply_ui_runtime_patch.py").exists():
+        fail("runtime patcher file still exists")
 
     print("RELEASE GUARD: PASS")
     print("Protected: owner-only callbacks, single-message method menu, status dashboard")
@@ -130,6 +131,7 @@ def main() -> None:
     print("Protected: Browser HLS authenticated requests + cleanup")
     print("Protected: atomic task states + retry budget + recursive cleanup")
     print("Security: .env untracked + dangerous Python constructs rejected")
+    print("Deployment: runtime patcher removed; GitHub source is production source")
 
 
 if __name__ == "__main__":
