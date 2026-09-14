@@ -84,9 +84,8 @@ jobs:
           ast.parse((root / 'tools' / 'release_guard.py').read_text(encoding='utf-8'))
           print('Patcher migration source edits prepared.')
           PY
-          git add update.sh tools/release_guard.py .github/workflows/protected-ci.yml bot_vnext/apply_ui_runtime_patch.py
-          git reset bot_vnext/apply_ui_runtime_patch.py
-          git add -u bot_vnext/apply_ui_runtime_patch.py
+          git add update.sh tools/release_guard.py .github/workflows/protected-ci.yml
+          git rm --cached --ignore-unmatch bot_vnext/apply_ui_runtime_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Remove runtime patcher from production deployment"
@@ -100,6 +99,7 @@ jobs:
           python -m py_compile \
             bot_vnext/main.py \
             bot_vnext/apply_ui_runtime_patch.py \
+            bot_vnext/app/pipeline.py \
             bot_vnext/app/pipeline.py \
             bot_vnext/app/downloader/engine.py \
             bot_vnext/app/downloader/browser_hls.py \
