@@ -13,10 +13,8 @@ import asyncio
 import re
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
@@ -33,10 +31,12 @@ async def main() -> int:
     parser.add_argument("url", help="source page URL")
     parser.add_argument("--segments", type=int, default=8, help="number of successful TS segments to capture")
     parser.add_argument("--wait", type=int, default=45, help="seconds to observe browser playback")
+    parser.add_argument("--rate", type=float, default=1.0, help="browser playback rate; >1 speeds up capture for testing")
     args = parser.parse_args()
 
     print("[TEST] === BROWSER HLS CAPTURE -> MP4 TEST ===")
     print(f"[TEST] Source: {args.url}")
+    print(f"[TEST] Playback rate: {args.rate}x")
     print("[TEST] Production files are NOT modified.")
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -96,9 +96,16 @@ async def main() -> int:
                 videos = frame.locator("video")
                 if await videos.count():
                     await videos.first.evaluate(
-                        "v => { v.muted=true; v.autoplay=true; const p=v.play(); if(p) p.catch(()=>{}); }"
+                        """(v, rate) => {
+                            v.muted = true;
+                            v.autoplay = true;
+                            v.playbackRate = rate;
+                            const p = v.play();
+                            if (p) p.catch(() => {});
+                        }""",
+                        args.rate,
                     )
-                    print(f"[TEST] play() requested in frame={frame.url}")
+                    print(f"[TEST] play() requested in frame={frame.url} rate={args.rate}x")
                 for selector in (".jwplayer", "[class*='play' i]", "button[aria-label*='play' i]"):
                     try:
                         loc = frame.locator(selector)
@@ -113,7 +120,20 @@ async def main() -> int:
 
         deadline = time.monotonic() + max(1, args.wait)
         while time.monotonic() < deadline and len(captured) < max(1, args.segments):
-            await page.wait_for_timeout(1000)
+            for frame in page.frames:
+                try:
+                    videos = frame.locator("video")
+                    if await videos.count():
+                        await videos.first.evaluate(
+                            """(v, rate) => {
+                                if (v.playbackRate !== rate) v.playbackRate = rate;
+                                if (v.paused) { const p = v.play(); if (p) p.catch(() => {}); }
+                            }""",
+                            args.rate,
+                        )
+                except Exception:
+                    pass
+            await page.wait_for_timeout(500)
 
         await page.wait_for_timeout(1000)
         await context.close()
