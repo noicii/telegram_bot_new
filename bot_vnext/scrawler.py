@@ -37,7 +37,6 @@ DEFAULT_WORKERS = 16
 MAX_EXTERNAL_PLAYER_HOPS = 128
 MAX_BROWSER_DISCOVERIES = 512
 
-# Keep extraction broad, but never treat arbitrary JavaScript/CSS identifiers as URLs.
 BLOCKED_PSEUDO_HOSTS = {
     "a", "b", "c", "d", "e", "f", "x", "y", "z", "document", "window", "location",
     "history", "navigator", "console", "main", "body", "html", "self", "parent", "top",
@@ -62,14 +61,11 @@ def _valid_host(host: str) -> bool:
     host = (host or "").lower().rstrip(".")
     if not host or host in BLOCKED_PSEUDO_HOSTS or ".." in host:
         return False
-    # A public crawler URL should have a real DNS-style host or a literal IP.
     if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
         return True
     if "." not in host:
         return False
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
-        return False
-    return True
+    return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host))
 
 
 def _canon(url: str, base: str = "") -> str:
@@ -84,7 +80,6 @@ def _canon(url: str, base: str = "") -> str:
         host = (p.hostname or "").lower()
         if scheme not in {"http", "https"} or not _valid_host(host):
             return ""
-        # Preserve query strings: signed media URLs commonly depend on them.
         netloc = host
         if p.port and not ((scheme == "http" and p.port == 80) or (scheme == "https" and p.port == 443)):
             netloc = f"{host}:{p.port}"
@@ -220,6 +215,16 @@ def _followable(url: str, root_host: str) -> bool:
     return _same_site(host, root_host) or _player_like(url)
 
 
+def _priority(url: str) -> int:
+    """Prefer archive/tag pagination and episode-like pages over incidental links."""
+    value = url.lower()
+    score = 0
+    if re.search(r"(?:[?&](?:page|paged|p|offset|start)=\d+|/page[-/]?\d+|/p/\d+)", value): score += 100
+    if any(x in value for x in ("/tag/", "/category/", "/archive/", "/series/", "/season/", "/episode/")): score += 50
+    if any(x in value for x in ("next", "older", "previous", "prev")): score += 25
+    return score
+
+
 def _page_context(soup: BeautifulSoup, final_url: str):
     bits = [soup.title.get_text(" ", strip=True)] if soup.title else []
     for selector in ("h1", ".entry-title", ".post-title", "meta[property='og:title']"):
@@ -236,8 +241,6 @@ def _extract_attribute_urls(tag, base: str):
         if value is None: continue
         if isinstance(value, (list, tuple)): value = " ".join(map(str, value))
         value = str(value)
-        # Known media/navigation attributes are always inspected; other attributes
-        # are only scanned when they actually contain URL syntax or JSON-like data.
         if attr in KNOWN_ATTRS or "http://" in value or "https://" in value or value.startswith(("//", "/", "./", "../")):
             values.append(value)
     found = set()
@@ -287,7 +290,6 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
         elif _followable(u, root_host) and _crawlable(u):
             links.add(u)
 
-    # Browser/network discovery is a fallback for JS players, not the first pass.
     if player:
         with budget_lock:
             allowed = browser_budget[0] > 0
@@ -334,11 +336,11 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
     max_pages = max(1, min(int(max_pages or DEFAULT_MAX_PAGES), DEFAULT_MAX_PAGES))
     workers = max(1, min(int(workers or DEFAULT_WORKERS), 32))
     queue, queued, visited, results = deque([start]), {start}, set(), []
+    failed_pages = 0
     external_hops = 0
     browser_budget, budget_lock = [min(MAX_BROWSER_DISCOVERIES, max_pages)], threading.Lock()
 
-    # Sitemaps give the crawler a high-quality starting frontier when available.
-    for u in _sitemap_urls(start, root_host):
+    for u in sorted(_sitemap_urls(start, root_host), key=_priority, reverse=True):
         if len(queued) >= max_pages: break
         if u not in queued: queued.add(u); queue.append(u)
 
@@ -350,37 +352,42 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
                 if u not in visited: batch.append(u)
             if not batch: continue
             futures = {pool.submit(_scan_page, u, root_host, browser_budget, budget_lock): u for u in batch}
+            discovered = []
             for future, page_url in futures.items():
                 visited.add(page_url)
                 try:
                     media, links, series, failed = future.result()
                 except Exception:
                     failed = 1; media, links, series = set(), set(), "Unknown Series"
+                if failed: failed_pages += 1
                 results.extend((series, ep, res, u, src, page_url) for u, ep, res, src in media if _media(u))
                 if failed: continue
                 for link in links:
-                    if link in queued or link in visited or len(queued) >= max_pages: continue
+                    if link in queued or link in visited: continue
                     host = (urlparse(link).hostname or "").lower()
                     if not _same_site(host, root_host):
                         if not _player_like(link) or external_hops >= MAX_EXTERNAL_PLAYER_HOPS: continue
                         external_hops += 1
-                    queued.add(link); queue.append(link)
+                    queued.add(link)
+                    discovered.append(link)
+            # Pagination/archive links are pushed to the front, so a tag/archive
+            # starting point can reach older pages before incidental site links.
+            discovered.sort(key=_priority, reverse=True)
+            for link in reversed(discovered):
+                if len(queued) <= max_pages: queue.appendleft(link)
 
-    # Exact canonical URL dedup first. Never collapse distinct signed URLs blindly.
     by_url = {}
     for row in results:
         key = _canon(row[3])
         if not key: continue
         old = by_url.get(key)
-        if old is None:
-            by_url[key] = row
-        elif old[1] == "Unknown Episode" and row[1] != "Unknown Episode":
+        if old is None or (old[1] == "Unknown Episode" and row[1] != "Unknown Episode"):
             by_url[key] = row
     rows = list(by_url.values())
     rows.sort(key=lambda x: (x[0].lower(), _episode_sort(x[1]), _resolution_sort(x[2]), x[3]))
     stats = {
         "pages": len(visited),
-        "failed": sum(1 for _ in visited if False),
+        "failed": failed_pages,
         "series": len({r[0] for r in rows if r[0] != "Unknown Series"}),
         "episodes": len({(r[0], r[1]) for r in rows}),
         "links": len(rows),
@@ -399,6 +406,23 @@ def _episode_sort(value: str):
 def _resolution_sort(value: str):
     m = re.search(r"(\d+)", value or "")
     return -(int(m.group(1)) if m else -1)
+
+
+def _format(rows, stats=None) -> str:
+    """Human-readable compatibility formatter for callers/tests."""
+    stats = stats or {}
+    lines = []
+    current = None
+    for series, episode, resolution, url, source, _page in rows:
+        key = series or "Unknown Series"
+        if key != current:
+            if current is not None: lines.append("")
+            lines.append(f"{key}")
+            current = key
+        lines.append(f"- {episode} [{resolution}] [{source}] {url}")
+    if stats:
+        lines.extend(("", f"Pages: {stats.get('pages', 0)}", f"Failed pages: {stats.get('failed', 0)}", f"Media links: {stats.get('links', 0)}", f"Duplicates removed: {stats.get('duplicates', 0)}"))
+    return "\n".join(lines)
 
 
 def crawl_website_media_urls(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFAULT_WORKERS) -> list[str]:
