@@ -1,10 +1,8 @@
 """Adaptive Telegram API gate for Bot V2.
 
-The gate deliberately separates Telegram API pressure from download/upload
-workers. FloodWait is treated as a pause signal, never as task cancellation.
-Upload concurrency adapts between 1 and 4 based on observed Telegram pressure.
-Dashboard updates use latest-state coalescing so stale progress edits are never
-replayed after a cooldown.
+Telegram API pressure is kept separate from download/upload workers.
+Dashboard updates are coalesced by chat so only the newest state is sent.
+There is no fixed three-second dashboard refresh rule.
 """
 from __future__ import annotations
 
@@ -17,7 +15,6 @@ from typing import Any, TypeVar
 from pyrogram.errors import FloodWait
 
 logger = logging.getLogger(__name__)
-
 T = TypeVar("T")
 
 
@@ -33,9 +30,11 @@ class TelegramFloodGate:
         self.upload_condition = asyncio.Condition()
         self.upload_success_streak = 0
 
-        self.dashboard_cooldown_until = 0.0
+        # Dashboard is deliberately independent from upload concurrency.
+        # It starts responsive and only backs off when Telegram asks us to.
         self.dashboard_min_interval = 0.75
-        self.dashboard_last_sent = 0.0
+        self.dashboard_cooldown_until = 0.0
+        self.dashboard_last_sent: dict[str, float] = {}
         self.dashboard_pending: dict[str, Callable[[], Awaitable[Any]]] = {}
         self.dashboard_tasks: dict[str, asyncio.Task] = {}
         self.dashboard_lock = asyncio.Lock()
@@ -44,13 +43,7 @@ class TelegramFloodGate:
     def _now() -> float:
         return time.monotonic()
 
-    async def _wait_until(self, deadline: float) -> None:
-        delay = deadline - self._now()
-        if delay > 0:
-            await asyncio.sleep(delay)
-
     async def acquire_upload(self) -> None:
-        """Wait for the current Telegram upload window and adaptive slot."""
         async with self.upload_condition:
             while True:
                 now = self._now()
@@ -75,8 +68,6 @@ class TelegramFloodGate:
     async def note_upload_success(self) -> None:
         async with self.upload_condition:
             self.upload_success_streak += 1
-            # Recover cautiously after sustained success; never jump upward
-            # immediately after a FloodWait.
             if self.upload_success_streak >= 4 and self.upload_limit < self.upload_max:
                 self.upload_limit += 1
                 self.upload_success_streak = 0
@@ -91,17 +82,11 @@ class TelegramFloodGate:
             self.upload_cooldown_until = max(self.upload_cooldown_until, self._now() + wait)
             logger.warning(
                 "telegram gate: upload FloodWait=%ss; pausing new upload sends; concurrency=%s",
-                wait,
-                self.upload_limit,
+                wait, self.upload_limit,
             )
             self.upload_condition.notify_all()
 
     async def run_upload(self, operation: Callable[[], Awaitable[T]]) -> T:
-        """Run one Telegram send with FloodWait-aware pause/retry.
-
-        A FloodWait never cancels the owning upload task. The current attempt
-        yields to Telegram's requested cooldown, then retries the same send.
-        """
         while True:
             await self.acquire_upload()
             try:
@@ -112,9 +97,6 @@ class TelegramFloodGate:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # Network/application failures are handled by UploadEngine's
-                # existing retry policy; do not adapt concurrency on ordinary
-                # errors without Telegram explicitly asking us to slow down.
                 raise
             else:
                 await self.note_upload_success()
@@ -127,71 +109,77 @@ class TelegramFloodGate:
         key: str,
         operation: Callable[[], Awaitable[Any]],
     ) -> None:
-        """Coalesce dashboard updates and send only the newest state.
-
-        There is intentionally no fixed three-second refresh rule. The gate
-        starts responsive, learns from FloodWaits, and keeps only the newest
-        pending render while Telegram is cooling down.
-        """
-        self.dashboard_pending[key] = operation
-        task = self.dashboard_tasks.get(key)
-        if task and not task.done():
-            return
-        self.dashboard_tasks[key] = asyncio.create_task(
-            self._dashboard_worker(key), name=f"telegram-dashboard-{key}"
-        )
+        """Queue the newest dashboard render for a chat/message key."""
+        async with self.dashboard_lock:
+            self.dashboard_pending[key] = operation
+            task = self.dashboard_tasks.get(key)
+            if task and not task.done():
+                return
+            self.dashboard_tasks[key] = asyncio.create_task(
+                self._dashboard_worker(key), name=f"telegram-dashboard-{key}"
+            )
 
     async def _dashboard_worker(self, key: str) -> None:
         try:
-            while key in self.dashboard_pending:
-                operation = self.dashboard_pending.pop(key)
+            while True:
                 async with self.dashboard_lock:
-                    cooldown = self.dashboard_cooldown_until - self._now()
-                    if cooldown > 0:
-                        await asyncio.sleep(cooldown)
-                    spacing = self.dashboard_min_interval - (self._now() - self.dashboard_last_sent)
-                    if spacing > 0:
-                        await asyncio.sleep(spacing)
-                    try:
-                        await operation()
-                    except FloodWait as exc:
-                        wait = max(0.0, float(exc.value or 0))
+                    operation = self.dashboard_pending.pop(key, None)
+                    if operation is None:
+                        return
+                    last_sent = self.dashboard_last_sent.get(key, 0.0)
+                    cooldown = max(
+                        self.dashboard_cooldown_until - self._now(),
+                        self.dashboard_min_interval - (self._now() - last_sent),
+                    )
+                if cooldown > 0:
+                    await asyncio.sleep(cooldown)
+
+                try:
+                    await operation()
+                except FloodWait as exc:
+                    wait = max(0.0, float(exc.value or 0))
+                    async with self.dashboard_lock:
                         self.dashboard_cooldown_until = max(
                             self.dashboard_cooldown_until, self._now() + wait
                         )
                         self.dashboard_min_interval = min(
-                            5.0, max(1.0, self.dashboard_min_interval * 1.5)
+                            5.0, max(0.75, self.dashboard_min_interval * 1.35)
                         )
-                        logger.warning(
-                            "telegram gate: dashboard FloodWait=%ss; adaptive interval=%.2fs",
-                            wait,
-                            self.dashboard_min_interval,
-                        )
-                        # Keep the latest pending operation only. Do not replay
-                        # every stale progress event after the cooldown.
-                        self.dashboard_pending[key] = operation
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        # A failed edit is retried only if a newer progress
-                        # event arrives; this avoids tight failure loops.
-                        logger.debug("dashboard Telegram update failed: %s", exc)
-                    else:
-                        self.dashboard_last_sent = self._now()
+                        # Requeue the same latest operation. If a newer state
+                        # arrived meanwhile, publish_dashboard already replaced it.
+                        self.dashboard_pending.setdefault(key, operation)
+                    logger.warning(
+                        "telegram gate: dashboard FloodWait=%ss; adaptive interval=%.2fs",
+                        wait, self.dashboard_min_interval,
+                    )
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("dashboard Telegram update failed: %s", exc)
+                    # Do not spin on a failed API call. A later state change
+                    # will schedule the next render.
+                    return
+                else:
+                    async with self.dashboard_lock:
+                        self.dashboard_last_sent[key] = self._now()
                         self.dashboard_min_interval = max(
                             0.75, self.dashboard_min_interval * 0.95
                         )
         finally:
-            self.dashboard_tasks.pop(key, None)
-            if key in self.dashboard_pending:
-                self.dashboard_tasks[key] = asyncio.create_task(
-                    self._dashboard_worker(key), name=f"telegram-dashboard-{key}"
-                )
+            async with self.dashboard_lock:
+                self.dashboard_tasks.pop(key, None)
+                if key in self.dashboard_pending:
+                    self.dashboard_tasks[key] = asyncio.create_task(
+                        self._dashboard_worker(key), name=f"telegram-dashboard-{key}"
+                    )
 
     async def close(self) -> None:
-        tasks = list(self.dashboard_tasks.values())
-        self.dashboard_tasks.clear()
-        self.dashboard_pending.clear()
+        async with self.dashboard_lock:
+            tasks = list(self.dashboard_tasks.values())
+            self.dashboard_tasks.clear()
+            self.dashboard_pending.clear()
+            self.dashboard_last_sent.clear()
         for task in tasks:
             if not task.done():
                 task.cancel()
