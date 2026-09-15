@@ -22,6 +22,7 @@ from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from config import API_HASH, API_ID, BOT_TOKEN, OWNER_ID, DOWNLOAD_DIR, THUMB_PATH, COOKIES_PATH
 from crawler import crawl_blog_episodes
+from app.crawler_website import crawl_website_episodes
 from utils import sanitize_filename
 from app.pipeline import Pipeline
 from app.downloader.method_store import get_method, set_method, get_default_method, set_default_method, next_method, method_label, METHODS
@@ -135,13 +136,19 @@ class V2Bot:
         if not owner_only(message): return
         p=(message.text or "").split(maxsplit=1)
         if len(p)!=2: await message.reply_text("Usage: `/crawl https://example.com/episode-page`"); return
-        await self.crawl_url(message,p[1].strip())
+        await self.crawl_website_url(message,p[1].strip())
     async def text_url(self,client,message):
         if not owner_only(message): return
         t=(message.text or "").strip()
         if not t or t.startswith("/"): return
         if t.startswith(("http://","https://")): await self.crawl_url(message,t)
         else: await message.reply_text("🔗 Send a valid http/https URL or use `/crawl <URL>`.")
+    async def crawl_website_url(self,message,url):
+        wait=await message.reply_text("🔎 Crawling… please wait")
+        try: items=await asyncio.to_thread(crawl_website_episodes,url)
+        except Exception as exc: logger.exception("crawl failed"); await wait.edit_text(f"❌ Crawl failed\n`{str(exc)[:700]}`"); return
+        if not items: await wait.edit_text("❌ No downloadable episode links found."); return
+        series=self._series_name(items); saved=await get_method(items[0].get("url") or url); self.sessions[message.from_user.id]={"items":items,"page":0,"selected":set(),"series":series,"source_url":url,"message_id":wait.id,"method":saved}; await self.render_selection(wait,self.sessions[message.from_user.id])
     async def crawl_url(self,message,url):
         wait=await message.reply_text("🔎 Crawling… please wait")
         try: items=await asyncio.to_thread(crawl_blog_episodes,url)
