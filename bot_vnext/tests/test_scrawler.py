@@ -47,9 +47,12 @@ class ScrawlerUnitTests(unittest.TestCase):
     def test_format_keeps_series_episode_resolution_and_url_together(self):
         rows = [("Lollipop 4", "Episode 04", "1080p", "https://frdl.example/a.mkv", "FRDL", "https://site.example/episode-4")]
         output = scrawler._format(rows, {"pages": 1, "failed": 0, "series": 1, "episodes": 1, "links": 1, "duplicates": 0})
-        self.assertIn("Web Series: Lollipop 4", output)
-        self.assertIn("Episode 04", output)
-        self.assertIn("1080p — https://frdl.example/a.mkv", output)
+        self.assertIn("Lollipop 4", output)
+        self.assertIn("- Episode 04 [1080p] [FRDL] https://frdl.example/a.mkv", output)
+        self.assertIn("Pages: 1", output)
+        self.assertIn("Failed pages: 0", output)
+        self.assertIn("Media links: 1", output)
+        self.assertIn("Duplicates removed: 0", output)
 
     def test_public_scrawl_output_contains_only_urls(self):
         rows = [("Show", "Episode 01", "1080p", "https://cdn.example/a.m3u8", "cdn.example", "https://site.example/e1"), ("Show", "Episode 02", "1080p", "https://cdn.example/b.m3u8", "cdn.example", "https://site.example/e2")]
