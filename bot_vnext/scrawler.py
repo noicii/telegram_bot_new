@@ -18,6 +18,7 @@ from crawler import _browser_discover
 MEDIA_EXTENSIONS = (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".m3u8", ".mpd", ".ts")
 MEDIA_TYPES = ("video/", "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")
 PLAYER_MARKERS = ("/embed/", "/player/", "embed.", "player.", "/watch", "/play/", "/stream/", "iframe", "m3u8", "mpd", "video")
+PLAYER_PATH_RE = re.compile(r"/(?:d|e|embed|player|watch|play|stream)(?:/|$)", re.I)
 ATTRIBUTES = (
     "href", "src", "data", "content", "poster", "data-src", "data-url", "data-file",
     "data-video", "data-video-url", "data-video-src", "data-stream", "data-stream-url",
@@ -37,6 +38,7 @@ EP_RE = re.compile(
 RES_RE = re.compile(r"\b(2160p|1080p|720p|480p)\b|\b(4k|uhd)\b|\b(\d{3,4})\s*[x×]\s*(\d{3,4})\b", re.I)
 DEFAULT_MAX_PAGES = 2000
 DEFAULT_WORKERS = 16
+MAX_EXTERNAL_PLAYER_HOPS = 32
 
 
 def _clean(value: str) -> str:
@@ -76,7 +78,12 @@ def _media(url: str, content_type: str = "") -> bool:
 
 def _player_like(url: str, text: str = "") -> bool:
     value = f"{url} {text}".lower()
-    return any(marker in value for marker in PLAYER_MARKERS)
+    if any(marker in value for marker in PLAYER_MARKERS):
+        return True
+    try:
+        return bool(PLAYER_PATH_RE.search(urlparse(url).path or ""))
+    except Exception:
+        return False
 
 
 def _urls(text: str, base: str) -> set[str]:
@@ -218,6 +225,11 @@ def _crawlable(u: str) -> bool:
     return True
 
 
+def _is_followup_link(u: str, root_host: str) -> bool:
+    host = (urlparse(u).hostname or "").lower()
+    return host == root_host or _player_like(u)
+
+
 def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock: threading.Lock):
     response = _fetch(url)
     if response is None:
@@ -258,29 +270,26 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
                     ep = _episode(context)
                     res = _resolution(context)
                     media.add((u, ep if ep != "Unknown Episode" else page_episode, res, _source(u)))
-                elif urlparse(u).hostname == root_host and _crawlable(u):
-                    # Any same-host URL discovered in data attributes, forms, embeds,
-                    # srcset, JSON, etc. can lead to an episode page; do not require href.
+                elif _is_followup_link(u, root_host) and _crawlable(u):
                     links.add(u)
 
     discovered = _urls(text, final_url) | _json_urls(text, final_url)
     for u in discovered:
         if _media(u):
             media.add((u, page_episode, _resolution(u), _source(u)))
-        elif urlparse(u).hostname == root_host and _crawlable(u):
+        elif _is_followup_link(u, root_host) and _crawlable(u):
             links.add(u)
 
-    # Meta refresh and common canonical/alternate link targets.
     for tag in soup.find_all("meta"):
         content = str(tag.get("content") or "")
         match = re.search(r"url\s*=\s*([^;]+)$", content, re.I)
         if match:
             u = _canon(match.group(1).strip(), final_url)
-            if u and urlparse(u).hostname == root_host and _crawlable(u):
+            if u and _is_followup_link(u, root_host) and _crawlable(u):
                 links.add(u)
     for tag in soup.find_all("link"):
         href = _canon(tag.get("href"), final_url)
-        if href and urlparse(href).hostname == root_host and _crawlable(href):
+        if href and _is_followup_link(href, root_host) and _crawlable(href):
             links.add(href)
 
     if not media and player:
@@ -295,12 +304,12 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
                     cu = _canon(u, final_url)
                     if cu and _media(cu):
                         media.add((cu, page_episode, _resolution(cu), _source(cu)))
-                    elif cu and urlparse(cu).hostname == root_host and _crawlable(cu):
+                    elif cu and _is_followup_link(cu, root_host) and _crawlable(cu):
                         links.add(cu)
                 for u in _urls(browser_text, final_url):
                     if _media(u):
                         media.add((u, page_episode, _resolution(u), _source(u)))
-                    elif urlparse(u).hostname == root_host and _crawlable(u):
+                    elif _is_followup_link(u, root_host) and _crawlable(u):
                         links.add(u)
             except Exception:
                 pass
@@ -346,6 +355,7 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
     queued = {start}
     visited = set()
     results = []
+    external_hops = 0
     browser_budget = [min(80, max_pages)]
     budget_lock = threading.Lock()
 
@@ -375,9 +385,15 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
                     continue
                 results.extend((series, ep, res, url, src, page_url) for url, ep, res, src in media if _media(url))
                 for link in links:
-                    if link not in queued and link not in visited and len(queued) < max_pages:
-                        queued.add(link)
-                        queue.append(link)
+                    if link in queued or link in visited or len(queued) >= max_pages:
+                        continue
+                    link_host = (urlparse(link).hostname or "").lower()
+                    if link_host != root_host:
+                        if not _player_like(link) or external_hops >= MAX_EXTERNAL_PLAYER_HOPS:
+                            continue
+                        external_hops += 1
+                    queued.add(link)
+                    queue.append(link)
 
     by_url = {}
     for row in results:
@@ -457,11 +473,6 @@ def _format(rows: list[tuple], stats: dict) -> list[str]:
 
 
 def crawl_website_media_urls(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFAULT_WORKERS) -> list[str]:
-    """Full-site crawl returning TXT-ready series/episode/resolution lines.
-
-    Kept under the existing function name so the production bot does not need a
-    risky second integration point. The old 300-page caller is automatically
-    upgraded to the 2000-page safe limit.
-    """
+    """Full-site crawl returning TXT-ready series/episode/resolution lines."""
     rows, stats = _crawl(raw_url, max_pages=max_pages, workers=workers)
     return _format(rows, stats)
