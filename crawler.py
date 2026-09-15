@@ -1,3 +1,4 @@
+import json
 import re
 from functools import lru_cache
 from html import unescape
@@ -13,11 +14,12 @@ CRAWL_TIMEOUT = 25
 RESOLUTION_TIMEOUT = 8
 MAX_HTML_BYTES = 8 * 1024 * 1024
 MEDIA_RE = re.compile(r"\.(?:mp4|m4v|webm|mov|mkv|m3u8|mpd)(?:[?#].*)?$", re.I)
+VIDEO_HINT_RE = re.compile(r"(?:/embed(?:/|$)|/player(?:/|$)|/video(?:/|$)|/stream(?:/|$)|/watch(?:/|$)|/download(?:/|$)|[?&](?:embed|video|stream|file|src|url)=)", re.I)
 RESOLUTION_RE = re.compile(r"(?<!\d)(2160p|1440p|1080p|720p|576p|540p|480p|360p|240p)(?!\d)", re.I)
 DIMENSION_RE = re.compile(r"(?<!\d)(\d{3,4})\s*[x×]\s*(\d{3,4})(?!\d)", re.I)
 EPISODE_PATTERNS = (
     re.compile(r"\bS\d{1,2}\s*[-._ ]?\s*E\s*(\d{1,4})\b", re.I),
-    re.compile(r"\bEpisode\s*[-._#:]?\s*(\d{1,4})\b", re.I),
+    re.compile(r"\b(?:Season\s*\d{1,2}\s*[-._ ]*)?Episode\s*[-._#:]?\s*(\d{1,4})\b", re.I),
     re.compile(r"\bEp\s*[-._#:]?\s*(\d{1,4})\b", re.I),
     re.compile(r"\bEP\s*[-._#:]?\s*(\d{1,4})\b", re.I),
     re.compile(r"\bE\s*[-._#:]?\s*(\d{1,4})\b", re.I),
@@ -77,13 +79,29 @@ def is_http_url(url):
         return False
 
 
+def _decode_embedded_text(text):
+    if not text:
+        return ""
+    value = unescape(str(text))
+    for _ in range(2):
+        value = value.replace("\\/", "/")
+        value = value.replace("\\u002f", "/").replace("\\u002F", "/")
+        value = value.replace("\\u0026", "&").replace("\\u003d", "=").replace("\\u003D", "=")
+        value = value.replace("&amp;", "&")
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
+
+
 def extract_protected_urls(text):
     if not text:
         return []
-    text = unescape(text).replace("\\/", "/")
+    text = _decode_embedded_text(text)
     pattern = r"https?://[^\s<>\"'\]\)]+"
     found = []
-    for match in re.findall(pattern, text):
+    for match in re.findall(pattern, text, re.I):
         url = _normalize_url(match)
         if is_protected_url(url):
             found.append(url)
@@ -93,28 +111,41 @@ def extract_protected_urls(text):
 def _extract_urls_from_text(text, base_url=""):
     if not text:
         return []
-    text = unescape(text).replace("\\/", "/").replace("\\u0026", "&")
+    text = _decode_embedded_text(text)
+    patterns = (
+        r"(?:https?://|//)[^\s<>\"'\]\)]+",
+        r"(?:(?:href|src|url|file|source|embed|video|stream|download)\s*[:=]\s*[\"'])([^\"']+)",
+    )
     found = []
-    for raw in re.findall(r"(?:https?://|//)[^\s<>\"'\]\)]+", text, re.I):
-        url = urljoin(base_url, raw)
-        url = _normalize_url(url)
-        if is_http_url(url):
-            found.append(url)
+    for pattern in patterns:
+        for match in re.findall(pattern, text, re.I):
+            raw = match if isinstance(match, str) else match[0]
+            if not raw:
+                continue
+            url = _normalize_url(urljoin(base_url, raw))
+            if is_http_url(url):
+                found.append(url)
     return list(dict.fromkeys(found))
 
 
 def _candidate_urls_from_tag(tag, base_url):
     values = []
-    attrs = ("href", "src", "data-src", "data-url", "data-link", "data-video", "data-file",
-             "data-href", "data-embed", "data-iframe", "data-stream", "data-play", "data-download")
+    attrs = (
+        "href", "src", "data-src", "data-url", "data-link", "data-video", "data-file",
+        "data-href", "data-embed", "data-iframe", "data-stream", "data-play", "data-download",
+        "data-source", "data-player", "data-config", "data-options", "content",
+    )
     for attr in attrs:
         value = tag.get(attr)
         if value:
             values.extend(_extract_urls_from_text(value, base_url))
+            raw = _decode_embedded_text(value).strip()
+            if is_http_url(raw):
+                values.append(_normalize_url(raw))
     for value in tag.attrs.values():
-        if isinstance(value, str) and ("http" in value.lower() or value.startswith("//")):
+        if isinstance(value, str) and ("http" in value.lower() or value.startswith("//") or "\\/" in value):
             values.extend(_extract_urls_from_text(value, base_url))
-    return list(dict.fromkeys(values))
+    return list(dict.fromkeys(x for x in values if is_http_url(x)))
 
 
 def _provider_name(url, text=""):
@@ -129,6 +160,23 @@ def _is_media(url):
     return bool(MEDIA_RE.search(url or ""))
 
 
+def _looks_like_video_candidate(url, text="", source_host=""):
+    if not is_http_url(url):
+        return False
+    if _is_media(url) or is_protected_url(url):
+        return True
+    provider = _provider_name(url, text)
+    if provider in PROVIDERS:
+        return True
+    if VIDEO_HINT_RE.search(url):
+        return True
+    combined = f"{url} {text}".lower()
+    if re.search(r"\b(?:video|player|stream|embed|watch|download|play|m3u8|mpd)\b", combined, re.I):
+        return True
+    host = _host(url)
+    return bool(host and source_host and host != source_host and re.search(r"(?:vid|stream|video|player|media|cdn|file)", host, re.I))
+
+
 def _challenge_page(text):
     low = (text or "").lower()
     markers = ("just a moment...", "__cf_chl_", "cf-chl-", "cf-ray")
@@ -137,8 +185,16 @@ def _challenge_page(text):
 
 def _fetch_html(url, timeout=CRAWL_TIMEOUT):
     try:
-        response = requests.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
-                                timeout=timeout, allow_redirects=True)
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.8",
+            },
+            timeout=timeout,
+            allow_redirects=True,
+        )
         if response.status_code in (403, 429):
             return None
         response.raise_for_status()
@@ -153,22 +209,50 @@ def _fetch_html(url, timeout=CRAWL_TIMEOUT):
 
 def _extract_candidates(soup, base_url, raw_html):
     candidates = []
-    tags = soup.find_all(["a", "iframe", "embed", "video", "source", "track", "object", "form"])
+    tags = soup.find_all([
+        "a", "iframe", "embed", "video", "source", "track", "object", "form",
+        "script", "meta", "link", "button",
+    ])
     for tag in tags:
         text = _clean(tag.get_text(" ", strip=True))
         for url in _candidate_urls_from_tag(tag, base_url):
-            if is_http_url(url):
-                candidates.append((url, text))
-    candidates.extend((u, "") for u in _extract_urls_from_text(raw_html, base_url))
+            candidates.append((url, text))
+
+    script_text = "\n".join(tag.string or tag.get_text(" ", strip=False) for tag in soup.find_all("script"))
+    for text in (raw_html, script_text):
+        for url in _extract_urls_from_text(text, base_url):
+            candidates.append((url, ""))
+
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        payload = tag.string or tag.get_text(" ", strip=False)
+        try:
+            data = json.loads(payload)
+            stack = [data]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    for value in item.values():
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+                        elif isinstance(value, str):
+                            for url in _extract_urls_from_text(value, base_url):
+                                candidates.append((url, value))
+                elif isinstance(item, list):
+                    stack.extend(item)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
     for url in extract_protected_urls(raw_html):
         candidates.append((url, ""))
+
     seen = set()
     output = []
     for url, text in candidates:
         key = _normalize_url(url)
-        if key and key not in seen:
-            seen.add(key)
-            output.append((key, text))
+        if not key or not is_http_url(key) or key in seen:
+            continue
+        seen.add(key)
+        output.append((key, _clean(text)))
     return output
 
 
@@ -184,19 +268,21 @@ def resolve_blog_links(raw_url):
     if not html:
         return []
     soup = BeautifulSoup(html, "lxml")
-    results = []
-    for url, _ in _extract_candidates(soup, raw_url, html):
-        if _is_media(url) or is_protected_url(url) or _provider_name(url) != _host(url):
-            results.append(url)
-    return list(dict.fromkeys(results))
+    source_host = _host(raw_url)
+    return list(dict.fromkeys(
+        url for url, text in _extract_candidates(soup, raw_url, html)
+        if _looks_like_video_candidate(url, text, source_host)
+    ))
 
 
 def parse_time_range(value):
     if not value:
         return None
     value = value.strip()
-    for pattern in (r"^(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})$",
-                    r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$"):
+    for pattern in (
+        r"^(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})$",
+        r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$",
+    ):
         match = re.match(pattern, value)
         if not match:
             continue
@@ -261,9 +347,8 @@ def _detect_resolution(value):
     value = _clean(value)
     match = RESOLUTION_RE.search(value)
     if match:
-        resolution = match.group(1).lower()
-        return "2160p" if resolution == "2160p" else resolution
-    if re.search(r"\b4k\b", value, re.I):
+        return match.group(1).lower()
+    if re.search(r"\b(?:4k|uhd)\b", value, re.I):
         return "2160p"
     match = DIMENSION_RE.search(value)
     if match:
@@ -287,8 +372,9 @@ def _lookup_page_resolution(url):
     if soup.title:
         values.append(soup.title.get_text(" ", strip=True))
     values.append(soup.get_text(" ", strip=True))
-    for tag in soup.find_all(["video", "source"]):
-        values.extend(str(tag.get(attr, "")) for attr in ("src", "data-src", "data-file", "data-video"))
+    values.append(html)
+    for tag in soup.find_all(["video", "source", "meta"]):
+        values.extend(str(tag.get(attr, "")) for attr in ("src", "data-src", "data-file", "data-video", "content"))
     for value in values:
         resolution = _detect_resolution(value)
         if resolution != "Unknown":
@@ -297,7 +383,11 @@ def _lookup_page_resolution(url):
 
 
 def _series_name(soup):
-    title = _clean(soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else (soup.title.get_text(" ", strip=True) if soup.title else ""))
+    title = _clean(
+        soup.find("h1").get_text(" ", strip=True)
+        if soup.find("h1")
+        else (soup.title.get_text(" ", strip=True) if soup.title else "")
+    )
     title = re.sub(r"\s*[|–—-]\s*(?:https?://)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}.*$", "", title, flags=re.I)
     title = re.sub(r"\s*[|–—-]\s*(?:complete|full|all\s+episodes?)\s*$", "", title, flags=re.I)
     if _detect_episode(title):
@@ -310,6 +400,19 @@ def _make_title(series, episode, resolution):
     name = re.sub(r"\s+", " ", name).strip(" -|–—:")
     parts = [x for x in (name, episode, resolution if resolution != "Unknown" else "") if x]
     return sanitize_filename(" - ".join(parts)).strip()
+
+
+def _nearest_episode_context(element):
+    parts = []
+    parent = element.parent
+    if parent:
+        parts.append(_clean(parent.get_text(" ", strip=True)))
+    for previous in element.find_all_previous(["h1", "h2", "h3", "h4", "h5", "h6"], limit=3):
+        text = _clean(previous.get_text(" ", strip=True))
+        if text:
+            parts.append(text)
+            break
+    return " ".join(parts)
 
 
 def crawl_blog_episodes(raw_url):
@@ -325,32 +428,31 @@ def crawl_blog_episodes(raw_url):
     current_episode = "Unknown Episode"
     candidates = []
 
-    for element in content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "a", "iframe", "embed", "video", "source", "object"]):
+    for element in content.find_all([
+        "h1", "h2", "h3", "h4", "h5", "h6", "a", "iframe", "embed", "video",
+        "source", "object", "form", "script", "meta", "button",
+    ]):
         text = _clean(element.get_text(" ", strip=True))
-        detected = _detect_episode(f"{text} {element.get('href', '')}")
+        local_context = " ".join((text, _nearest_episode_context(element), str(element)))
+        detected = _detect_episode(local_context)
         if element.name.startswith("h") and detected:
             current_episode = detected
-            continue
         for url in _candidate_urls_from_tag(element, raw_url):
-            candidates.append((url, text, detected or current_episode))
+            candidates.append((url, local_context, detected or current_episode))
 
-    # Catch URLs living only in scripts/JSON or HTML attributes.
     for url, text in _extract_candidates(content, raw_url, str(content)):
-        candidates.append((url, text, _detect_episode(f"{text} {url}") or current_episode))
+        candidates.append((url, text, _detect_episode(text) or current_episode))
 
     results = []
     seen = set()
+    source_host = _host(raw_url)
     for url, link_text, context_episode in candidates:
         url = _normalize_url(url)
-        if not is_http_url(url):
+        if not is_http_url(url) or not _looks_like_video_candidate(url, link_text, source_host):
             continue
+        episode = _detect_episode(link_text) or context_episode or _detect_episode(url) or "Unknown Episode"
         provider = _provider_name(url, link_text)
-        media_like = _is_media(url)
-        protected = is_protected_url(url)
         known_provider = provider in PROVIDERS
-        if not (media_like or protected or known_provider):
-            continue
-        episode = _detect_episode(f"{link_text} {url}") or context_episode
         resolution = _detect_resolution(f"{link_text} {url}")
         if resolution == "Unknown" and known_provider:
             resolution = _lookup_page_resolution(url)
@@ -370,8 +472,7 @@ def crawl_blog_episodes(raw_url):
     def sort_key(item):
         episode_no = _episode_number(item.get("episode", ""))
         resolution = item.get("resolution", "")
-        res_rank = {"2160p": 4, "1440p": 3, "1080p": 2, "720p": 1, "576p": 1, "540p": 1, "480p": 0}.get(resolution, -1)
+        res_rank = {"2160p": 4, "1440p": 3, "1080p": 2, "720p": 1}.get(resolution, 0)
         return (episode_no, -res_rank, item.get("source", ""), item.get("url", ""))
 
-    results.sort(key=sort_key)
-    return results
+    return sorted(results, key=sort_key)
