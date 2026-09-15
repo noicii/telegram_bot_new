@@ -46,7 +46,8 @@ class HybridDownloader:
             task.check_cancelled()
             for attempt in range(self.retries + 1):
                 try:
-                    if output.exists(): output.unlink(missing_ok=True)
+                    if output.exists():
+                        output.unlink(missing_ok=True)
                     logger.info("task=%s engine=%s attempt=%s/%s", task.task_id, engine, attempt + 1, self.retries + 1)
                     await self._report(progress, 0.0, 0, None, 0.0)
                     if engine == "hls-multi":
@@ -113,6 +114,16 @@ class HybridDownloader:
         upper = playlist.upper()
         return "#EXT-X-MAP:" in upper or "#EXT-X-BYTERANGE:" in upper
 
+    @staticmethod
+    def _ffmpeg_headers(headers: dict | None, cookies: dict | None) -> dict:
+        """Build FFmpeg HTTP headers without mutating the aiohttp session headers."""
+        result = dict(headers or {})
+        if cookies:
+            cookie_text = "; ".join(f"{name}={value}" for name, value in cookies.items() if name)
+            if cookie_text:
+                result["Cookie"] = cookie_text
+        return result
+
     async def _hls_multi(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         """Download HLS with 16 concurrent workers while keeping segment bytes on disk, not RAM."""
         import aiohttp
@@ -126,6 +137,7 @@ class HybridDownloader:
         stream_url = url if ".m3u8" in url.lower() else await self._discover_hls(url, task, headers, progress)
         if not stream_url:
             raise DownloadError("HLS stream URL could not be discovered")
+        cookies = dict(task.metadata.get("cookies") or cookies)
         task.metadata["stream_url"] = stream_url
         task.metadata["headers"] = headers
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
@@ -140,13 +152,14 @@ class HybridDownloader:
                     stream_url = self._best_variant(stream_url, playlist)
                     task.metadata["stream_url"] = stream_url
                     playlist = await self._fetch_text(session, stream_url)
+                ffmpeg_headers = self._ffmpeg_headers(headers, cookies)
                 if "#EXT-X-KEY:" in playlist:
                     logger.info("task=%s encrypted HLS detected; using FFmpeg", task.task_id)
-                    await self._ffmpeg(stream_url, output, task, progress, headers=headers)
+                    await self._ffmpeg(stream_url, output, task, progress, headers=ffmpeg_headers)
                     return
                 if self._playlist_requires_ffmpeg(playlist):
                     logger.info("task=%s HLS uses EXT-X-MAP/BYTERANGE; using FFmpeg for playlist-correct reconstruction", task.task_id)
-                    await self._ffmpeg(stream_url, output, task, progress, headers=headers)
+                    await self._ffmpeg(stream_url, output, task, progress, headers=ffmpeg_headers)
                     return
                 segments = [urljoin(stream_url, line.strip()) for line in playlist.splitlines() if line.strip() and not line.strip().startswith("#")]
                 if not segments:
@@ -235,9 +248,11 @@ class HybridDownloader:
             task.metadata["browser"] = browser
             try:
                 for candidate in self._browser_candidates(url):
-                    task.check_cancelled(); captured.clear()
+                    task.check_cancelled()
+                    captured.clear()
                     context = await browser.new_context(user_agent=headers.get("User-Agent"), extra_http_headers={k: v for k, v in headers.items() if k.lower() != "user-agent"})
-                    page = await context.new_page(); task.metadata["browser_page"] = page
+                    page = await context.new_page()
+                    task.metadata["browser_page"] = page
                     async def on_response(response):
                         low = response.url.lower()
                         if ".m3u8" in low and not any(x in low for x in ("google", "analytics", "preview", "thumb")) and response.url not in captured:
@@ -248,9 +263,11 @@ class HybridDownloader:
                         await self._report(progress, 1.0, 0, None, 0.0)
                         for tick in range(25):
                             task.check_cancelled()
-                            if captured: break
+                            if captured:
+                                break
                             await asyncio.sleep(1)
-                            if tick % 5 == 0: await self._report(progress, 1.0, 0, None, 0.0)
+                            if tick % 5 == 0:
+                                await self._report(progress, 1.0, 0, None, 0.0)
                         try:
                             html = await page.content()
                             for item in re.findall(r"(?:https?:)?//[^\"'<>\s]+\.m3u8(?:\?[^\"'<>\s]*)?", html, re.I):
@@ -263,17 +280,23 @@ class HybridDownloader:
                             try:
                                 found = await frame.evaluate("""() => { const out=[]; try { if(typeof jwplayer==='function'){const p=jwplayer();const c=p&&p.getConfig?p.getConfig():null;for(const x of (c&&c.sources)||[]) if(x&&x.file) out.push(x.file);} } catch(e) {} try { for(const v of document.querySelectorAll('video,source')) if(v.src) out.push(v.src); } catch(e) {} return out; }""")
                                 for item in found or []:
-                                    if isinstance(item, str) and ".m3u8" in item and item not in captured: captured.append(item)
+                                    if isinstance(item, str) and ".m3u8" in item and item not in captured:
+                                        captured.append(item)
                             except Exception:
                                 pass
                         raw_cookies = await context.cookies()
-                        if raw_cookies: task.metadata["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
+                        if raw_cookies:
+                            task.metadata["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
                     finally:
-                        await context.close(); task.metadata.pop("browser_page", None)
-                    if captured: return captured[0]
+                        await context.close()
+                        task.metadata.pop("browser_page", None)
+                    if captured:
+                        return captured[0]
                 return None
             finally:
-                task.metadata.pop("browser_page", None); task.metadata.pop("browser", None); await browser.close()
+                task.metadata.pop("browser_page", None)
+                task.metadata.pop("browser", None)
+                await browser.close()
 
     @staticmethod
     async def _fetch_text(session, url: str) -> str:
@@ -284,76 +307,109 @@ class HybridDownloader:
     @staticmethod
     def _best_variant(base_url: str, playlist: str) -> str:
         lines = [line.strip() for line in playlist.splitlines()]
-        variants: list[tuple[int, str]] = []; pending = 0
+        variants: list[tuple[int, str]] = []
+        pending = 0
         for line in lines:
             if line.startswith("#EXT-X-STREAM-INF:"):
-                match = re.search(r"(?:RESOLUTION|BANDWIDTH)=(?:\d+x)?(\d+)", line); pending = int(match.group(1)) if match else 0
+                match = re.search(r"(?:RESOLUTION|BANDWIDTH)=(?:\d+x)?(\d+)", line)
+                pending = int(match.group(1)) if match else 0
             elif pending and line and not line.startswith("#"):
-                variants.append((pending, urljoin(base_url, line))); pending = 0
+                variants.append((pending, urljoin(base_url, line)))
+                pending = 0
         return max(variants, key=lambda x: x[0])[1] if variants else base_url
 
     async def _direct(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         import aiohttp
-        tmp = output.with_suffix(output.suffix + ".part"); task.register_temp(tmp)
+        tmp = output.with_suffix(output.suffix + ".part")
+        task.register_temp(tmp)
         headers = task.metadata.get("headers") or {}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=60), headers=headers) as session:
+        cookies = task.metadata.get("cookies") or {}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=60), headers=headers, cookies=cookies) as session:
             async with session.get(url, allow_redirects=True) as response:
-                response.raise_for_status(); content_type = (response.headers.get("Content-Type") or "").lower(); final_url = str(response.url).lower()
-                if content_type.startswith(("text/html", "text/plain", "application/json")): raise DownloadError(f"Direct response is not media ({content_type or 'unknown'})")
-                if not any(x in final_url for x in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".m3u8", ".mpd")) and not content_type.startswith(("video/", "audio/", "application/octet-stream")): raise DownloadError(f"Direct response is not recognized media ({content_type or 'unknown'})")
-                total = int(response.headers.get("Content-Length") or 0) or None; done = 0
+                response.raise_for_status()
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                final_url = str(response.url).lower()
+                if content_type.startswith(("text/html", "text/plain", "application/json")):
+                    raise DownloadError(f"Direct response is not media ({content_type or 'unknown'})")
+                if not any(x in final_url for x in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".m3u8", ".mpd")) and not content_type.startswith(("video/", "audio/", "application/octet-stream")):
+                    raise DownloadError(f"Direct response is not recognized media ({content_type or 'unknown'})")
+                total = int(response.headers.get("Content-Length") or 0) or None
+                done = 0
                 with tmp.open("wb") as fh:
                     async for chunk in response.content.iter_chunked(1024 * 1024):
-                        task.check_cancelled(); fh.write(chunk); done += len(chunk)
+                        task.check_cancelled()
+                        fh.write(chunk)
+                        done += len(chunk)
                         await self._report(progress, done * 100 / total if total else None, done, total, None)
-        tmp.replace(output); task.temp_paths.discard(tmp)
+        tmp.replace(output)
+        task.temp_paths.discard(tmp)
 
     async def _aria2c(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         binary = shutil.which("aria2c")
-        if not binary: raise DownloadError("aria2c is not installed")
+        if not binary:
+            raise DownloadError("aria2c is not installed")
         proc = await asyncio.create_subprocess_exec(binary, "--allow-overwrite=true", "--auto-file-renaming=false", "--summary-interval=1", "--console-log-level=warn", "--dir", str(output.parent), "--out", output.name, url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         task.register_process(proc)
         try:
             while True:
-                task.check_cancelled(); line = await proc.stdout.readline()
-                if not line: break
-                if progress and output.exists(): await self._report(progress, None, output.stat().st_size, None, None)
+                task.check_cancelled()
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                if progress and output.exists():
+                    await self._report(progress, None, output.stat().st_size, None, None)
             rc = await proc.wait()
-            if rc != 0: raise DownloadError(f"aria2c exited with code {rc}")
-        finally: task.unregister_process(proc)
+            if rc != 0:
+                raise DownloadError(f"aria2c exited with code {rc}")
+        finally:
+            task.unregister_process(proc)
 
     async def _ffmpeg(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None, headers: dict | None = None) -> None:
         binary = shutil.which("ffmpeg")
-        if not binary: raise DownloadError("ffmpeg is not installed")
+        if not binary:
+            raise DownloadError("ffmpeg is not installed")
         command = [binary, "-hide_banner", "-loglevel", "error", "-y"]
         if headers:
-            header_text = "".join(f"{k}: {v}\r\n" for k, v in headers.items()); command += ["-headers", header_text]
+            header_text = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            command += ["-headers", header_text]
         command += ["-i", url, "-c", "copy", str(output)]
-        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE); task.register_process(proc)
+        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        task.register_process(proc)
         try:
             while proc.returncode is None:
                 task.check_cancelled()
-                try: await asyncio.wait_for(proc.wait(), timeout=0.5)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
                 except asyncio.TimeoutError:
-                    if progress and output.exists(): await self._report(progress, None, output.stat().st_size, None, None)
+                    if progress and output.exists():
+                        await self._report(progress, None, output.stat().st_size, None, None)
             err = await proc.stderr.read()
-            if proc.returncode != 0: raise DownloadError(err.decode(errors="ignore")[-1000:] or f"ffmpeg exited with code {proc.returncode}")
-        finally: task.unregister_process(proc)
+            if proc.returncode != 0:
+                raise DownloadError(err.decode(errors="ignore")[-1000:] or f"ffmpeg exited with code {proc.returncode}")
+        finally:
+            task.unregister_process(proc)
 
     async def _ytdlp(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         binary = shutil.which("yt-dlp") or sys.executable
         command = [binary, "-m", "yt_dlp"] if binary == sys.executable else [binary]
-        if task.metadata.get("cookiefile"): command += ["--cookies", str(task.metadata["cookiefile"])]
+        if task.metadata.get("cookiefile"):
+            command += ["--cookies", str(task.metadata["cookiefile"])]
         command += ["--newline", "--no-part", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(output), url]
-        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT); task.register_process(proc)
+        proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        task.register_process(proc)
         try:
             while True:
-                task.check_cancelled(); line = await proc.stdout.readline()
-                if not line: break
-                if progress and output.exists(): await self._report(progress, None, output.stat().st_size, None, None)
+                task.check_cancelled()
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                if progress and output.exists():
+                    await self._report(progress, None, output.stat().st_size, None, None)
             rc = await proc.wait()
-            if rc != 0: raise DownloadError(f"yt-dlp exited with code {rc}")
-        finally: task.unregister_process(proc)
+            if rc != 0:
+                raise DownloadError(f"yt-dlp exited with code {rc}")
+        finally:
+            task.unregister_process(proc)
 
     async def _browser(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         downloader = BrowserHLSDownloader(self.output_dir)
@@ -366,4 +422,5 @@ class HybridDownloader:
     async def _report(callback, percent, current, total, speed, details=None):
         if callback:
             result = callback(percent, current, total, speed, details)
-            if asyncio.iscoroutine(result): await result
+            if asyncio.iscoroutine(result):
+                await result
