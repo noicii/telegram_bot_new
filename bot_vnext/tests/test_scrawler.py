@@ -9,8 +9,8 @@ class ScrawlerUnitTests(unittest.TestCase):
     def test_canon_normalizes_protocol_and_query_fragment(self):
         self.assertEqual(scrawler._canon("https://Example.COM/path/file.m3u8?token=1#fragment"), "https://example.com/path/file.m3u8?token=1")
 
-    def test_canon_preserves_literal_plus_in_query(self):
-        self.assertEqual(scrawler._canon("https://example.com/video.m3u8?sig=a+b&x=1%2B2"), "https://example.com/video.m3u8?sig=a+b&x=1+2")
+    def test_canon_preserves_literal_and_encoded_plus_in_query(self):
+        self.assertEqual(scrawler._canon("https://example.com/video.m3u8?sig=a+b&x=1%2B2"), "https://example.com/video.m3u8?sig=a+b&x=1%2B2")
 
     def test_media_detection_handles_common_media_formats(self):
         for url in ("https://cdn.example/video.mp4", "https://cdn.example/master.m3u8?token=abc", "https://cdn.example/manifest.mpd", "https://cdn.example/playlist"):
