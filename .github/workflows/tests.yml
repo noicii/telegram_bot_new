@@ -11,6 +11,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/bot_vnext
     steps:
       - name: Checkout
         uses: actions/checkout@v4
