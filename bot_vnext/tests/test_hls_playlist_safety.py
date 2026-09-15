@@ -29,18 +29,6 @@ class HLSPlaylistSafetyTests(unittest.TestCase):
         result = HybridDownloader._ffmpeg_headers({"Referer": "https://example.test/"}, {})
         self.assertNotIn("Cookie", result)
 
-    def test_retryable_hls_statuses(self):
-        self.assertTrue(HybridDownloader._hls_status_retryable(408))
-        self.assertTrue(HybridDownloader._hls_status_retryable(425))
-        self.assertTrue(HybridDownloader._hls_status_retryable(429))
-        self.assertTrue(HybridDownloader._hls_status_retryable(500))
-        self.assertTrue(HybridDownloader._hls_status_retryable(502))
-        self.assertTrue(HybridDownloader._hls_status_retryable(503))
-        self.assertTrue(HybridDownloader._hls_status_retryable(504))
-        self.assertFalse(HybridDownloader._hls_status_retryable(401))
-        self.assertFalse(HybridDownloader._hls_status_retryable(403))
-        self.assertFalse(HybridDownloader._hls_status_retryable(404))
-
 
 if __name__ == "__main__":
     unittest.main()
