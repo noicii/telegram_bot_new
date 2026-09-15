@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urljoin, urlparse
@@ -124,6 +127,38 @@ class HybridDownloader:
                 result["Cookie"] = cookie_text
         return result
 
+    @staticmethod
+    def _hls_status_retryable(status: int) -> bool:
+        """Return whether an HLS segment HTTP status is worth retrying."""
+        return status in {408, 425, 429} or 500 <= status <= 599
+
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> float | None:
+        """Parse Retry-After seconds or HTTP-date, capped to avoid indefinite segment stalls."""
+        if not value:
+            return None
+        text = value.strip()
+        try:
+            return max(0.0, min(float(text), 30.0))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(text)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            delay = (when.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            return max(0.0, min(delay, 30.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _hls_retry_delay(attempt: int, retry_after: float | None = None) -> float:
+        """Calculate bounded exponential backoff with jitter for transient HLS failures."""
+        if retry_after is not None:
+            return min(max(retry_after, 0.0), 30.0)
+        base = min(8.0, 0.75 * (2 ** attempt))
+        return min(12.0, base + random.uniform(0.0, base * 0.35))
+
     async def _hls_multi(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         """Download HLS with 16 concurrent workers while keeping segment bytes on disk, not RAM."""
         import aiohttp
@@ -179,11 +214,18 @@ class HybridDownloader:
                         last_exc = None
                         for attempt in range(3):
                             task.check_cancelled()
+                            retry_after = None
                             try:
                                 tmp = path.with_suffix(".part")
                                 tmp.unlink(missing_ok=True)
                                 async with session.get(segment_url) as response:
-                                    response.raise_for_status()
+                                    status = response.status
+                                    if status >= 400:
+                                        retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
+                                        message = f"HTTP {status}"
+                                        if not self._hls_status_retryable(status):
+                                            raise DownloadError(f"HLS segment {index + 1} failed: {message} (non-retryable)")
+                                        raise DownloadError(message)
                                     size = 0
                                     with tmp.open("wb") as fh:
                                         async for chunk in response.content.iter_chunked(1024 * 1024):
@@ -204,10 +246,19 @@ class HybridDownloader:
                             except Exception as exc:
                                 last_exc = exc
                                 path.with_suffix(".part").unlink(missing_ok=True)
-                                if attempt < 2:
+                                status = None
+                                match = re.search(r"HTTP (\d+)", str(exc))
+                                if match:
+                                    status = int(match.group(1))
+                                retryable = status is None or self._hls_status_retryable(status)
+                                if attempt < 2 and retryable:
                                     async with progress_lock:
                                         retry_count += 1
-                                    await asyncio.sleep(2 ** attempt)
+                                    delay = self._hls_retry_delay(attempt, retry_after if status == 429 else None)
+                                    logger.debug("task=%s HLS segment=%s transient_failure=%s retry=%s delay=%.2fs", task.task_id, index + 1, exc, attempt + 2, delay)
+                                    await asyncio.sleep(delay)
+                                    continue
+                                break
                         raise DownloadError(f"HLS segment {index + 1} failed: {last_exc}")
 
                 workers = [asyncio.create_task(fetch(i, segment)) for i, segment in enumerate(segments)]
@@ -218,7 +269,6 @@ class HybridDownloader:
                         worker.cancel()
                     await asyncio.gather(*workers, return_exceptions=True)
                     raise
-
             concat_file = segment_dir / "segments.ffconcat"
             with concat_file.open("w", encoding="utf-8") as fh:
                 fh.write("ffconcat version 1.0\n")
