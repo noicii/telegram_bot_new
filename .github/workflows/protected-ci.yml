@@ -2,9 +2,16 @@ name: Protected Bot V2 CI
 
 on:
   push:
-    branches: ["bot-vnext"]
+    branches:
+      - "bot-vnext"
+      - "bot-vnext-fixed"
+      - "bot-vnext-upgrade"
   pull_request:
-    branches: ["bot-vnext"]
+    branches:
+      - "bot-vnext"
+      - "bot-vnext-fixed"
+      - "bot-vnext-upgrade"
+  workflow_dispatch:
 
 permissions:
   contents: read
