@@ -12,6 +12,7 @@ from utils import sanitize_filename
 MEDIA_EXTENSIONS = (".mp4", ".m4v", ".webm", ".mov", ".mkv", ".m3u8", ".mpd")
 MEDIA_MARKERS = (".m3u8", ".mpd", "manifest", "playlist", "master.m3u8", "videoplayback", "hls", "dash")
 PLAYER_MARKERS = ("/embed/", "/player/", "embed.", "player.", "/watch", "/play/", "/stream/", "iframe", "vidsrc", "filemoon", "streamtape", "streamwish", "dood", "vidhide", "lulu")
+PLAYER_PATH_RE = re.compile(r"/(?:d|e|embed|player|watch|play|stream)(?:/|$)", re.I)
 URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.I)
 SCHEMELESS_URL_RE = re.compile(r"(?<![\w@])(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:/[^\s<>\"'`\\]*)?", re.I)
 ATTRIBUTES = (
@@ -84,7 +85,13 @@ def is_media_url(url):
 
 
 def is_player_like_url(url, text=""):
-    return any(marker in f"{url} {text}".lower() for marker in PLAYER_MARKERS)
+    value = f"{url} {text}".lower()
+    if any(marker in value for marker in PLAYER_MARKERS):
+        return True
+    try:
+        return bool(PLAYER_PATH_RE.search(urlparse(url).path or ""))
+    except Exception:
+        return False
 
 
 def extract_urls_from_text(text, base_url=None):
@@ -171,7 +178,7 @@ def resolve_blog_links(raw_url):
                 found.extend(extract_urls_from_text(value, response.url))
     found.extend(extract_urls_from_text(response.text, response.url))
     found.extend(extract_json_urls(response.text, response.url))
-    return list(dict.fromkeys(u for u in found if is_protected_url(u) or is_media_url(u)))
+    return list(dict.fromkeys(u for u in found if is_protected_url(u) or is_media_url(u) or is_player_like_url(u)))
 
 
 def parse_time_range(value):
@@ -400,7 +407,7 @@ def crawl_blog_episodes(raw_url):
     seen = set()
     for href, text, force, context_episode in candidates:
         href = normalize_url(href, final_base)
-        if not href or not (force or is_media_url(href) or is_protected_url(href) or is_player_like_url(href, text)): continue
+        if not href or not (is_media_url(href) or is_protected_url(href) or is_player_like_url(href, text)): continue
         key = canonical_url_key(href)
         if not key or key in seen: continue
         seen.add(key)
