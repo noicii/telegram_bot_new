@@ -1,6 +1,7 @@
 import logging
 
 from pyrogram import Client
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import (
     API_HASH,
@@ -14,6 +15,26 @@ from database import init_db
 # Apply downloader/queue hardening before handlers are imported.
 from runtime_hardening import apply as apply_runtime_hardening
 apply_runtime_hardening()
+
+# Add the admin-only Safe Restart control to the existing Settings keyboard.
+# The existing handlers callback performs the confirmation step before restart.
+import utils as _utils
+_original_get_main_keyboard = _utils.get_main_keyboard
+
+
+def _get_main_keyboard_with_safe_restart():
+    markup = _original_get_main_keyboard()
+    rows = list(markup.inline_keyboard)
+    rows.append([
+        InlineKeyboardButton(
+            "🔄 Safe Restart",
+            callback_data="confirm_restart",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_utils.get_main_keyboard = _get_main_keyboard_with_safe_restart
 
 from handlers import register_handlers
 from queue_worker import start_queue_worker, stop_queue_worker
