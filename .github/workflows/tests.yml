@@ -11,6 +11,9 @@ on:
       - bot-vnext-fixed
   workflow_dispatch:
 
+env:
+  PYTHONPATH: bot_vnext
+
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
@@ -26,12 +29,10 @@ jobs:
       - name: Install bot test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests beautifulsoup4 lxml python-dotenv pyrogram aiohttp tgcrypto
+          python -m pip install requests beautifulsoup4 lxml python-dotenv pyrogram tgcrypto aiohttp
 
       - name: Compile Python files
         run: python -m compileall -q bot_vnext crawler.py config.py
 
       - name: Run all Bot V2 unit tests
-        env:
-          PYTHONPATH: bot_vnext
         run: python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
