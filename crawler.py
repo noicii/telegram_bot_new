@@ -290,33 +290,72 @@ def _browser_discover(url):
 
 
 def _result_key(item):
-    """Deduplicate an episode at the media level, not just by raw URL spelling."""
+    """Return a conservative identity key for one crawler result.
+
+    Exact URLs are always deduplicated. Different URLs are grouped only when
+    episode, resolution and source are all known, which removes repeated player
+    links without collapsing unknown-quality alternatives.
+    """
     url_key = canonical_url_key(item.get("url", ""))
     episode = clean_text(item.get("episode") or "Unknown Episode").lower()
     resolution = clean_text(item.get("resolution") or "Unknown").lower()
-    source = clean_text(item.get("source") or "").lower()
-    return (url_key, episode, resolution, source)
+    source = clean_text(item.get("source") or "Unknown").lower()
+    if episode != "unknown episode" and resolution != "unknown" and source not in {"", "unknown"}:
+        return ("logical", episode, resolution, source)
+    return ("url", url_key)
+
+
+def _candidate_score(item):
+    """Prefer directly downloadable media over wrapper/player pages."""
+    url = item.get("url", "")
+    return (
+        int(is_media_url(url)),
+        int(is_protected_url(url)),
+        int(not is_player_like_url(url)),
+        int(item.get("episode") != "Unknown Episode"),
+        int(item.get("resolution") != "Unknown"),
+        -len(url),
+    )
+
+
+def _merge_result(primary, secondary):
+    """Merge useful metadata from a duplicate into the preferred result."""
+    merged = dict(primary)
+    if merged.get("episode") == "Unknown Episode" and secondary.get("episode") != "Unknown Episode":
+        merged["episode"] = secondary["episode"]
+    if merged.get("resolution") == "Unknown" and secondary.get("resolution") != "Unknown":
+        merged["resolution"] = secondary["resolution"]
+    if (not merged.get("title") or merged.get("title") == "Unknown Episode") and secondary.get("title"):
+        merged["title"] = secondary["title"]
+    if not merged.get("source_url") and secondary.get("source_url"):
+        merged["source_url"] = secondary["source_url"]
+    return merged
 
 
 def _dedupe_results(results):
-    """Keep one result per canonical media URL; preserve the best metadata seen."""
+    """Deduplicate exact URLs, then conservative logical episode duplicates."""
     by_url = {}
     for item in results:
-        key = canonical_url_key(item.get("url", ""))
-        if not key:
+        url_key = canonical_url_key(item.get("url", ""))
+        if not url_key:
             continue
-        existing = by_url.get(key)
+        existing = by_url.get(url_key)
         if existing is None:
-            by_url[key] = item
+            by_url[url_key] = dict(item)
             continue
-        # Prefer the richer episode/resolution metadata when two HTML nodes point
-        # to the exact same media URL.
-        if existing.get("episode") == "Unknown Episode" and item.get("episode") != "Unknown Episode":
-            existing["episode"] = item["episode"]
-        if existing.get("resolution") == "Unknown" and item.get("resolution") != "Unknown":
-            existing["resolution"] = item["resolution"]
-            existing["title"] = sanitize_filename(" - ".join(x for x in (existing.get("title", "").split(" - ")[0], existing["episode"], item["resolution"]) if x))
-    return list(by_url.values())
+        preferred, other = (item, existing) if _candidate_score(item) > _candidate_score(existing) else (existing, item)
+        by_url[url_key] = _merge_result(preferred, other)
+
+    grouped = {}
+    for item in by_url.values():
+        key = _result_key(item)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = item
+            continue
+        preferred, other = (item, existing) if _candidate_score(item) > _candidate_score(existing) else (existing, item)
+        grouped[key] = _merge_result(preferred, other)
+    return list(grouped.values())
 
 
 def crawl_blog_episodes(raw_url):
