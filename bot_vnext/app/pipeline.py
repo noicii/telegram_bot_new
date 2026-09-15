@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from app.queue.worker_pool import QueueItem
 from app.queue.download_manager import DownloadManager
@@ -29,7 +29,6 @@ class Pipeline:
         self.on_complete = on_complete
         self.on_failed = on_failed
         self.telegram_gate = TelegramFloodGate(upload_max=4)
-        self._install_dashboard_hooks(client)
         try:
             client.sleep_threshold = 0
         except Exception:
@@ -38,59 +37,6 @@ class Pipeline:
         self.download = DownloadManager(output_dir, workers=2, database=self.db, on_progress=self._download_progress, on_complete=self._download_complete, on_failed=self._download_failed)
         self._started = False
         self._cleanup_task: asyncio.Task | None = None
-
-    def _install_dashboard_hooks(self, client) -> None:
-        """Route only the persistent live-dashboard message through the gate."""
-        if getattr(client, "_v2_dashboard_gate_installed", False):
-            return
-        setattr(client, "_v2_dashboard_gate_installed", True)
-        cache: dict[tuple[int | str, int], Any] = {}
-        gate = self.telegram_gate
-        original_send = client.send_message
-        original_get = client.get_messages
-        original_edit = client.edit_message_text
-
-        def is_dashboard_text(value: Any) -> bool:
-            return isinstance(value, str) and value.startswith("📊 **LIVE DOWNLOAD / UPLOAD**")
-
-        async def send_message(*args, **kwargs):
-            message = await original_send(*args, **kwargs)
-            text = kwargs.get("text")
-            if text is None and len(args) >= 2:
-                text = args[1]
-            if is_dashboard_text(text):
-                chat_id = kwargs.get("chat_id", args[0] if args else None)
-                if chat_id is not None and getattr(message, "id", None) is not None:
-                    cache[(chat_id, message.id)] = message
-            return message
-
-        async def get_messages(*args, **kwargs):
-            chat_id = kwargs.get("chat_id", args[0] if args else None)
-            message_ids = kwargs.get("message_ids", args[1] if len(args) >= 2 else None)
-            if isinstance(message_ids, int):
-                cached = cache.get((chat_id, message_ids))
-                if cached is not None:
-                    return cached
-            return await original_get(*args, **kwargs)
-
-        async def edit_message_text(*args, **kwargs):
-            chat_id = kwargs.get("chat_id", args[0] if args else None)
-            message_id = kwargs.get("message_id", args[1] if len(args) >= 2 else None)
-            text = kwargs.get("text", args[2] if len(args) >= 3 else None)
-            if not is_dashboard_text(text):
-                return await original_edit(*args, **kwargs)
-            key = f"{chat_id}:{message_id}"
-            async def operation():
-                result = await original_edit(*args, **kwargs)
-                if getattr(result, "id", None) is not None:
-                    cache[(chat_id, result.id)] = result
-                return result
-            await gate.publish_dashboard(key, operation)
-            return cache.get((chat_id, message_id))
-
-        client.send_message = send_message
-        client.get_messages = get_messages
-        client.edit_message_text = edit_message_text
 
     async def start(self) -> None:
         if self._started:
@@ -133,7 +79,7 @@ class Pipeline:
             except Exception:
                 logger.exception("failed to recover task %s", row.get("id"))
 
-    async def _dispatch_row(self, row: dict[str, Any]) -> None:
+    async def _dispatch_row(self, row: dict[str, object]) -> None:
         task_id = str(row["id"])
         payload = {
             "url": row.get("url"),
@@ -152,7 +98,7 @@ class Pipeline:
         else:
             await self.download.submit(task_id, payload)
 
-    async def submit(self, task_id: int | str, payload: dict[str, Any]) -> None:
+    async def submit(self, task_id: int | str, payload: dict[str, object]) -> None:
         await self.db.create_task(str(task_id), payload.get("task_type", "download"), **{k: v for k, v in payload.items() if k != "task_type"})
         row = await self.db.get_task(str(task_id))
         if not row:
