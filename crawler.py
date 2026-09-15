@@ -27,7 +27,9 @@ def clean_text(value):
     value = html.unescape(unquote(str(value or "")))
     for _ in range(2):
         value = html.unescape(unquote(value)).replace("\\/", "/").replace("\\u0026", "&")
-    value = value.replace("+", " ")
+    # Never convert '+' to a space here. In URLs, '+' is a literal character
+    # and %2B is explicitly an encoded '+'. Converting it breaks signed media
+    # URLs and can make otherwise valid HLS links fail.
     return re.sub(r"\s+", " ", value).strip()
 
 
