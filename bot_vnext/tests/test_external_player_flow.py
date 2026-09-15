@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from bot_vnext import scrawler
@@ -11,12 +12,18 @@ class ExternalPlayerFlowTest(unittest.TestCase):
         manifest = "https://cdn.example/video/episode-1/master.m3u8"
 
         pages = {
-            root: '<html><body><a href="https://player.example/d/abc123">Watch</a></body></html>',
+            root: '<html><head><title>Episode 1</title></head><body><a href="https://player.example/d/abc123">Watch</a></body></html>',
             player: '<html><script>var src = "https://cdn.example/video/episode-1/master.m3u8";</script></html>',
         }
 
         def fake_fetch(url, *args, **kwargs):
-            return pages.get(url, "")
+            text = pages.get(url, "")
+            return SimpleNamespace(
+                url=url,
+                text=text,
+                headers={"content-type": "text/html; charset=utf-8"},
+                status_code=200,
+            ) if text else None
 
         with patch.object(scrawler, "_fetch", side_effect=fake_fetch), \
              patch.object(scrawler, "_sitemap_urls", return_value=[]), \
@@ -26,7 +33,7 @@ class ExternalPlayerFlowTest(unittest.TestCase):
         urls = [row[3] for row in rows]
         self.assertIn(manifest, urls)
         self.assertEqual(len(urls), 1)
-        self.assertGreaterEqual(stats["pages_scanned"], 2)
+        self.assertGreaterEqual(stats["pages"], 2)
 
 
 if __name__ == "__main__":
