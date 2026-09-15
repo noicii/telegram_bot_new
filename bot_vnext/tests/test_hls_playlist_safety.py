@@ -16,6 +16,19 @@ class HLSPlaylistSafetyTests(unittest.TestCase):
         playlist = """#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-BYTERANGE:1200@0\n#EXTINF:6,\nmedia.ts\n#EXT-X-BYTERANGE:1400\n#EXTINF:6,\nmedia.ts\n#EXT-X-ENDLIST\n"""
         self.assertTrue(HybridDownloader._playlist_requires_ffmpeg(playlist))
 
+    def test_ffmpeg_headers_include_browser_cookies(self):
+        headers = {"User-Agent": "test-agent", "Referer": "https://example.test/"}
+        cookies = {"session": "abc123", "token": "xyz"}
+        result = HybridDownloader._ffmpeg_headers(headers, cookies)
+        self.assertEqual(result["Cookie"], "session=abc123; token=xyz")
+        self.assertEqual(result["User-Agent"], "test-agent")
+        self.assertEqual(result["Referer"], "https://example.test/")
+        self.assertNotIn("Cookie", headers)
+
+    def test_ffmpeg_headers_without_cookies_do_not_add_cookie(self):
+        result = HybridDownloader._ffmpeg_headers({"Referer": "https://example.test/"}, {})
+        self.assertNotIn("Cookie", result)
+
 
 if __name__ == "__main__":
     unittest.main()
