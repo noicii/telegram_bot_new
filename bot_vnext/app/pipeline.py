@@ -193,13 +193,6 @@ class Pipeline:
         return True
 
     async def _cancel_owned(self, task_id: int | str, *, manager) -> bool:
-        """Atomically claim cancellation in DB before stopping worker execution.
-
-        This ordering closes the cancel-vs-complete race: if completion already
-        won the DB transition, cancellation returns False and never tears down a
-        successfully completed task. If cancellation wins, worker completion
-        transitions become no-ops because the task is already terminal.
-        """
         key = str(task_id)
         task = await self.db.get_task(key)
         if not task or task.get("status") not in {"queued", "downloading", "uploading"}:
@@ -230,7 +223,6 @@ class Pipeline:
         return await self._cancel_owned(task_id, manager=self.upload)
 
     async def cancel(self, task_id: int | str) -> bool:
-        # Determine the owner first so cancellation never pollutes the other manager.
         task = await self.db.get_task(str(task_id))
         if not task or task.get("status") not in {"queued", "downloading", "uploading"}:
             return False
@@ -270,13 +262,24 @@ class Pipeline:
         task_id = str(item.task_id)
         logger.info("download COMPLETE task=%s file=%s size=%.1fMiB; handing off to upload",
                     task_id, path, path.stat().st_size / 1024 / 1024 if path.is_file() else 0)
-        await self.db.update_task(task_id, file_path=str(path), progress=0)
+
+        # Persist the handoff first. This single DB transition makes the upload
+        # recoverable even if the process dies before upload.submit() runs.
+        changed = await self.db.mark_download_handed_to_upload(task_id, str(path))
+        if not changed:
+            logger.warning("download handoff ignored because task state changed task=%s", task_id)
+            await remove_artifact_async(path)
+            return
+
         payload = dict(item.payload)
         payload["file_path"] = str(path)
         payload["task_type"] = "upload"
         try:
             await self.upload.submit(item.task_id, payload)
         except Exception as exc:
+            # The task is already queued as an upload, so a later restart can
+            # recover it. If submission itself fails now, keep the DB state
+            # explicit and clean the orphaned artifact.
             await self.db.mark_failed(task_id, str(exc))
             await remove_artifact_async(path)
             raise
