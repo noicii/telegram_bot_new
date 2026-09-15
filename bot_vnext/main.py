@@ -53,7 +53,7 @@ def bar(p,width=20):
     return "█"*n+"░"*(width-n)
 class V2Bot:
     def __init__(self,client):
-        self.client=client; self.pipeline=None; self.sessions={}; self.progress_cache={}; self.dashboard_messages={}; self.dashboard_locks={}; self.dashboard_last_edit={}; self.restart_event=None
+        self.client=client; self.pipeline=None; self.sessions={}; self.progress_cache={}; self.dashboard_messages={}; self.dashboard_locks={}; self.restart_event=None
     def lock(self,chat_id): return self.dashboard_locks.setdefault(chat_id,asyncio.Lock())
     async def start(self):
         self.pipeline=Pipeline(self.client,DOWNLOAD_DIR,on_progress=self.on_progress,on_complete=self.on_complete,on_failed=self.on_failed); await self.pipeline.start()
@@ -250,11 +250,9 @@ class V2Bot:
     async def render_dashboard(self,chat_id,message_id,force=False):
         if not self.pipeline or not message_id: return False
         async with self.lock(chat_id):
-            now=asyncio.get_running_loop().time()
-            if not force and now-self.dashboard_last_edit.get(chat_id,0)<1.2: return True
             rows=await self.pipeline.db.get_tasks(statuses=("queued","downloading","uploading"),limit=25); failed_rows_for_retry=await self.pipeline.db.get_tasks(statuses=("failed",),limit=10); counts=await self.pipeline.db.counts(); d,u=counts.get("download",{}),counts.get("upload",{}); ad,au=self.pipeline.download.active_workers(),self.pipeline.upload.active_workers(); qd,qu=d.get("queued",0),u.get("queued",0)
             lines=["📊 **LIVE DOWNLOAD / UPLOAD**","",f"⬇️ Downloads: **{ad}/2 active** • {qd} queued",f"⬆️ Uploads: **{au}/4 active** • {qu} queued",""]
-            downs=[r for r in rows if r.get("status") in {"queued","downloading"}]; ups=[r for r in rows if r.get("status")=="uploading"]
+            queued=[r for r in rows if r.get("status")=="queued"]; downs=[r for r in rows if r.get("status")=="downloading"]; ups=[r for r in rows if r.get("status")=="uploading"]
             if downs:
                 lines.append("📥 **DOWNLOADING**")
                 for n,r in enumerate(downs[:8],1):
@@ -265,6 +263,12 @@ class V2Bot:
                     else: lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
                     lines.append("")
             else: lines.append("📥 **DOWNLOADING**\nNo active downloads.\n")
+            if queued:
+                lines.append("⏳ **QUEUED**")
+                for n,r in enumerate(queued[:8],1):
+                    title=str(r.get("title") or r.get("url") or r.get("id"))[:52]; method=(r.get("metadata") or {}).get("download_method") or "auto"; lines.append(f"{n}️⃣ **{title}** • {method_label(method)}\n🆔 `{r.get('id')}`")
+                if len(queued)>8: lines.append(f"… +{len(queued)-8} more queued")
+                lines.append("")
             if ups:
                 lines.append("📤 **UPLOADING**")
                 for n,r in enumerate(ups[:8],1):
@@ -275,7 +279,7 @@ class V2Bot:
             disk=shutil.disk_usage(DOWNLOAD_DIR); used=disk.total-disk.free; dp=used*100/disk.total if disk.total else 0; icon="🔴" if dp>=90 else "🟠" if dp>=80 else "🟢"; lines.append(f"{icon} **Disk:** {used/(1024**3):.1f}/{disk.total/(1024**3):.1f} GB used • {disk.free/(1024**3):.1f} GB free ({dp:.0f}%)")
             lines.append(f"\n✅ Done: {d.get('completed',0)+u.get('completed',0)} • ❌ Failed: {d.get('failed',0)+u.get('failed',0)} • 🛑 Cancelled: {d.get('cancelled',0)+u.get('cancelled',0)}")
             try:
-                msg=await self.client.get_messages(chat_id,message_id); await msg.edit_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Retry {str(r.get('title') or r.get('id'))[:24]}",callback_data=f"v2:retry:{r.get('id')}")] for r in failed_rows_for_retry]+[[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])); self.dashboard_last_edit[chat_id]=now; return True
+                msg=await self.client.get_messages(chat_id,message_id); await msg.edit_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Retry {str(r.get('title') or r.get('id'))[:24]}",callback_data=f"v2:retry:{r.get('id')}")] for r in failed_rows_for_retry]+[[InlineKeyboardButton("🔄 Refresh",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")]])); return True
             except Exception as exc: logger.debug("dashboard edit failed: %s",exc); return False
     async def on_progress(self,kind,task_id,percent=None,current=None,total=None,speed=None,eta=None,details=None):
         self.progress_cache[str(task_id)]={"percent":percent,"current":current or 0,"total":total or 0,"speed":speed or 0,"eta":eta or 0,"details":details or {},"kind":kind}
