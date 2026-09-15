@@ -1,5 +1,7 @@
 # Telegram Bot vNext
 
+CI test workflow enabled for vnext-v3.
+
 Clean rebuild. This tree is intentionally isolated from the current production bot until tests pass.
 
 ## Architecture
