@@ -9,6 +9,7 @@ on:
     branches:
       - bot-vnext-upgrade
       - bot-vnext-fixed
+  workflow_dispatch:
 
 jobs:
   unit-tests:
@@ -30,5 +31,5 @@ jobs:
       - name: Compile Python files
         run: python -m compileall -q bot_vnext crawler.py config.py
 
-      - name: Run crawler unit tests
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run bot_vnext test harness
+        run: python -m unittest discover -s bot_vnext/tests -p 'test_*.py' -v
