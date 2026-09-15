@@ -23,8 +23,11 @@ ATTRIBUTES = (
     "data-video", "data-video-url", "data-video-src", "data-stream", "data-stream-url",
     "data-source", "data-hls", "data-m3u8", "data-mpd", "data-link", "data-download",
     "data-player", "data-embed", "data-iframe", "data-manifest", "data-playlist",
+    "srcset", "imagesrcset", "action", "formaction", "ping", "cite",
 )
-URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.I)
+URL_RE = re.compile(r"(?:https?:)?//[^\s<>\"'`\\]+", re.I)
+QUOTED_RELATIVE_RE = re.compile(r"[\"'`]((?:/|\./|\.\./)[^\"'`<>\s]+)[\"'`]", re.I)
+CSS_URL_RE = re.compile(r"url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)", re.I)
 EP_RE = re.compile(
     r"\bS\s*(\d{1,2})\s*[-_. ]?\s*E(?:P(?:ISODE)?)?\s*(\d{1,4})\b|"
     r"\b(?:Episode|Ep)\s*[-_.:# ]*\s*(\d{1,4})\b|"
@@ -45,7 +48,7 @@ def _clean(value: str) -> str:
 def _canon(url: str, base: str = "") -> str:
     try:
         value = _clean(url).strip(" \t\r\n<>\"'`.,;)]}")
-        if not value or value.startswith(("javascript:", "mailto:", "tel:", "#")):
+        if not value or value.startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
             return ""
         value = urljoin(base, value)
         p = urlparse(value)
@@ -90,6 +93,14 @@ def _urls(text: str, base: str) -> set[str]:
             u = _canon(raw, base)
             if u:
                 found.add(u)
+        for raw in QUOTED_RELATIVE_RE.findall(blob):
+            u = _canon(raw, base)
+            if u:
+                found.add(u)
+        for raw in CSS_URL_RE.findall(blob):
+            u = _canon(raw, base)
+            if u:
+                found.add(u)
     return found
 
 
@@ -100,20 +111,20 @@ def _json_urls(text: str, base: str) -> set[str]:
     for script in re.findall(r"<script[^>]*>(.*?)</script>", text, re.I | re.S):
         decoded = _clean(script)
         found.update(_urls(decoded, base))
-        # JSON blobs often contain escaped URLs but are not valid standalone JSON.
         try:
             obj = json.loads(decoded)
         except Exception:
-            continue
-        stack = [obj]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, dict):
-                stack.extend(item.values())
-            elif isinstance(item, list):
-                stack.extend(item)
-            elif isinstance(item, str):
-                found.update(_urls(item, base))
+            obj = None
+        if obj is not None:
+            stack = [obj]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    stack.extend(item.values())
+                elif isinstance(item, list):
+                    stack.extend(item)
+                elif isinstance(item, str):
+                    found.update(_urls(item, base))
     return found
 
 
@@ -160,7 +171,6 @@ def _series(soup: BeautifulSoup, fallback: str = "") -> str:
     name = re.sub(r"\s*[|–—-]\s*(?:https?://)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}.*$", "", name, flags=re.I)
     name = re.sub(r"\b(?:watch|download)\b\s*", "", name, flags=re.I)
     if _episode(name) != "Unknown Episode":
-        # Try breadcrumb/category text before giving up.
         for selector in (".breadcrumb a", ".breadcrumbs a", "nav a", ".category a"):
             for tag in soup.select(selector):
                 candidate = _clean(tag.get_text(" ", strip=True))
@@ -198,6 +208,16 @@ def _fetch(url: str, timeout: int = 25):
         return None
 
 
+def _crawlable(u: str) -> bool:
+    """Return True for likely HTML/player pages, excluding obvious static assets."""
+    path = urlparse(u).path.lower()
+    if _media(u):
+        return False
+    if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".css", ".js", ".woff", ".woff2", ".ttf", ".ico", ".xml", ".json", ".txt", ".pdf", ".zip", ".rar")):
+        return False
+    return True
+
+
 def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock: threading.Lock):
     response = _fetch(url)
     if response is None:
@@ -216,18 +236,20 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
     links = set()
     player = False
 
-    # Every HTML attribute is inspected. Only same-domain HTTP links are queued;
-    # external links are retained only when they look like actual media.
     for tag in soup.find_all(True):
         tag_text = _clean(tag.get_text(" ", strip=True))
-        if _player_like(str(tag), tag_text):
+        tag_repr = str(tag)
+        if _player_like(tag_repr, tag_text):
             player = True
         for attr in ATTRIBUTES:
             value = tag.get(attr)
             if not value:
                 continue
-            raw_values = [str(value)] + list(_urls(str(value), final_url))
-            for raw in raw_values:
+            values = [str(value)]
+            if attr in {"srcset", "imagesrcset"}:
+                values.extend(part.strip().split(" ")[0] for part in str(value).split(",") if part.strip())
+            values.extend(_urls(str(value), final_url))
+            for raw in values:
                 u = _canon(raw, final_url)
                 if not u:
                     continue
@@ -236,15 +258,31 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
                     ep = _episode(context)
                     res = _resolution(context)
                     media.add((u, ep if ep != "Unknown Episode" else page_episode, res, _source(u)))
-                elif urlparse(u).hostname == root_host and attr == "href":
+                elif urlparse(u).hostname == root_host and _crawlable(u):
+                    # Any same-host URL discovered in data attributes, forms, embeds,
+                    # srcset, JSON, etc. can lead to an episode page; do not require href.
                     links.add(u)
 
-    for u in _urls(text, final_url) | _json_urls(text, final_url):
+    discovered = _urls(text, final_url) | _json_urls(text, final_url)
+    for u in discovered:
         if _media(u):
             media.add((u, page_episode, _resolution(u), _source(u)))
+        elif urlparse(u).hostname == root_host and _crawlable(u):
+            links.add(u)
 
-    # Browser discovery is intentionally budgeted so a large site does not launch
-    # thousands of Chromium instances, while JS-heavy player pages still work.
+    # Meta refresh and common canonical/alternate link targets.
+    for tag in soup.find_all("meta"):
+        content = str(tag.get("content") or "")
+        match = re.search(r"url\s*=\s*([^;]+)$", content, re.I)
+        if match:
+            u = _canon(match.group(1).strip(), final_url)
+            if u and urlparse(u).hostname == root_host and _crawlable(u):
+                links.add(u)
+    for tag in soup.find_all("link"):
+        href = _canon(tag.get("href"), final_url)
+        if href and urlparse(href).hostname == root_host and _crawlable(href):
+            links.add(href)
+
     if not media and player:
         with budget_lock:
             allowed = browser_budget[0] > 0
@@ -257,9 +295,13 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
                     cu = _canon(u, final_url)
                     if cu and _media(cu):
                         media.add((cu, page_episode, _resolution(cu), _source(cu)))
+                    elif cu and urlparse(cu).hostname == root_host and _crawlable(cu):
+                        links.add(cu)
                 for u in _urls(browser_text, final_url):
                     if _media(u):
                         media.add((u, page_episode, _resolution(u), _source(u)))
+                    elif urlparse(u).hostname == root_host and _crawlable(u):
+                        links.add(u)
             except Exception:
                 pass
     return media, links, series, page_episode, 1, 0
@@ -267,15 +309,25 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
 
 def _sitemap_urls(start: str, root_host: str) -> set[str]:
     found = set()
-    candidates = [urljoin(start, "/sitemap.xml"), urljoin(start, "/sitemap_index.xml")]
-    for sitemap in candidates:
+    candidates = [urljoin(start, "/sitemap.xml"), urljoin(start, "/sitemap_index.xml"), urljoin(start, "/wp-sitemap.xml")]
+    seen_sitemaps = set()
+    pending = deque(candidates)
+    while pending and len(seen_sitemaps) < 20:
+        sitemap = _canon(pending.popleft(), start)
+        if not sitemap or sitemap in seen_sitemaps:
+            continue
+        seen_sitemaps.add(sitemap)
         r = _fetch(sitemap, timeout=15)
-        if not r or "xml" not in (r.headers.get("content-type") or "").lower() and "<url" not in r.text[:500].lower():
+        if not r or ("xml" not in (r.headers.get("content-type") or "").lower() and "<url" not in r.text[:500].lower() and "<sitemap" not in r.text[:500].lower()):
             continue
         for raw in re.findall(r"<loc[^>]*>(.*?)</loc>", r.text or "", re.I | re.S):
             u = _canon(raw, sitemap)
-            if u and urlparse(u).hostname == root_host:
+            if not u:
+                continue
+            if urlparse(u).hostname == root_host and _crawlable(u):
                 found.add(u)
+            elif u not in seen_sitemaps and len(seen_sitemaps) < 20:
+                pending.append(u)
     return found
 
 
@@ -297,8 +349,6 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
     browser_budget = [min(80, max_pages)]
     budget_lock = threading.Lock()
 
-    # Sitemaps often contain archive/series pages that are not reachable from the
-    # homepage navigation. Seed them without allowing them to exceed the page cap.
     for u in _sitemap_urls(start, root_host):
         if len(queued) >= max_pages:
             break
@@ -329,8 +379,6 @@ def _crawl(raw_url: str, max_pages: int = DEFAULT_MAX_PAGES, workers: int = DEFA
                         queued.add(link)
                         queue.append(link)
 
-    # Canonical media URL is the strongest duplicate key. Preserve the richest
-    # metadata encountered across pages pointing at the same media.
     by_url = {}
     for row in results:
         series, ep, res, url, src, page = row
