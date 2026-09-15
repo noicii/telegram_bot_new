@@ -1,1 +1,0 @@
-Crawler upgrade target: broader iframe/data-* and inline-JS URL extraction, URL normalization, episode pattern expansion, cached resolution lookup, and safer candidate scoring. Runtime integration pending.
