@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import os
 
 from pyrogram import Client
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,7 +39,34 @@ def _get_main_keyboard_with_safe_restart():
 _utils.get_main_keyboard = _get_main_keyboard_with_safe_restart
 
 from handlers import register_handlers
+import handlers as _handlers
 from queue_worker import start_queue_worker, stop_queue_worker
+
+# Convert the existing restart callback's os._exit(0) into a graceful async
+# shutdown. The callback still requires the existing Yes/Cancel confirmation.
+_REAL_OS_EXIT = os._exit
+
+
+async def _graceful_restart():
+    try:
+        await stop_queue_worker()
+    finally:
+        try:
+            await app.stop()
+        finally:
+            _REAL_OS_EXIT(0)
+
+
+def _safe_restart_exit(code=0):
+    if code != 0:
+        _REAL_OS_EXIT(code)
+        return
+    asyncio.create_task(_graceful_restart())
+
+
+# Patch only the handlers module's os reference; the rest of the process keeps
+# the normal os._exit behavior.
+_handlers.os._exit = _safe_restart_exit
 
 # Apply handler-side hardening after handlers are loaded.
 apply_runtime_hardening()
@@ -80,7 +109,6 @@ register_handlers(app)
 
 
 if __name__ == "__main__":
-    import asyncio
     from pyrogram import idle
 
     async def run_bot():
