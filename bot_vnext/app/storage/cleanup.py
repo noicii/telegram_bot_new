@@ -32,6 +32,35 @@ def _iter_files(root: Path) -> Iterable[Path]:
     return (p for p in root.rglob("*") if p.is_file())
 
 
+def _remove_file(path: str | Path) -> int:
+    """Remove one file and return its size in bytes."""
+    target = Path(path)
+    try:
+        size = target.stat().st_size if target.is_file() else 0
+        target.unlink(missing_ok=True)
+        return size
+    except OSError as exc:
+        logger.warning("cleanup could not remove file %s: %s", target, exc)
+        return 0
+
+
+def _remove_dir(path: str | Path) -> int:
+    """Remove a directory tree and return the bytes removed."""
+    target = Path(path)
+    freed = 0
+    try:
+        for item in target.rglob("*"):
+            if item.is_file():
+                try:
+                    freed += item.stat().st_size
+                except OSError:
+                    pass
+        shutil.rmtree(target, ignore_errors=True)
+    except OSError as exc:
+        logger.warning("cleanup could not remove directory %s: %s", target, exc)
+    return freed
+
+
 def remove_artifact(path: str | Path) -> int:
     """Delete a media artifact and its generated split directory."""
     target = Path(path)
