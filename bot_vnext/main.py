@@ -1,16 +1,22 @@
 """Telegram entrypoint for Bot V2 with a single-message live command center."""
 from __future__ import annotations
+
 import asyncio
 import logging
+import os
 import shutil
 import sys
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
+
 ROOT = Path(__file__).resolve().parents[1]
 V2_ROOT = Path(__file__).resolve().parent
-if str(V2_ROOT) not in sys.path: sys.path.insert(0, str(V2_ROOT))
-if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+if str(V2_ROOT) not in sys.path:
+    sys.path.insert(0, str(V2_ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -19,6 +25,7 @@ from crawler import crawl_blog_episodes
 from utils import sanitize_filename
 from app.pipeline import Pipeline
 from app.downloader.method_store import get_method, set_method, get_default_method, set_default_method, next_method, method_label, METHODS
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("bot_vnext")
 PAGE_SIZE = 8
@@ -46,7 +53,7 @@ def bar(p,width=20):
     return "█"*n+"░"*(width-n)
 class V2Bot:
     def __init__(self,client):
-        self.client=client; self.pipeline=None; self.sessions={}; self.progress_cache={}; self.dashboard_messages={}; self.dashboard_locks={}; self.dashboard_last_edit={}
+        self.client=client; self.pipeline=None; self.sessions={}; self.progress_cache={}; self.dashboard_messages={}; self.dashboard_locks={}; self.dashboard_last_edit={}; self.restart_event=None
     def lock(self,chat_id): return self.dashboard_locks.setdefault(chat_id,asyncio.Lock())
     async def start(self):
         self.pipeline=Pipeline(self.client,DOWNLOAD_DIR,on_progress=self.on_progress,on_complete=self.on_complete,on_failed=self.on_failed); await self.pipeline.start()
@@ -54,6 +61,13 @@ class V2Bot:
         except Exception: logger.exception("could not set bot command menu")
     async def stop(self):
         if self.pipeline: await self.pipeline.stop(); self.pipeline=None
+    async def _request_restart(self):
+        logger.info("Safe restart requested from Settings")
+        if self.pipeline:
+            await self.pipeline.stop()
+            self.pipeline=None
+        if self.restart_event:
+            self.restart_event.set()
     async def start_cmd(self,client,message):
         if owner_only(message): await message.reply_text("🎬 **BOT V2 READY**\n\n🔎 `/crawl <URL>` — crawl & select episodes\n📊 `/status` — live status\n📋 `/queue` — task list\n🎯 `/method` — choose download method\n⚙️ `/settings` — all controls\n🩺 `/health` — system health\n\n⚡ Downloads: **2** simultaneous\n⚡ Uploads: **4** simultaneous\n🛑 Independent cancellation: **ON**")
     async def status_cmd(self,client,message):
@@ -113,7 +127,6 @@ class V2Bot:
         if len(rows)>6:
             lines.append("Showing the latest 6 with retry buttons.")
         await message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
     async def clear_cmd(self,client,message):
         if not owner_only(message): return
         if not self.pipeline: await message.reply_text("❌ V2 pipeline is offline."); return
@@ -157,7 +170,7 @@ class V2Bot:
     async def settings_cmd(self,client,message):
         if owner_only(message): await self.send_settings(message)
     async def send_settings(self,message):
-        m=await get_default_method(); await message.reply_text(f"⚙️ **BOT V2 SETTINGS**\n\n🎯 Download method: **{method_label(m)}**\n⬇️ Download workers: **2**\n⬆️ Upload workers: **4**\n🛑 Independent cancellation: **ON**\n💾 Persistent SQLite queue: **ON**\n🖼️ Auto thumbnail: configured\n🍪 Cookies: auto-detected",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Download Method",callback_data="v2:methodmenu")],[InlineKeyboardButton("📊 Live Status",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")],[InlineKeyboardButton("🩺 Health Check",callback_data="v2:health")],[InlineKeyboardButton("🧹 Clear Finished",callback_data="v2:clear")]]))
+        m=await get_default_method(); await message.reply_text(f"⚙️ **BOT V2 SETTINGS**\n\n🎯 Download method: **{method_label(m)}**\n⬇️ Download workers: **2**\n⬆️ Upload workers: **4**\n🛑 Independent cancellation: **ON**\n💾 Persistent SQLite queue: **ON**\n🖼️ Auto thumbnail: configured\n🍪 Cookies: auto-detected",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Download Method",callback_data="v2:methodmenu")],[InlineKeyboardButton("📊 Live Status",callback_data="v2:status"),InlineKeyboardButton("📋 Queue",callback_data="v2:queue")],[InlineKeyboardButton("🩺 Health Check",callback_data="v2:health")],[InlineKeyboardButton("🧹 Clear Finished",callback_data="v2:clear")],[InlineKeyboardButton("🔄 Safe Restart",callback_data="v2:restart")]]))
     async def health_cmd(self,client,message):
         if owner_only(message): await self.send_health(message)
     async def send_health(self,message):
@@ -167,13 +180,20 @@ class V2Bot:
     async def callback(self,client,query):
         if not callback_owner(query): await query.answer("Not allowed",show_alert=True); return
         data=query.data or ""
-        if data=="v2:status":
-            await query.answer("📊 Refreshing status…")
-            await self.show_dashboard(query.message.chat.id, query.message)
-            return
+        if data=="v2:status": await query.answer("📊 Refreshing status…"); await self.show_dashboard(query.message.chat.id,query.message); return
         if data=="v2:queue": await query.answer(); await self.send_queue(query.message); return
         if data=="v2:settings": await query.answer(); await self.send_settings(query.message); return
         if data in {"v2:health","v2:healthmenu"}: await query.answer(); await self.send_health(query.message); return
+        if data=="v2:restart":
+            await query.answer()
+            await query.message.edit_text("⚠️ **RESTART BOT?**\n\nActive downloads/uploads will be stopped safely, then Bot V2 will restart.\n\nContinue?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Restart",callback_data="v2:restart_confirm"),InlineKeyboardButton("❌ Cancel",callback_data="v2:restart_cancel")]]))
+            return
+        if data=="v2:restart_cancel": await query.answer("Restart cancelled"); await self.send_settings(query.message); return
+        if data=="v2:restart_confirm":
+            await query.answer("Restarting safely…")
+            await query.message.edit_text("🔄 **SAFE RESTART**\n\nStopping downloads/uploads and restarting Bot V2…")
+            asyncio.create_task(self._request_restart())
+            return
         if data=="v2:methodmenu" and not self.sessions.get(query.from_user.id): await query.answer(); await self.send_method_menu(query.message); return
         if data.startswith("v2:m:"):
             m=data.rsplit(":",1)[1]
@@ -183,18 +203,12 @@ class V2Bot:
                 s["method"]=m
                 try: await set_method(s["items"][0].get("url") or s.get("source_url") or "",m)
                 except Exception: logger.exception("could not persist session method")
-                await query.answer(f"Method: {method_label(m)}")
-                await self.render_selection(query.message,s)
+                await query.answer(f"Method: {method_label(m)}"); await self.render_selection(query.message,s)
             else:
                 await set_default_method(m); await query.answer(f"Default: {method_label(m)}"); await self.send_method_menu(query.message)
             return
         if data.startswith("v2:retry:"):
-            tid=data.split(":",2)[2]
-            m=await get_default_method()
-            ok=bool(self.pipeline and await self.pipeline.retry(tid,method=m))
-            await query.answer("🔁 Retried" if ok else "⚠️ Task is no longer retryable",show_alert=not ok)
-            await self.render_dashboard(query.message.chat.id,query.message.id,True)
-            return
+            tid=data.split(":",2)[2]; m=await get_default_method(); ok=bool(self.pipeline and await self.pipeline.retry(tid,method=m)); await query.answer("🔁 Retried" if ok else "⚠️ Task is no longer retryable",show_alert=not ok); await self.render_dashboard(query.message.chat.id,query.message.id,True); return
         if data=="v2:clear":
             if self.pipeline: await query.answer(f"Cleared {await self.pipeline.db.clear_finished()} task(s)"); await self.send_queue(query.message); return
             await query.answer()
@@ -202,38 +216,22 @@ class V2Bot:
             task_id=data.rsplit(":",1)[1].strip()
             if not task_id: await query.answer("Invalid task",show_alert=True); return
             if not self.pipeline: await query.answer("Pipeline is offline",show_alert=True); return
-            ok=await self.pipeline.cancel(task_id)
-            await query.answer("Task cancelled" if ok else "Task is not currently active",show_alert=not ok)
-            await self.send_queue(query.message)
-            return
+            ok=await self.pipeline.cancel(task_id); await query.answer("Task cancelled" if ok else "Task is not currently active",show_alert=not ok); await self.send_queue(query.message); return
         s=self.sessions.get(query.from_user.id)
         if not s: await query.answer("Selection expired",show_alert=True); return
         if data.startswith("v2:t:"):
             try: index=int(data.rsplit(":",1)[1])
             except ValueError: await query.answer("Invalid selection",show_alert=True); return
             if index<0 or index>=len(s["items"]): await query.answer("Invalid selection",show_alert=True); return
-            if index in s["selected"]:
-                s["selected"].remove(index); action="Deselected"
-            else:
-                s["selected"].add(index); action="Selected"
-            await query.answer(action)
-            await self.render_selection(query.message,s)
-            return
+            if index in s["selected"]: s["selected"].remove(index); action="Deselected"
+            else: s["selected"].add(index); action="Selected"
+            await query.answer(action); await self.render_selection(query.message,s); return
         if data=="v2:all": s["selected"]=set(range(len(s["items"]))); await query.answer("All selected"); await self.render_selection(query.message,s); return
         if data=="v2:selclear": s["selected"].clear(); await query.answer("Selection cleared"); await self.render_selection(query.message,s); return
         if data.startswith("v2:p:"):
             d=int(data.rsplit(":",1)[1]); pages=max(1,(len(s["items"])+PAGE_SIZE-1)//PAGE_SIZE); s["page"]=max(0,min(pages-1,s["page"]+d)); await query.answer(); await self.render_selection(query.message,s); return
         if data=="v2:method":
-            await query.answer()
-            current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method()
-            await query.message.edit_text(
-                f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: **{method_label(current_method)}**",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")]
-                    for m in METHODS
-                ]),
-            )
-            return
+            await query.answer(); current_method=(self.sessions.get(query.from_user.id) or {}).get("method") or await get_default_method(); await query.message.edit_text(f"🎯 **DOWNLOAD METHOD**\n\nCurrent selection: **{method_label(current_method)}**",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if m==current_method else "")+method_label(m),callback_data=f"v2:m:{m}")] for m in METHODS])); return
         if data=="v2:close": self.sessions.pop(query.from_user.id,None); await query.answer("Selection closed"); await query.message.edit_text("❌ Selection cancelled."); return
         if data=="v2:download":
             selected=sorted(s["selected"])
@@ -262,12 +260,9 @@ class V2Bot:
                 for n,r in enumerate(downs[:8],1):
                     live=self.progress_cache.get(str(r.get("id")),{}); pct=float(live.get("percent",r.get("progress") or 0) or 0); cur=live.get("current",0); total=live.get("total",0); sp=live.get("speed",r.get("speed",0)); eta=live.get("eta",r.get("eta",0)); det=live.get("details") or {}; title=str(r.get("title") or r.get("url") or r.get("id"))[:48]; res=str(r.get("resolution") or "").strip(); lines += [f"{n}️⃣ **{title}{(' • '+res) if res else ''}**",f"{bar(pct)} **{pct:.0f}%**"]
                     if det.get("hls_total"):
-                        hls_done=int(det.get("hls_completed") or 0); hls_total=int(det.get("hls_total") or 0); hls_pct=(hls_done*100/hls_total) if hls_total else pct
-                        lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**")
-                        lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
+                        hls_done=int(det.get("hls_completed") or 0); hls_total=int(det.get("hls_total") or 0); hls_pct=(hls_done*100/hls_total) if hls_total else pct; lines.append(f"🧩 Segments: **{hls_done} / {hls_total}** • **{hls_pct:.0f}%**"); lines.append(f"💾 Data: **{fmt_bytes(cur)}** • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}");
                         if det.get("hls_retries"): lines.append(f"🔁 Retries: {int(det.get('hls_retries') or 0)}")
-                    else:
-                        lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
+                    else: lines.append(f"📦 {fmt_bytes(cur)} / {fmt_bytes(total)} • ⚡ {fmt_speed(sp)} • ETA {fmt_eta(eta)}")
                     lines.append("")
             else: lines.append("📥 **DOWNLOADING**\nNo active downloads.\n")
             if ups:
@@ -303,9 +298,11 @@ class V2Bot:
 async def run():
     if not BOT_TOKEN or not API_ID or not API_HASH or not OWNER_ID: raise RuntimeError("API_ID, API_HASH, BOT_TOKEN and OWNER_ID must be configured")
     app=Client("telegram_bot_v2",api_id=API_ID,api_hash=API_HASH,bot_token=BOT_TOKEN,max_concurrent_transmissions=4,workdir=str(ROOT/"data")); bot=V2Bot(app)
+    restart_event=asyncio.Event(); bot.restart_event=restart_event
     app.add_handler(MessageHandler(bot.start_cmd,filters.command("start"))); app.add_handler(MessageHandler(bot.status_cmd,filters.command("status"))); app.add_handler(MessageHandler(bot.queue_cmd,filters.command("queue"))); app.add_handler(MessageHandler(bot.cancel_cmd,filters.command("cancel"))); app.add_handler(MessageHandler(bot.retry_cmd,filters.command("retry"))); app.add_handler(MessageHandler(bot.failed_cmd,filters.command("failed"))); app.add_handler(MessageHandler(bot.clear_cmd,filters.command("clear"))); app.add_handler(MessageHandler(bot.crawl_cmd,filters.command("crawl"))); app.add_handler(MessageHandler(bot.settings_cmd,filters.command("settings"))); app.add_handler(MessageHandler(bot.method_cmd,filters.command("method"))); app.add_handler(MessageHandler(bot.health_cmd,filters.command("health"))); app.add_handler(MessageHandler(bot.text_url,filters.text & ~filters.command([c for c,_ in COMMANDS]))); app.add_handler(CallbackQueryHandler(bot.callback))
     async with app:
         await bot.start()
-        try: await asyncio.Event().wait()
+        try: await restart_event.wait()
         finally: await bot.stop()
+    os.execv(sys.executable,[sys.executable,str(Path(__file__).resolve())])
 if __name__=="__main__": asyncio.run(run())
