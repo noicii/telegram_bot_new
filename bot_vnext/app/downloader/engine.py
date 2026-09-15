@@ -107,6 +107,12 @@ class HybridDownloader:
             candidates.extend([f"https://luluvdo.com/e/{video_id}", f"https://lulustream.com/e/{video_id}", f"https://luluvdoo.com/e/{video_id}"])
         return list(dict.fromkeys(candidates))
 
+    @staticmethod
+    def _playlist_requires_ffmpeg(playlist: str) -> bool:
+        """Return True for HLS forms the disk-segment concat path cannot safely reconstruct."""
+        upper = playlist.upper()
+        return "#EXT-X-MAP:" in upper or "#EXT-X-BYTERANGE:" in upper
+
     async def _hls_multi(self, url: str, output: Path, task: TaskContext, progress: ProgressCallback | None) -> None:
         """Download HLS with 16 concurrent workers while keeping segment bytes on disk, not RAM."""
         import aiohttp
@@ -136,6 +142,10 @@ class HybridDownloader:
                     playlist = await self._fetch_text(session, stream_url)
                 if "#EXT-X-KEY:" in playlist:
                     logger.info("task=%s encrypted HLS detected; using FFmpeg", task.task_id)
+                    await self._ffmpeg(stream_url, output, task, progress, headers=headers)
+                    return
+                if self._playlist_requires_ffmpeg(playlist):
+                    logger.info("task=%s HLS uses EXT-X-MAP/BYTERANGE; using FFmpeg for playlist-correct reconstruction", task.task_id)
                     await self._ffmpeg(stream_url, output, task, progress, headers=headers)
                     return
                 segments = [urljoin(stream_url, line.strip()) for line in playlist.splitlines() if line.strip() and not line.strip().startswith("#")]
@@ -200,7 +210,8 @@ class HybridDownloader:
             with concat_file.open("w", encoding="utf-8") as fh:
                 fh.write("ffconcat version 1.0\n")
                 for index in range(len(segments)):
-                    fh.write(f"file '{(segment_dir / f'{index:08d}.seg').as_posix().replace(chr(39), chr(39)+chr(39))}'\n")
+                    escaped = (segment_dir / f"{index:08d}.seg").as_posix().replace("'", "''")
+                    fh.write(f"file '{escaped}'\n")
             proc = await asyncio.create_subprocess_exec("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart", str(output), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             task.register_process(proc)
             try:
@@ -240,6 +251,14 @@ class HybridDownloader:
                             if captured: break
                             await asyncio.sleep(1)
                             if tick % 5 == 0: await self._report(progress, 1.0, 0, None, 0.0)
+                        try:
+                            html = await page.content()
+                            for item in re.findall(r"(?:https?:)?//[^\"'<>\s]+\.m3u8(?:\?[^\"'<>\s]*)?", html, re.I):
+                                absolute = urljoin(candidate, item)
+                                if absolute not in captured:
+                                    captured.append(absolute)
+                        except Exception:
+                            pass
                         for frame in page.frames:
                             try:
                                 found = await frame.evaluate("""() => { const out=[]; try { if(typeof jwplayer==='function'){const p=jwplayer();const c=p&&p.getConfig?p.getConfig():null;for(const x of (c&&c.sources)||[]) if(x&&x.file) out.push(x.file);} } catch(e) {} try { for(const v of document.querySelectorAll('video,source')) if(v.src) out.push(v.src); } catch(e) {} return out; }""")
