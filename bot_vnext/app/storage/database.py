@@ -82,7 +82,7 @@ class Database:
             conn.close()
 
     async def update_task(self, task_id: str, **fields):
-        allowed = {"status", "url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
+        allowed = {"status", "task_type", "url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
             return
@@ -102,7 +102,7 @@ class Database:
             conn.close()
 
     async def transition(self, task_id: str, from_statuses: tuple[str, ...], to_status: str, **fields) -> bool:
-        allowed = {"url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
+        allowed = {"task_type", "url", "file_path", "title", "caption", "thumbnail", "chat_id", "message_id", "preset", "mode", "source", "provider", "resolution", "batch_id", "batch_total", "priority", "retry_count", "max_retries", "progress", "speed", "eta", "error", "metadata", "started_at", "completed_at"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if isinstance(fields.get("metadata"), dict):
             fields["metadata"] = json.dumps(fields["metadata"], ensure_ascii=False)
@@ -212,6 +212,26 @@ class Database:
 
     async def mark_cancelled(self, task_id):
         return await self.transition(task_id, ("queued", "downloading", "uploading"), "cancelled")
+
+    async def mark_download_handed_to_upload(self, task_id, file_path: str) -> bool:
+        """Atomically turn a completed download into a recoverable upload job.
+
+        The task becomes queued/upload in one DB transaction before the upload
+        worker is handed the file. If the process dies between these two steps,
+        startup recovery sees a queued upload and resumes it instead of losing
+        the completed download.
+        """
+        return await self.transition(
+            task_id,
+            ("downloading",),
+            "queued",
+            task_type="upload",
+            file_path=str(file_path),
+            progress=0,
+            speed=0,
+            eta=0,
+            error=None,
+        )
 
     async def reset_for_retry(self, task_id: str) -> bool:
         task = await self.get_task(task_id)
