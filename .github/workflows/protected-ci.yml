@@ -33,7 +33,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml python-dotenv
 
       - name: Verify runtime patcher is removed
         run: test ! -e bot_vnext/apply_ui_runtime_patch.py
