@@ -30,7 +30,7 @@ RES_RE = re.compile(r"\b(2160p|1080p|720p|480p)\b|\b(4k|uhd)\b|\b(\d{3,4})\s*[x√
 DEFAULT_MAX_PAGES = 2000
 DEFAULT_WORKERS = 16
 MAX_EXTERNAL_PLAYER_HOPS = 128
-MAX_BROWSER_DISCOVERIES = 200
+MAX_BROWSER_DISCOVERIES = 512
 
 _thread_local = threading.local()
 
@@ -206,14 +206,22 @@ def _scan_page(url: str, root_host: str, browser_budget: list[int], budget_lock:
         tag_text = _clean(tag.get_text(" ", strip=True))
         tag_repr = str(tag)
         player = player or _player_like(tag_repr, tag_text)
+        values_by_attr = set()
         for attr in ATTRIBUTES:
             value = tag.get(attr)
-            if not value: continue
+            if value is None: continue
             values = [str(value)]
             if attr in {"srcset", "imagesrcset"}: values += [x.strip().split(" ")[0] for x in str(value).split(",") if x.strip()]
             values += list(_urls(str(value), final_url))
-            for raw in values:
-                u = _canon(raw, final_url)
+            values_by_attr.update(values)
+        # Also inspect every HTML attribute. This catches player/config URLs
+        # hidden in onclick, data-* variants, JSON blobs, and vendor-specific attributes.
+        for attr, value in tag.attrs.items():
+            if attr in ATTRIBUTES or value is None: continue
+            if isinstance(value, (list, tuple)): value = " ".join(map(str, value))
+            values_by_attr.add(str(value))
+        for raw in values_by_attr:
+            for u in ({_canon(raw, final_url)} | _urls(raw, final_url)):
                 if not u: continue
                 if _media(u):
                     ctx = f"{tag_text} {tag.get('title','')} {tag.get('aria-label','')} {u}"
